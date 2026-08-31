@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
-appimg-core = { path = "../core" }
+appimg-core = { path = "../core", version = "0.1.1" }
 clap = { version = "4.5.61", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "color", "wrap_help"] }
 clap_complete = "4.5.67"
 ratatui = "0.29.0"
