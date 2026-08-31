@@ -13,9 +13,9 @@ workspace = true
 
 [dependencies]
 imagesize = "0.15.0"
+tempfile = "3.27.0"
 thiserror = "2.0.20"
 ureq = "3.2.1"
 
 [dev-dependencies]
-tempfile = "3.27.0"
 tiny_http = "0.12.0"
