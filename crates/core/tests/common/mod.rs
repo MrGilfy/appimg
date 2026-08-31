@@ -74,6 +74,11 @@ pub struct FakeAppImage {
     pub categories: String,
     pub exec: String,
     pub extra_keys: Vec<(String, String)>,
+    /// Whether the fixture gets the executable bit. A file that arrived
+    /// through a browser does not have it.
+    pub executable: bool,
+    /// What the fake runtime does instead of extracting, if anything.
+    pub failure: Option<(i32, String)>,
     /// Extra bytes appended to the runtime, so two builds differ.
     pub marker: String,
 }
@@ -87,6 +92,8 @@ impl FakeAppImage {
             categories: "Utility;".to_string(),
             exec: "AppRun %U".to_string(),
             extra_keys: Vec::new(),
+            executable: true,
+            failure: None,
             marker: String::new(),
         }
     }
@@ -98,6 +105,19 @@ impl FakeAppImage {
 
     pub fn key(mut self, key: &str, value: &str) -> Self {
         self.extra_keys.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Builds a fixture without the executable bit, the way a download from
+    /// a browser arrives.
+    pub fn not_executable(mut self) -> Self {
+        self.executable = false;
+        self
+    }
+
+    /// Makes `--appimage-extract` fail with this exit code and message.
+    pub fn failing(mut self, code: i32, message: &str) -> Self {
+        self.failure = Some((code, message.to_string()));
         self
     }
 
@@ -134,6 +154,12 @@ impl FakeAppImage {
         }
         fs::write(payload.join(".DirIcon"), png_bytes(32, 32)).unwrap();
 
+        let extract = match &self.failure {
+            Some((code, message)) => format!("echo '{message}' >&2\nexit {code}\n"),
+            None => {
+                format!("mkdir -p squashfs-root\ncp -R '{}/.' squashfs-root/\n", payload.display())
+            }
+        };
         let script = format!(
             "#!/bin/sh\n\
              # fake AppImage runtime {marker}\n\
@@ -141,10 +167,8 @@ impl FakeAppImage {
              \techo 'fake appimage'\n\
              \texit 0\n\
              fi\n\
-             mkdir -p squashfs-root\n\
-             cp -R '{payload}/.' squashfs-root/\n",
+             {extract}",
             marker = self.marker,
-            payload = payload.display(),
         );
 
         // The script only appears under its final name once it is complete
@@ -155,7 +179,8 @@ impl FakeAppImage {
         file.write_all(script.as_bytes()).unwrap();
         file.flush().unwrap();
         drop(file);
-        fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = if self.executable { 0o755 } else { 0o644 };
+        fs::set_permissions(&partial, fs::Permissions::from_mode(mode)).unwrap();
         fs::rename(&partial, &path).unwrap();
         path
     }

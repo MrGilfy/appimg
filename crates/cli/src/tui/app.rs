@@ -323,11 +323,15 @@ impl App {
 
     fn inspect(&mut self, path: PathBuf) -> Result<()> {
         let info = metadata::inspect(&path, appimg_core::current_locale().as_deref())?;
-        let extracted = info.extract_root().is_some();
+        // Not extracting is not fatal here, the form asks for name and icon
+        // anyway, but the reason belongs on screen.
+        let problem = info.extract_root().is_none().then(|| match info.extract_problems.first() {
+            Some(problem) => format!("Not extracted, name and icon are guesses: {problem}"),
+            None => "Not extracted, name and icon are guesses.".to_string(),
+        });
         let origin = path.to_string_lossy().into_owned();
         self.mode = Mode::Form(Box::new(InstallForm::new(&path, &origin, info)));
-        self.status = (!extracted)
-            .then(|| "The AppImage could not be extracted, name and icon are guesses.".to_string());
+        self.status = problem;
         Ok(())
     }
 

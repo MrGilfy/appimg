@@ -19,11 +19,9 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     }
 
     let info = metadata::inspect(&source, appimg_core::current_locale().as_deref())?;
-    if info.extract_root().is_none() {
-        ui.warn(
-            "the AppImage could not be extracted, so name, icon and categories are guesses. \
-             Install libfuse2 or squashfs-tools, or pass --name and --icon.",
-        );
+    if info.extract_root().is_none() && !confirm_without_metadata(ui, &info)? {
+        ui.info("Nothing was installed.");
+        return Ok(Outcome::NothingToDo);
     }
 
     let mut request = InstallRequest::from_info(&source, &origin, &info);
@@ -96,6 +94,23 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
     ui.info(&format!("  {} downloaded", human_size(bytes)));
 
     Ok((dest, source.to_string(), Some(scratch)))
+}
+
+/// Extraction failed, so name, icon and categories would be guesses. Say
+/// exactly what went wrong and let the user decide, unless --yes already
+/// decided.
+fn confirm_without_metadata(ui: &Ui, info: &appimg_core::AppImageInfo) -> Result<bool> {
+    ui.warn("the AppImage did not extract, so its name, icon and categories are unknown:");
+    for problem in &info.extract_problems {
+        ui.warn(&format!("  {problem}"));
+    }
+    ui.info(&format!(
+        "Installing anyway uses the name {:?} and the generic icon. Passing --name and --icon \
+         instead gives the entry the values you want.",
+        info.name.clone().unwrap_or_default()
+    ));
+
+    ui.confirm("Install without the embedded metadata?", false)
 }
 
 fn apply_overrides(request: &mut InstallRequest, args: &InstallArgs) -> Result<()> {

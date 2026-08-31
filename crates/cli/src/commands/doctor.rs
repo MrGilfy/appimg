@@ -25,8 +25,24 @@ pub fn run(paths: &Paths, ui: &Ui) -> Result<Outcome> {
 
     ui.info("");
     ui.info(&ui.bold("Tools"));
-    for tool in report.required_tools.iter().chain(report.optional_tools.iter()) {
+    for tool in &report.required_tools {
         check(ui, tool.found, &tool.name, &tool.consequence);
+    }
+
+    ui.info("");
+    ui.info(&ui.bold("Optional tools"));
+    for tool in &report.optional_tools {
+        // Nothing here is a problem, so none of it sets the exit code.
+        if tool.found {
+            ui.info(&format!("  {} {}", mark(ui, true), tool.name));
+        } else {
+            ui.info(&format!(
+                "  {} {} is not installed: {}",
+                ui.dim("--  "),
+                tool.name,
+                tool.consequence
+            ));
+        }
     }
 
     ui.info("");
@@ -46,9 +62,9 @@ pub fn run(paths: &Paths, ui: &Ui) -> Result<Outcome> {
 fn report_leftovers(ui: &Ui, report: &DoctorReport) {
     if report.broken_entries.is_empty()
         && report.orphaned_icons.is_empty()
-        && report.orphaned_appimages.is_empty()
+        && report.leftover_files.is_empty()
     {
-        ui.info(&format!("  {} no leftovers", mark(ui, true)));
+        ui.info(&format!("  {} nothing left behind by appimg", mark(ui, true)));
         return;
     }
 
@@ -60,10 +76,18 @@ fn report_leftovers(ui: &Ui, report: &DoctorReport) {
         ));
     }
     for icon in &report.orphaned_icons {
-        ui.info(&format!("  {} orphaned icon {}", mark(ui, false), icon.display()));
+        ui.info(&format!(
+            "  {} icon no longer used by its entry: {}",
+            mark(ui, false),
+            icon.display()
+        ));
     }
-    for appimage in &report.orphaned_appimages {
-        ui.info(&format!("  {} unmanaged AppImage {}", mark(ui, false), appimage.display()));
+    for file in &report.leftover_files {
+        ui.info(&format!(
+            "  {} leftover from an interrupted update: {}",
+            mark(ui, false),
+            file.display()
+        ));
     }
 }
 

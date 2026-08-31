@@ -177,25 +177,104 @@ fn a_deleted_binary_shows_up_as_broken() {
 }
 
 #[test]
-fn doctor_finds_orphans_and_a_clean_tree_afterwards() {
+fn doctor_leaves_files_of_other_applications_alone() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
-    let stray_icon = sandbox.paths.icons_root.join("48x48/apps/ghost.png");
-    fs::create_dir_all(stray_icon.parent().unwrap()).unwrap();
-    fs::write(&stray_icon, common::png_bytes(48, 48)).unwrap();
-    let stray_appimage = sandbox.paths.appimage_dir.join("ghost.AppImage");
-    fs::write(&stray_appimage, "not managed").unwrap();
+    install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+
+    // A real home shares the icon theme and the AppImage directory with
+    // everything else installed on the machine.
+    let foreign_icons =
+        ["512x512/apps/osu.png", "48x48/apps/curseforge.png", "64x64/apps/steam.png"];
+    for icon in foreign_icons {
+        let path = sandbox.paths.icons_root.join(icon);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, common::png_bytes(48, 48)).unwrap();
+    }
+    for appimage in ["osu.AppImage", "curseforge.AppImage"] {
+        fs::write(sandbox.paths.appimage_dir.join(appimage), "someone else's AppImage").unwrap();
+    }
+    fs::write(
+        sandbox.paths.applications_dir.join("wine-Steam.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Steam\nExec=wine steam.exe\nIcon=steam\n",
+    )
+    .unwrap();
 
     let report = doctor::run(&sandbox.paths).unwrap();
-    assert_eq!(report.orphaned_icons, vec![stray_icon.clone()]);
-    assert_eq!(report.orphaned_appimages, vec![stray_appimage.clone()]);
+    assert!(report.orphaned_icons.is_empty(), "{:?}", report.orphaned_icons);
+    assert!(report.leftover_files.is_empty(), "{:?}", report.leftover_files);
+    assert!(report.broken_entries.is_empty(), "{:?}", report.broken_entries);
 
-    fs::remove_file(&stray_icon).unwrap();
-    fs::remove_file(&stray_appimage).unwrap();
+    // Nothing of the foreign files is gone or even mentioned.
+    for icon in foreign_icons {
+        assert!(sandbox.paths.icons_root.join(icon).is_file());
+    }
+    assert!(sandbox.paths.appimage_dir.join("osu.AppImage").is_file());
+}
+
+#[test]
+fn doctor_reports_only_leftovers_of_managed_slugs() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+
+    // An interrupted update leaves these two behind, both named after a slug
+    // appimg manages.
+    let backup = sandbox.paths.appimage_dir.join("fake-app.AppImage.bak");
+    let staged = sandbox.paths.appimage_dir.join("fake-app.AppImage.new");
+    fs::write(&backup, "the previous version").unwrap();
+    fs::write(&staged, "half a download").unwrap();
+    // Same shape, but for something appimg never installed.
+    fs::write(sandbox.paths.appimage_dir.join("osu.AppImage.bak"), "not ours").unwrap();
+
     let report = doctor::run(&sandbox.paths).unwrap();
+    assert_eq!(report.leftover_files, vec![backup.clone(), staged.clone()]);
     assert!(report.orphaned_icons.is_empty());
-    assert!(report.orphaned_appimages.is_empty());
-    assert!(report.broken_entries.is_empty());
+    assert!(!report.is_clean());
+
+    // Once the entry falls back to the generic icon, the icons installed
+    // under the slug are ours and unused.
+    let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    entry.set("Icon", install::FALLBACK_ICON);
+    entry.write(&outcome.desktop_entry_path).unwrap();
+    fs::remove_file(&backup).unwrap();
+    fs::remove_file(&staged).unwrap();
+
+    let report = doctor::run(&sandbox.paths).unwrap();
+    assert!(report.leftover_files.is_empty());
+    assert_eq!(report.orphaned_icons, outcome.icons);
+}
+
+#[test]
+fn missing_optional_tools_are_not_a_problem() {
+    let _serial = common::serial();
+    let report = doctor::DoctorReport {
+        libfuse2: true,
+        xdg_data_home_in_search_path: true,
+        applications_dir_writable: true,
+        required_tools: vec![doctor::ToolStatus {
+            name: "update-desktop-database".to_string(),
+            found: true,
+            consequence: String::new(),
+        }],
+        optional_tools: vec![
+            doctor::ToolStatus {
+                name: "appimageupdatetool".to_string(),
+                found: false,
+                consequence: String::new(),
+            },
+            doctor::ToolStatus {
+                name: "unsquashfs".to_string(),
+                found: false,
+                consequence: String::new(),
+            },
+        ],
+        orphaned_icons: Vec::new(),
+        leftover_files: Vec::new(),
+        broken_entries: Vec::new(),
+    };
+
+    assert!(report.is_clean(), "optional tooling never decides whether something is wrong");
 }
 
 #[test]
@@ -224,7 +303,7 @@ fn remove_leaves_nothing_behind() {
 
     let report = doctor::run(&sandbox.paths).unwrap();
     assert!(report.orphaned_icons.is_empty());
-    assert!(report.orphaned_appimages.is_empty());
+    assert!(report.leftover_files.is_empty());
     assert!(report.broken_entries.is_empty());
 
     assert!(matches!(remove::remove(&sandbox.paths, "fake-app"), Err(Error::NotInstalled(_))));
@@ -381,4 +460,46 @@ fn the_environment_decides_where_everything_lives() {
     assert_eq!(paths.applications_dir, sandbox.root.join("xdg-data/applications"));
     assert_eq!(paths.icons_root, sandbox.root.join("xdg-data/icons/hicolor"));
     assert_eq!(paths.appimage_path("app"), elsewhere.join("app.AppImage"));
+}
+
+/// An AppImage downloaded through a browser has no executable bit, and the
+/// runtime cannot extract itself without one.
+#[test]
+fn an_appimage_without_the_executable_bit_still_extracts() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source = FakeAppImage::new("Fake App")
+        .not_executable()
+        .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
+    assert!(!is_executable(&source));
+
+    let info = metadata::inspect(&source, None).unwrap();
+    assert!(info.extract_problems.is_empty(), "{:?}", info.extract_problems);
+    assert!(info.extract_root().is_some());
+    assert_eq!(info.name.as_deref(), Some("Fake App"));
+    assert!(is_executable(&source), "the file gets the bit it needs to run");
+}
+
+/// A runtime that refuses to extract has to say why, with its own words.
+#[test]
+fn a_failing_runtime_reports_its_exit_status_and_message() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source = FakeAppImage::new("Fake App")
+        .failing(3, "runtime: cannot open the payload")
+        .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
+
+    let info = metadata::inspect(&source, None).unwrap();
+    assert!(info.extract_root().is_none());
+
+    let problems = info.extract_problems.join("\n");
+    assert!(problems.contains("exited with 3"), "{problems}");
+    assert!(problems.contains("cannot open the payload"), "{problems}");
+    // Nothing here is about FUSE, the runtime extracts without it.
+    assert!(!problems.to_lowercase().contains("fuse"), "{problems}");
+    // A shell script carries no squashfs payload, and that is said plainly.
+    assert!(problems.contains("no squashfs payload"), "{problems}");
+
+    // The name still falls back to the file name, so installing stays possible.
+    assert_eq!(info.name.as_deref(), Some("Fake_App"));
 }

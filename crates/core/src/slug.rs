@@ -35,12 +35,12 @@ pub fn name_from_filename(file_name: &str) -> String {
         .or_else(|| file_name.strip_suffix(".appimage"))
         .unwrap_or(file_name);
 
-    match base.find(['-', '_']) {
-        Some(idx) if base[idx + 1..].starts_with(|c: char| c.is_ascii_digit()) => {
-            base[..idx].to_string()
-        }
-        _ => base.to_string(),
-    }
+    // The version is the first segment that starts with a digit, and only
+    // everything from there on is dropped: `Some-App-2.0` keeps `Some-App`.
+    base.match_indices(['-', '_'])
+        .find(|(index, _)| base[index + 1..].starts_with(|c: char| c.is_ascii_digit()))
+        .map(|(index, _)| base[..index].to_string())
+        .unwrap_or_else(|| base.to_string())
 }
 
 #[cfg(test)]
@@ -93,5 +93,9 @@ mod tests {
         assert_eq!(name_from_filename("obsidian_1.5.3.AppImage"), "obsidian");
         assert_eq!(name_from_filename("Cursor.AppImage"), "Cursor");
         assert_eq!(name_from_filename("some-app.AppImage"), "some-app");
+        // The version can sit behind more than one separator.
+        assert_eq!(name_from_filename("Some-App-2.0.AppImage"), "Some-App");
+        assert_eq!(name_from_filename("Fake_App-1.0.0.AppImage"), "Fake_App");
+        assert_eq!(name_from_filename("balena-etcher-1.19.25-x64.AppImage"), "balena-etcher");
     }
 }

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use crate::desktop_entry::{self, DesktopEntry};
 use crate::error::{Error, Result};
-use crate::fs_util;
+use crate::fs_util::{self, MODE_EXEC};
 use crate::{elf, slug, version};
 
 const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
@@ -26,6 +26,16 @@ impl Extraction {
     }
 }
 
+/// What an extraction attempt did, in words a user can act on. Empty when
+/// the AppImage extracted on the first try.
+#[derive(Debug, Default)]
+pub struct ExtractReport {
+    pub extraction: Option<Extraction>,
+    /// One line per attempt that failed, with the exit status and whatever
+    /// the tool printed. Never a guess about the cause.
+    pub problems: Vec<String>,
+}
+
 /// Everything worth knowing about an AppImage before installing it. All of it
 /// is optional: AppImages that refuse to extract still install fine, the user
 /// just has to supply name and icon.
@@ -42,6 +52,8 @@ pub struct AppImageInfo {
     pub version: Option<String>,
     pub update_info: Option<String>,
     pub extraction: Option<Extraction>,
+    /// Why the AppImage did not extract, when it did not.
+    pub extract_problems: Vec<String>,
 }
 
 impl AppImageInfo {
@@ -66,8 +78,9 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
         ..Default::default()
     };
 
-    let extraction = extract(appimage);
-    if let Some(extraction) = extraction {
+    let report = extract_reported(appimage);
+    info.extract_problems = report.problems;
+    if let Some(extraction) = report.extraction {
         if let Some(entry) = read_embedded_entry(extraction.root()) {
             apply_entry(&mut info, &entry, locale);
         }
@@ -83,7 +96,22 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
 /// Extracts an AppImage, first through its own runtime, then through
 /// `unsquashfs`. Returns `None` when neither works.
 pub fn extract(appimage: &Path) -> Option<Extraction> {
-    extract_with_runtime(appimage).or_else(|| extract_with_unsquashfs(appimage))
+    extract_reported(appimage).extraction
+}
+
+/// Extracts an AppImage and says what went wrong along the way. The runtime
+/// does the extraction itself, no FUSE involved, so a failure here is about
+/// the file or the runtime, never about libfuse.
+pub fn extract_reported(appimage: &Path) -> ExtractReport {
+    let mut problems = Vec::new();
+
+    if let Some(extraction) = extract_with_runtime(appimage, &mut problems) {
+        return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
+    }
+    if let Some(extraction) = extract_with_unsquashfs(appimage, &mut problems) {
+        return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
+    }
+    ExtractReport { extraction: None, problems }
 }
 
 /// Reads the `.upd_info` ELF section, which holds the zsync update string.
@@ -134,32 +162,88 @@ fn apply_entry(info: &mut AppImageInfo, entry: &DesktopEntry, locale: Option<&st
     }
 }
 
-fn extract_with_runtime(appimage: &Path) -> Option<Extraction> {
+/// Runs the AppImage's own runtime. An AppImage that arrived through a
+/// browser is not executable, and the runtime cannot run without that bit,
+/// so it is set first.
+fn extract_with_runtime(appimage: &Path, problems: &mut Vec<String>) -> Option<Extraction> {
     if !fs_util::is_executable(appimage) {
-        return None;
+        if let Err(error) = fs_util::set_mode(appimage, MODE_EXEC) {
+            problems.push(format!(
+                "{} is not executable and the mode could not be changed: {error}",
+                appimage.display()
+            ));
+            return None;
+        }
     }
-    let dir = tempfile::Builder::new().prefix("appimg-extract-").tempdir().ok()?;
 
-    let status = Command::new(appimage)
+    let dir = match tempfile::Builder::new().prefix("appimg-extract-").tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            problems.push(format!("no temporary directory for the extraction: {error}"));
+            return None;
+        }
+    };
+
+    let output = Command::new(appimage)
         .arg("--appimage-extract")
         .current_dir(dir.path())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            problems
+                .push(format!("running {} --appimage-extract failed: {error}", appimage.display()));
+            return None;
+        }
+    };
 
     let root = dir.path().join("squashfs-root");
-    (status.success() && root.is_dir()).then_some(Extraction { _dir: dir, root })
+    if output.status.success() && root.is_dir() {
+        return Some(Extraction { _dir: dir, root });
+    }
+
+    problems.push(format!(
+        "--appimage-extract {}{}",
+        describe_status(output.status),
+        first_lines(&output.stderr, &output.stdout)
+    ));
+    if output.status.success() {
+        problems.push("--appimage-extract wrote no squashfs-root directory".to_string());
+    }
+    None
 }
 
-fn extract_with_unsquashfs(appimage: &Path) -> Option<Extraction> {
-    let unsquashfs = fs_util::which("unsquashfs")?;
-    let offset = find_squashfs_offset(appimage)?;
-    let dir = tempfile::Builder::new().prefix("appimg-extract-").tempdir().ok()?;
+/// The runtime is not the only way in: the squashfs payload sits behind the
+/// ELF part of the file and `unsquashfs` can read it from there.
+fn extract_with_unsquashfs(appimage: &Path, problems: &mut Vec<String>) -> Option<Extraction> {
+    let Some(offset) = payload_offset(appimage) else {
+        problems.push(format!(
+            "{} carries no squashfs payload behind its ELF header",
+            appimage.display()
+        ));
+        return None;
+    };
+
+    let Some(unsquashfs) = fs_util::which("unsquashfs") else {
+        problems.push(format!(
+            "the squashfs payload starts at byte {offset}, but unsquashfs is not installed \
+             (package squashfs-tools), so it cannot be unpacked without the runtime"
+        ));
+        return None;
+    };
+
+    let dir = match tempfile::Builder::new().prefix("appimg-extract-").tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            problems.push(format!("no temporary directory for the extraction: {error}"));
+            return None;
+        }
+    };
     let root = dir.path().join("squashfs-root");
 
-    let status = Command::new(unsquashfs)
+    let output = Command::new(unsquashfs)
         .arg("-no-progress")
         .arg("-o")
         .arg(offset.to_string())
@@ -167,12 +251,52 @@ fn extract_with_unsquashfs(appimage: &Path) -> Option<Extraction> {
         .arg(&root)
         .arg(appimage)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
+        .output();
 
-    (status.success() && root.is_dir()).then_some(Extraction { _dir: dir, root })
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            problems.push(format!("running unsquashfs failed: {error}"));
+            return None;
+        }
+    };
+
+    if output.status.success() && root.is_dir() {
+        return Some(Extraction { _dir: dir, root });
+    }
+
+    problems.push(format!(
+        "unsquashfs {}{}",
+        describe_status(output.status),
+        first_lines(&output.stderr, &output.stdout)
+    ));
+    None
+}
+
+/// Where the squashfs payload starts: from the ELF header, and only if that
+/// fails, by looking for the magic bytes.
+pub fn payload_offset(appimage: &Path) -> Option<u64> {
+    elf::payload_offset(appimage).or_else(|| find_squashfs_offset(appimage))
+}
+
+fn describe_status(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exited with {code}"),
+        None => "was killed by a signal".to_string(),
+    }
+}
+
+/// The first two lines a tool printed, so the reason travels with the error
+/// without dumping a whole log into the terminal.
+fn first_lines(stderr: &[u8], stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(if stderr.is_empty() { stdout } else { stderr });
+    let message: Vec<&str> =
+        text.lines().map(str::trim).filter(|line| !line.is_empty()).take(2).collect();
+    if message.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", message.join(" / "))
+    }
 }
 
 /// Finds where the squashfs image starts inside an AppImage by scanning for

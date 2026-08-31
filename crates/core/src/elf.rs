@@ -7,6 +7,29 @@ const CLASS_64: u8 = 2;
 const DATA_LITTLE_ENDIAN: u8 = 1;
 const SECTION_HEADER_SIZE: usize = 64;
 
+/// Where the ELF part of the file ends, which is where an AppImage keeps
+/// its squashfs payload. Reading the header beats scanning for magic bytes,
+/// because the magic can also appear inside the payload itself.
+pub fn payload_offset(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+
+    let mut ident = [0u8; 16];
+    file.read_exact(&mut ident).ok()?;
+    if &ident[0..4] != ELF_MAGIC || ident[4] != CLASS_64 || ident[5] != DATA_LITTLE_ENDIAN {
+        return None;
+    }
+
+    let mut header = [0u8; 48];
+    file.read_exact(&mut header).ok()?;
+    let section_table_offset = read_u64(&header, 24)?;
+    let section_entry_size = read_u16(&header, 42)? as u64;
+    let section_count = read_u16(&header, 44)? as u64;
+
+    let end = section_table_offset.checked_add(section_entry_size.checked_mul(section_count)?)?;
+    let size = file.metadata().ok()?.len();
+    (end > 0 && end < size).then_some(end)
+}
+
 /// Reads one section out of a 64-bit little-endian ELF file. Anything else,
 /// including malformed files, yields `None`. AppImage runtimes are x86_64
 /// binaries, so no other ELF flavour needs to be understood here.
@@ -181,6 +204,31 @@ mod tests {
         let script = dir.path().join("script.sh");
         write_atomic(&script, b"#!/bin/sh\necho hi\n", MODE_FILE).unwrap();
         assert!(read_section(&script, ".upd_info").is_none());
+    }
+
+    #[test]
+    fn the_payload_starts_where_the_section_table_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.elf");
+        let mut bytes = elf_with_section(".upd_info", b"data");
+        let elf_size = bytes.len() as u64;
+        bytes.extend_from_slice(b"hsqs");
+        bytes.extend_from_slice(&[0u8; 64]);
+        write_atomic(&path, &bytes, MODE_FILE).unwrap();
+
+        assert_eq!(payload_offset(&path), Some(elf_size));
+    }
+
+    #[test]
+    fn a_file_without_a_payload_has_no_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.elf");
+        write_atomic(&path, &elf_with_section(".upd_info", b"data"), MODE_FILE).unwrap();
+        assert_eq!(payload_offset(&path), None);
+
+        let script = dir.path().join("script.sh");
+        write_atomic(&script, b"#!/bin/sh\n", MODE_FILE).unwrap();
+        assert_eq!(payload_offset(&script), None);
     }
 
     #[test]

@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::desktop_entry::DesktopEntry;
 use crate::error::Result;
 use crate::fs_util;
 use crate::list::{self, Health};
@@ -39,10 +40,11 @@ pub struct DoctorReport {
     pub applications_dir_writable: bool,
     pub required_tools: Vec<ToolStatus>,
     pub optional_tools: Vec<ToolStatus>,
-    /// Icons whose slug has no desktop entry any more.
+    /// Icons of a slug appimg manages whose entry no longer refers to them.
     pub orphaned_icons: Vec<PathBuf>,
-    /// AppImages in the managed directory that no entry refers to.
-    pub orphaned_appimages: Vec<PathBuf>,
+    /// `<slug>.AppImage.bak` and `.new` files an interrupted update left
+    /// behind, for slugs appimg manages.
+    pub leftover_files: Vec<PathBuf>,
     /// Managed entries whose AppImage or slug is missing.
     pub broken_entries: Vec<(String, PathBuf)>,
 }
@@ -54,14 +56,22 @@ impl DoctorReport {
             && self.applications_dir_writable
             && self.required_tools.iter().all(|t| t.found)
             && self.orphaned_icons.is_empty()
-            && self.orphaned_appimages.is_empty()
+            && self.leftover_files.is_empty()
             && self.broken_entries.is_empty()
     }
 }
 
+/// Looks the environment over and hunts for leftovers of appimg's own
+/// installations.
+///
+/// Only files that belong to a slug with `X-AppImg-Managed=true` are ever
+/// considered. The icon theme and the AppImage directory are shared with
+/// everything else on the machine, and a file appimg did not put there is
+/// none of its business: it is never reported and never offered for
+/// deletion.
 pub fn run(paths: &Paths) -> Result<DoctorReport> {
     let apps = list::list(paths)?;
-    let slugs: HashSet<String> = apps.iter().map(|app| app.slug.clone()).collect();
+    let managed = managed_icon_names(&apps);
 
     Ok(DoctorReport {
         libfuse2: has_libfuse2(),
@@ -69,14 +79,30 @@ pub fn run(paths: &Paths) -> Result<DoctorReport> {
         applications_dir_writable: is_writable(&paths.applications_dir),
         required_tools: check_tools(REQUIRED_TOOLS),
         optional_tools: check_tools(OPTIONAL_TOOLS),
-        orphaned_appimages: collect_orphaned_appimages(&paths.appimage_dir, &slugs),
+        leftover_files: collect_leftovers(paths, &managed),
         broken_entries: apps
             .iter()
             .filter(|app| app.health != Health::Ok)
             .map(|app| (app.slug.clone(), app.desktop_entry_path.clone()))
             .collect(),
-        orphaned_icons: collect_orphaned_icons(&paths.icons_root, &slugs),
+        orphaned_icons: collect_orphaned_icons(&paths.icons_root, &managed),
     })
+}
+
+/// The slugs appimg manages, each with the icon name its entry uses. An
+/// entry that fell back to a generic icon no longer refers to the icons that
+/// were installed under its slug.
+fn managed_icon_names(apps: &[list::InstalledApp]) -> HashMap<String, String> {
+    apps.iter()
+        .filter(|app| !app.slug.is_empty())
+        .map(|app| {
+            let icon = DesktopEntry::read(&app.desktop_entry_path)
+                .ok()
+                .and_then(|entry| entry.get("Icon").map(str::to_string))
+                .unwrap_or_default();
+            (app.slug.clone(), icon)
+        })
+        .collect()
 }
 
 fn check_tools(tools: &[(&str, &str)]) -> Vec<ToolStatus> {
@@ -122,7 +148,11 @@ fn is_writable(dir: &Path) -> bool {
     tempfile::NamedTempFile::new_in(dir).is_ok()
 }
 
-fn collect_orphaned_icons(icons_root: &Path, slugs: &HashSet<String>) -> Vec<PathBuf> {
+/// Icons named after a slug appimg manages, in the `<size>/apps` layout it
+/// writes, that the slug's entry does not use any more. Icons of other
+/// applications share the same tree and are skipped, whatever they are
+/// called.
+fn collect_orphaned_icons(icons_root: &Path, managed: &HashMap<String, String>) -> Vec<PathBuf> {
     let mut orphans = Vec::new();
     let mut stack = vec![icons_root.to_path_buf()];
 
@@ -136,12 +166,18 @@ fn collect_orphaned_icons(icons_root: &Path, slugs: &HashSet<String>) -> Vec<Pat
                 stack.push(path);
                 continue;
             }
+            if !in_apps_directory(&path) {
+                continue;
+            }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            // Only icons that look like ours are our business.
-            if !slugs.contains(stem) && was_installed_by_appimg(&path) {
-                orphans.push(path);
+            match managed.get(stem) {
+                // The entry still points at these icons, they are in use.
+                Some(icon) if icon == stem => {}
+                Some(_) => orphans.push(path),
+                // Not one of ours, so not ours to report.
+                None => {}
             }
         }
     }
@@ -149,31 +185,24 @@ fn collect_orphaned_icons(icons_root: &Path, slugs: &HashSet<String>) -> Vec<Pat
     orphans
 }
 
-/// An icon counts as ours when it sits in `<size>/apps` and no other
-/// application in the tree claims it. Anything outside that layout belongs to
-/// the distribution and is left alone.
-fn was_installed_by_appimg(icon: &Path) -> bool {
+fn in_apps_directory(icon: &Path) -> bool {
     icon.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("apps")
 }
 
-fn collect_orphaned_appimages(appimage_dir: &Path, slugs: &HashSet<String>) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(appimage_dir) else {
-        return Vec::new();
-    };
-
-    let mut orphans: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("AppImage"))
-        .filter(|path| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|stem| !slugs.contains(stem))
-                .unwrap_or(false)
+/// The staging and backup files an interrupted update leaves behind. Both
+/// are named after a managed slug, so they are provably appimg's own.
+fn collect_leftovers(paths: &Paths, managed: &HashMap<String, String>) -> Vec<PathBuf> {
+    let mut leftovers: Vec<PathBuf> = managed
+        .keys()
+        .flat_map(|slug| {
+            ["AppImage.bak", "AppImage.new"]
+                .iter()
+                .map(|suffix| paths.appimage_dir.join(format!("{slug}.{suffix}")))
+                .collect::<Vec<_>>()
         })
+        .filter(|path| path.is_file())
         .collect();
 
-    orphans.sort();
-    orphans
+    leftovers.sort();
+    leftovers
 }
