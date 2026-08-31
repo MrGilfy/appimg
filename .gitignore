@@ -1,3 +1,8 @@
 /target
 PROMPT.md
 prototype.sh
+packaging/aur/*.log
+packaging/aur/*.pkg.tar.zst
+packaging/aur/*.tar.gz
+packaging/aur/src/
+packaging/aur/pkg/
