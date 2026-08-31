@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-31
+
 ### Added
 
 - `appimg-core`: installing, updating and removing AppImages entirely inside
