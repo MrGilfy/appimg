@@ -9,7 +9,7 @@ inside `$HOME`.
 cargo install appimg
 ```
 
-Arch/AUR: `appimg` or `appimg-bin`.
+Arch/AUR: `appimg` 
 
 Needs Rust 1.88, which is what ratatui's dependencies require, not the code
 itself.
