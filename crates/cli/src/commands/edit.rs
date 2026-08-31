@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -25,15 +26,28 @@ pub fn run(paths: &Paths, ui: &Ui, args: &EditArgs) -> Result<Outcome> {
     }
 
     let app = list::find(paths, &args.name)?;
-    let original = DesktopEntry::read(&app.desktop_entry_path)?;
-
-    let edited = edit_in_editor(&original)?;
-    if edited == original {
+    if !edit_entry(paths, &app.desktop_entry_path)? {
         ui.info("Nothing changed.");
         return Ok(Outcome::NothingToDo);
     }
 
-    let mut edited = edited;
+    for warning in caches::validate_desktop_entry(&app.desktop_entry_path) {
+        ui.warn(&warning);
+    }
+    ui.info(&format!("Updated {}.", app.desktop_entry_path.display()));
+    Ok(Outcome::Done)
+}
+
+/// Opens a desktop entry in `$EDITOR` and writes it back. The keys appimg
+/// owns survive even when the user deletes them. Returns whether anything
+/// changed.
+pub fn edit_entry(paths: &Paths, entry_path: &Path) -> Result<bool> {
+    let original = DesktopEntry::read(entry_path)?;
+    let mut edited = edit_in_editor(&original)?;
+    if edited == original {
+        return Ok(false);
+    }
+
     for key in MANAGED_KEYS {
         if edited.get(key).is_none() {
             if let Some(value) = original.get(key) {
@@ -43,14 +57,9 @@ pub fn run(paths: &Paths, ui: &Ui, args: &EditArgs) -> Result<Outcome> {
     }
     desktop_entry::validate_categories(&edited.categories())?;
 
-    edited.write(&app.desktop_entry_path)?;
-    for warning in caches::validate_desktop_entry(&app.desktop_entry_path) {
-        ui.warn(&warning);
-    }
+    edited.write(entry_path)?;
     caches::refresh(paths);
-
-    ui.info(&format!("Updated {}.", app.desktop_entry_path.display()));
-    Ok(Outcome::Done)
+    Ok(true)
 }
 
 fn edit_in_editor(entry: &DesktopEntry) -> Result<DesktopEntry> {

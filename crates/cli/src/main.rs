@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+mod tui;
 mod ui;
 
 use std::process::ExitCode;
@@ -50,6 +51,6 @@ fn run(args: &Cli, ui: &Ui) -> anyhow::Result<Outcome> {
         Some(Command::Completions(completion_args)) => {
             commands::completions::run(ui, completion_args)
         }
-        None => commands::list::run(&paths, ui, &cli::ListArgs { json: false }),
+        None => tui::run(&paths, ui),
     }
 }

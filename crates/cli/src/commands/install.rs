@@ -129,7 +129,7 @@ fn apply_overrides(request: &mut InstallRequest, args: &InstallArgs) -> Result<(
 }
 
 /// Splits a launch argument string on whitespace, honouring quotes.
-fn split_args(input: &str) -> Vec<String> {
+pub fn split_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;

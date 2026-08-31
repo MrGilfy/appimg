@@ -10,6 +10,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 - `appimg-core`: installing, updating and removing AppImages entirely inside
   the user's home, with the desktop entry as the only source of truth.
+- Terminal interface: table of installed applications, details, search, an
+  install form with a file browser and a preview of the generated desktop
+  entry, update, edit and remove, with a panic hook that restores the
+  terminal.
 - Command line interface: `install`, `list`, `update`, `remove`, `edit`,
   `doctor` and `completions`, all scriptable, with `--json` output for `list`
   and `update --check`.

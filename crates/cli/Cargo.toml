@@ -20,6 +20,7 @@ anyhow = "1.0.104"
 appimg-core = { path = "../core" }
 clap = { version = "4.5.61", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "color", "wrap_help"] }
 clap_complete = "4.5.67"
+ratatui = "0.29.0"
 tempfile = "3.27.0"
 
 [dev-dependencies]
