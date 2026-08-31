@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: static x86_64 binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Collect the artifacts
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          staging="appimg-${version}-x86_64-linux-musl"
+          mkdir -p "$staging"
+          cp target/x86_64-unknown-linux-musl/release/appimg "$staging/"
+          cp LICENSE README.md CHANGELOG.md "$staging/"
+          cp -r man completions "$staging/"
+          rm -f "$staging"/man/.gitignore "$staging"/completions/.gitignore
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" "$staging/appimg" > sha256sums.txt
+
+      - name: Take the release notes from the changelog
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { printing = 1; next }
+            printing && /^## \[/ { exit }
+            printing { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md || echo "See CHANGELOG.md." > release-notes.md
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: |
+            appimg-*-x86_64-linux-musl.tar.gz
+            sha256sums.txt

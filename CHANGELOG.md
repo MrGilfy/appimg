@@ -14,6 +14,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   install form with a file browser and a preview of the generated desktop
   entry, update, edit and remove, with a panic hook that restores the
   terminal.
+- Packaging: PKGBUILDs for `appimg` and `appimg-bin`, CI that checks
+  formatting, clippy and the tests, and a release workflow that publishes a
+  static musl binary. The man page and the shell completions are generated
+  from the clap definition during the build.
 - Command line interface: `install`, `list`, `update`, `remove`, `edit`,
   `doctor` and `completions`, all scriptable, with `--json` output for `list`
   and `update --check`.
