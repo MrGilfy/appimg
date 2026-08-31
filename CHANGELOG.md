@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-31
+
+### Added
+
+- `update --check` reads the zsync file itself: the header carries the
+  length and the checksums of the complete file, so a single ranged request
+  decides whether the installed AppImage is still the one being offered.
+  `appimageupdatetool` is only needed to apply a delta, and its absence no
+  longer keeps a check from reporting a version or a size difference.
+
+### Fixed
+
+- Release notes are the changelog section of the tag that is being built.
+  A tag without a section fails the release job instead of publishing a
+  pointer to `CHANGELOG.md`, and the extraction is covered by a test that
+  runs in CI.
+- An update that needs `appimageupdatetool` says that the tool is missing
+  instead of reporting that no update source was recorded.
+
 ## [0.1.0] - 2026-08-31
 
 ### Added
