@@ -7,6 +7,7 @@ pkgdesc="Install, update and remove AppImages as proper desktop applications"
 arch=('x86_64')
 url="https://github.com/MrGilfy/appimg"
 license=('MIT')
+options=('!lto')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('fuse2: needed by most AppImages at runtime'
@@ -14,7 +15,7 @@ optdepends=('fuse2: needed by most AppImages at runtime'
             'desktop-file-utils: desktop database updates'
             'gtk-update-icon-cache: icon cache updates')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # run `updpkgsums` after tagging, never ship SKIP to the AUR
+sha256sums=('bf610e4541ad32d5193f13e87ac8806c92feca57ab852796b96e96fc344fac11')
 
 prepare() {
 	cd "$pkgname-$pkgver"
