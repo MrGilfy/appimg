@@ -8,19 +8,20 @@ use std::fs;
 use appimg_core::desktop_entry::{self, DesktopEntry};
 use appimg_core::install::{IconChoice, InstallRequest};
 use appimg_core::list::Health;
-use appimg_core::{doctor, install, list, remove, update, Error};
+use appimg_core::{doctor, install, list, metadata, remove, update, Error};
 
 use common::{is_executable, read, walk, FakeAppImage, Sandbox};
 
 fn install_fake(sandbox: &Sandbox, file_name: &str) -> install::InstallOutcome {
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, file_name);
-    let info = common::inspect(&source, None);
+    let info = metadata::inspect(&source, None).unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     install::install(&sandbox.paths, &request).unwrap()
 }
 
 #[test]
 fn install_writes_binary_icons_and_entry() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let outcome = install_fake(&sandbox, "Fake_App-1.2.0-x86_64.AppImage");
 
@@ -55,14 +56,16 @@ fn install_writes_binary_icons_and_entry() {
 
 #[test]
 fn the_preferred_locale_wins_for_the_name() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake App.AppImage");
-    let info = common::inspect(&source, Some("de_DE.UTF-8"));
+    let info = metadata::inspect(&source, Some("de_DE.UTF-8")).unwrap();
     assert_eq!(info.name.as_deref(), Some("Fake App (de)"));
 }
 
 #[test]
 fn list_reports_what_was_installed() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     install_fake(&sandbox, "Fake_App-1.2.0.AppImage");
 
@@ -83,6 +86,7 @@ fn list_reports_what_was_installed() {
 
 #[test]
 fn foreign_desktop_entries_are_left_alone() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     fs::write(
         sandbox.paths.applications_dir.join("someone-else.desktop"),
@@ -95,13 +99,14 @@ fn foreign_desktop_entries_are_left_alone() {
 
 #[test]
 fn installing_the_same_slug_twice_needs_overwrite() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     install_fake(&sandbox, "Fake_App-1.2.0.AppImage");
 
     let source = FakeAppImage::new("Fake App")
         .marker("second")
         .build(&sandbox.downloads, "Fake_App-2.0.0.AppImage");
-    let info = common::inspect(&source, None);
+    let info = metadata::inspect(&source, None).unwrap();
     let mut request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
 
     match install::install(&sandbox.paths, &request) {
@@ -118,17 +123,18 @@ fn installing_the_same_slug_twice_needs_overwrite() {
 
 #[test]
 fn stale_icons_do_not_survive_a_replacement() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let first = FakeAppImage::new("Fake App")
         .icon_sizes(&[48, 256])
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = common::inspect(&first, None);
+    let info = metadata::inspect(&first, None).unwrap();
     install::install(&sandbox.paths, &InstallRequest::from_info(&first, "local", &info)).unwrap();
 
     let second = FakeAppImage::new("Fake App")
         .icon_sizes(&[64])
         .build(&sandbox.downloads, "Fake_App-2.0.0.AppImage");
-    let info = common::inspect(&second, None);
+    let info = metadata::inspect(&second, None).unwrap();
     let mut request = InstallRequest::from_info(&second, "local", &info);
     request.overwrite = true;
     install::install(&sandbox.paths, &request).unwrap();
@@ -140,9 +146,10 @@ fn stale_icons_do_not_survive_a_replacement() {
 
 #[test]
 fn an_unusable_icon_falls_back_to_the_generic_one() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App.AppImage");
-    let info = common::inspect(&source, None);
+    let info = metadata::inspect(&source, None).unwrap();
     let mut request = InstallRequest::from_info(&source, "local", &info);
     request.icon = IconChoice::Fallback;
 
@@ -154,6 +161,7 @@ fn an_unusable_icon_falls_back_to_the_generic_one() {
 
 #[test]
 fn a_deleted_binary_shows_up_as_broken() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
     fs::remove_file(&outcome.appimage_path).unwrap();
@@ -170,6 +178,7 @@ fn a_deleted_binary_shows_up_as_broken() {
 
 #[test]
 fn doctor_finds_orphans_and_a_clean_tree_afterwards() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let stray_icon = sandbox.paths.icons_root.join("48x48/apps/ghost.png");
     fs::create_dir_all(stray_icon.parent().unwrap()).unwrap();
@@ -191,6 +200,7 @@ fn doctor_finds_orphans_and_a_clean_tree_afterwards() {
 
 #[test]
 fn remove_leaves_nothing_behind() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
     // A failed update left this behind, removal has to take it along.
@@ -222,11 +232,12 @@ fn remove_leaves_nothing_behind() {
 
 #[test]
 fn updating_from_a_local_file_keeps_manual_edits() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let origin = sandbox.downloads.join("Fake_App.AppImage");
     FakeAppImage::new("Fake App").marker("v1").build(&sandbox.downloads, "Fake_App.AppImage");
 
-    let info = common::inspect(&origin, None);
+    let info = metadata::inspect(&origin, None).unwrap();
     let mut request = InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info);
     request.name = "My Renamed App".to_string();
     request.categories = vec!["Graphics".to_string()];
@@ -265,10 +276,11 @@ fn updating_from_a_local_file_keeps_manual_edits() {
 
 #[test]
 fn a_rollback_puts_the_previous_version_back() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let origin = sandbox.downloads.join("Fake_App.AppImage");
     FakeAppImage::new("Fake App").marker("v1").build(&sandbox.downloads, "Fake_App.AppImage");
-    let info = common::inspect(&origin, None);
+    let info = metadata::inspect(&origin, None).unwrap();
     let request = InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info);
     install::install(&sandbox.paths, &request).unwrap();
 
@@ -285,10 +297,11 @@ fn a_rollback_puts_the_previous_version_back() {
 
 #[test]
 fn check_reports_without_touching_anything() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let origin = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
     FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = common::inspect(&origin, None);
+    let info = metadata::inspect(&origin, None).unwrap();
     install::install(
         &sandbox.paths,
         &InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info),
@@ -316,6 +329,7 @@ fn check_reports_without_touching_anything() {
 
 #[test]
 fn an_app_without_a_source_cannot_be_updated() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
     let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
@@ -330,6 +344,7 @@ fn an_app_without_a_source_cannot_be_updated() {
 
 #[test]
 fn a_missing_source_file_is_an_error_not_a_panic() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let missing = sandbox.downloads.join("gone.AppImage");
     let request = InstallRequest::from_info(&missing, "local", &Default::default());
@@ -348,6 +363,7 @@ fn a_missing_source_file_is_an_error_not_a_panic() {
 /// variables, every other test builds its `Paths` directly.
 #[test]
 fn the_environment_decides_where_everything_lives() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let elsewhere = sandbox.root.join("elsewhere");
 

@@ -20,32 +20,41 @@ const MANAGED_KEYS: &[&str] = &[
     desktop_entry::KEY_INSTALLED_AT,
 ];
 
+/// What came out of an editing session.
+pub struct Edited {
+    pub changed: bool,
+    /// Whatever `desktop-file-validate` said about the saved entry.
+    pub warnings: Vec<String>,
+}
+
 pub fn run(paths: &Paths, ui: &Ui, args: &EditArgs) -> Result<Outcome> {
     if !ui.is_interactive() {
         bail!("editing needs a terminal");
     }
 
     let app = list::find(paths, &args.name)?;
-    if !edit_entry(paths, &app.desktop_entry_path)? {
+    let edited = edit_entry(paths, &app.desktop_entry_path)?;
+    if !edited.changed {
         ui.info("Nothing changed.");
         return Ok(Outcome::NothingToDo);
     }
 
-    for warning in caches::validate_desktop_entry(&app.desktop_entry_path) {
-        ui.warn(&warning);
+    for warning in &edited.warnings {
+        ui.warn(warning);
     }
     ui.info(&format!("Updated {}.", app.desktop_entry_path.display()));
     Ok(Outcome::Done)
 }
 
 /// Opens a desktop entry in `$EDITOR` and writes it back. The keys appimg
-/// owns survive even when the user deletes them. Returns whether anything
-/// changed.
-pub fn edit_entry(paths: &Paths, entry_path: &Path) -> Result<bool> {
+/// owns survive even when the user deletes them. A saved entry is validated
+/// again and the desktop database and the icon cache are refreshed, because
+/// the name, the categories or the icon may have changed.
+pub fn edit_entry(paths: &Paths, entry_path: &Path) -> Result<Edited> {
     let original = DesktopEntry::read(entry_path)?;
     let mut edited = edit_in_editor(&original)?;
     if edited == original {
-        return Ok(false);
+        return Ok(Edited { changed: false, warnings: Vec::new() });
     }
 
     for key in MANAGED_KEYS {
@@ -58,8 +67,9 @@ pub fn edit_entry(paths: &Paths, entry_path: &Path) -> Result<bool> {
     desktop_entry::validate_categories(&edited.categories())?;
 
     edited.write(entry_path)?;
+    let warnings = caches::validate_desktop_entry(entry_path);
     caches::refresh(paths);
-    Ok(true)
+    Ok(Edited { changed: true, warnings })
 }
 
 fn edit_in_editor(entry: &DesktopEntry) -> Result<DesktopEntry> {

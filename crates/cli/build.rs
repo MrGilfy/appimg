@@ -21,11 +21,14 @@ fn main() {
 
     generate(&out_dir);
 
-    // Packaging installs these from the repository, so keep them current
-    // whenever the tree is writable. A read-only source tree is fine.
+    // `OUT_DIR` carries a build hash in its path, which packaging cannot
+    // rely on, so the same files also land in `man/` and `completions/` at
+    // the root of the source tree. They are created when they are missing,
+    // which is what a fresh checkout looks like. A source tree that cannot
+    // be written to is not an error, `OUT_DIR` still has everything.
     let man_dir = repo_root.join("man");
     let completions_dir = repo_root.join("completions");
-    if man_dir.is_dir() && completions_dir.is_dir() {
+    if fs::create_dir_all(&man_dir).is_ok() && fs::create_dir_all(&completions_dir).is_ok() {
         copy(&out_dir.join("appimg.1"), &man_dir.join("appimg.1"));
         for name in ["appimg.fish", "appimg.bash", "_appimg", "appimg.elv"] {
             copy(&out_dir.join(name), &completions_dir.join(name));

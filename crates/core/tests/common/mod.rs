@@ -3,13 +3,26 @@
 
 #![allow(dead_code)]
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use appimg_core::metadata::{self, AppImageInfo};
 use appimg_core::paths::Paths;
 use tempfile::TempDir;
+
+/// Executing a file while any process still holds it open for writing fails
+/// with `ETXTBSY`. The writing thread closes its handle before the file gets
+/// its final name, but a `fork` in another test thread inherits that handle
+/// for the moment between fork and exec, which is enough. The tests run one
+/// at a time, so no fork can ever happen while a fixture is being written.
+pub fn serial() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let lock = LOCK.get_or_init(|| Mutex::new(()));
+    // A failing test must not take the rest of the suite down with it.
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// A throwaway XDG home with the directories `appimg` writes to.
 pub struct Sandbox {
@@ -134,25 +147,18 @@ impl FakeAppImage {
             payload = payload.display(),
         );
 
+        // The script only appears under its final name once it is complete
+        // and closed: no reader, and no `exec`, ever sees a half-written file.
         let path = dir.join(file_name);
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let partial = dir.join(format!(".{file_name}.partial"));
+        let mut file = File::create(&partial).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::rename(&partial, &path).unwrap();
         path
     }
-}
-
-/// Reads an AppImage the way the tests need it. Running a file that another
-/// test thread still holds open for writing fails with `ETXTBSY`, which says
-/// nothing about the code under test, so give the extraction a few tries.
-pub fn inspect(path: &Path, locale: Option<&str>) -> AppImageInfo {
-    for _ in 0..50 {
-        let info = metadata::inspect(path, locale).unwrap();
-        if info.extract_root().is_some() {
-            return info;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    panic!("{} never extracted", path.display());
 }
 
 pub fn read(path: &Path) -> String {

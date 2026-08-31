@@ -72,21 +72,27 @@ fn event_loop(terminal: &mut Tui, app: &mut App) -> Result<()> {
     }
 }
 
-/// Hands the terminal to `$EDITOR` and takes it back afterwards.
+/// Hands the terminal to `$EDITOR` and takes it back afterwards. Raw mode
+/// and the alternate screen are given up before the editor starts and taken
+/// again once it is gone, whether it succeeded or not.
 fn run_editor(terminal: &mut Tui, app: &mut App, slug: &str) -> Result<()> {
     let installed = list::find(&app.paths, slug)?;
+
     leave(terminal)?;
-
     let result = crate::commands::edit::edit_entry(&app.paths, &installed.desktop_entry_path);
-
     *terminal = enter()?;
     terminal.clear()?;
+
     app.reload()?;
     app.select_slug(slug);
-
     app.status = Some(match result {
-        Ok(true) => format!("Updated the entry of {}.", installed.name),
-        Ok(false) => "Nothing changed.".to_string(),
+        Ok(edited) if !edited.changed => "Nothing changed.".to_string(),
+        Ok(edited) => match edited.warnings.first() {
+            Some(warning) => {
+                format!("Updated {}. desktop-file-validate: {warning}", installed.name)
+            }
+            None => format!("Updated the entry of {}.", installed.name),
+        },
         Err(error) => format!("{error:#}"),
     });
     Ok(())

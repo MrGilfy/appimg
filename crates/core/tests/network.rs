@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use appimg_core::install::InstallRequest;
-use appimg_core::{download, install, list, update};
+use appimg_core::{download, install, list, metadata, update};
 
 use common::{read, walk, FakeAppImage, Sandbox};
 
@@ -78,6 +78,7 @@ impl Drop for Server {
 
 #[test]
 fn a_url_is_recognised_and_names_its_file() {
+    let _serial = common::serial();
     assert!(download::is_url("https://example.com/App.AppImage"));
     assert!(download::is_url("http://example.com/App.AppImage"));
     assert!(!download::is_url("/home/someone/App.AppImage"));
@@ -90,6 +91,7 @@ fn a_url_is_recognised_and_names_its_file() {
 
 #[test]
 fn downloading_reports_progress_and_writes_the_file() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let server = Server::start(b"an appimage payload".to_vec());
     let dest = sandbox.downloads.join("App.AppImage");
@@ -112,6 +114,7 @@ fn downloading_reports_progress_and_writes_the_file() {
 
 #[test]
 fn a_download_that_fails_leaves_no_half_file() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let dest = sandbox.downloads.join("App.AppImage");
     // Nothing listens on this port.
@@ -124,6 +127,7 @@ fn a_download_that_fails_leaves_no_half_file() {
 
 #[test]
 fn install_from_a_url_records_it_and_updates_from_it() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
     let server = Server::start(std::fs::read(&built).unwrap());
@@ -132,7 +136,7 @@ fn install_from_a_url_records_it_and_updates_from_it() {
     let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
     download::to_file(&url, &downloaded, None).unwrap();
 
-    let info = common::inspect(&downloaded, None);
+    let info = metadata::inspect(&downloaded, None).unwrap();
     let outcome =
         install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info))
             .unwrap();
@@ -167,6 +171,7 @@ fn install_from_a_url_records_it_and_updates_from_it() {
 
 #[test]
 fn a_failing_update_leaves_the_installed_version_alone() {
+    let _serial = common::serial();
     let sandbox = Sandbox::new();
     let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
     let url = {
@@ -174,7 +179,7 @@ fn a_failing_update_leaves_the_installed_version_alone() {
         let url = server.url("Fake_App-1.0.0.AppImage");
         let downloaded = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
         download::to_file(&url, &downloaded, None).unwrap();
-        let info = common::inspect(&downloaded, None);
+        let info = metadata::inspect(&downloaded, None).unwrap();
         install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info))
             .unwrap();
         url
