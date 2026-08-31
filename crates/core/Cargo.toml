@@ -1,0 +1,21 @@
+[package]
+name = "appimg-core"
+description = "Core logic for appimg: install, update and remove AppImages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+imagesize = "0.15.0"
+thiserror = "2.0.20"
+ureq = "3.2.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tiny_http = "0.12.0"

@@ -1,0 +1,23 @@
+[package]
+name = "appimg"
+description = "Install, update and remove AppImages as proper desktop applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "appimg"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+appimg-core = { path = "../core" }
+
+[dev-dependencies]
+
+[build-dependencies]
