@@ -14,6 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Take the release notes from the changelog
+        run: .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
+
       - name: Install the Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -35,16 +38,6 @@ jobs:
           rm -f "$staging"/man/.gitignore "$staging"/completions/.gitignore
           tar czf "${staging}.tar.gz" "$staging"
           sha256sum "${staging}.tar.gz" "$staging/appimg" > sha256sums.txt
-
-      - name: Take the release notes from the changelog
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v version="$version" '
-            $0 ~ "^## \\[" version "\\]" { printing = 1; next }
-            printing && /^## \[/ { exit }
-            printing { print }
-          ' CHANGELOG.md > release-notes.md
-          test -s release-notes.md || echo "See CHANGELOG.md." > release-notes.md
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2

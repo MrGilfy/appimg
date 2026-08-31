@@ -38,3 +38,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
+
+  release-notes:
+    name: release notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: .github/scripts/release-notes-test.sh
+
+      - name: The current version has release notes
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          echo "Release notes for $version:"
+          .github/scripts/release-notes.sh "$version"
