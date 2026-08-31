@@ -3,13 +3,15 @@
 Installs, updates and removes AppImages as proper desktop applications, entirely
 inside `$HOME`.
 
+![appimg](docs/screenshot.png)
+
 ## Install
 
 ```
 cargo install appimg
 ```
 
-Arch/AUR: `appimg` or `appimg-bin` .  
+Arch/AUR: `appimg` or `appimg-bin` .
 
 Needs Rust 1.88, which is what ratatui's dependencies require, not the code
 itself.
