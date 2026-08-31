@@ -56,6 +56,12 @@ pub enum Error {
 
     #[error("no update source could be determined for {0:?}")]
     NoUpdateSource(String),
+
+    #[error("{url}: {reason}")]
+    Zsync { url: String, reason: String },
+
+    #[error("{tool} is not installed, {purpose}")]
+    MissingTool { tool: String, purpose: String },
 }
 
 impl Error {

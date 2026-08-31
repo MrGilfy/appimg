@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -94,6 +94,29 @@ pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Resu
     fs_util::set_mode(&partial, MODE_EXEC)?;
     std::fs::rename(&partial, dest).map_err(|e| Error::io(dest, e))?;
     Ok(written)
+}
+
+/// Fetches at most `max_bytes` from the start of a URL, with a ranged
+/// request. A server that ignores the range simply sends more, so the reader
+/// is capped either way: the caller gets the beginning of the file and
+/// nothing else is downloaded.
+pub fn head_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let response = agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Range", format!("bytes=0-{}", max_bytes.saturating_sub(1)))
+        .call()
+        .map_err(|e| Error::Download(format!("{url}: {e}")))?;
+
+    let mut reader = response.into_body().into_reader().take(max_bytes as u64);
+    let mut out = Vec::with_capacity(max_bytes.min(64 * 1024));
+    std::io::Read::read_to_end(&mut reader, &mut out)
+        .map_err(|e| Error::Download(format!("{url}: {e}")))?;
+
+    if out.is_empty() {
+        return Err(Error::Download(format!("{url}: the server sent an empty response")));
+    }
+    Ok(out)
 }
 
 /// Fetches a URL as text, used for the GitHub release API.

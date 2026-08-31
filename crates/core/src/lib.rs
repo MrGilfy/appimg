@@ -20,6 +20,7 @@ pub mod remove;
 pub mod slug;
 pub mod update;
 pub mod version;
+pub mod zsync;
 
 pub use desktop_entry::{DesktopEntry, MAIN_CATEGORIES};
 pub use error::{Error, Result};

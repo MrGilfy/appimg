@@ -9,14 +9,15 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, icon, json, version};
+use crate::{caches, icon, json, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
 /// How an application can be updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSource {
-    /// `X-AppImg-UpdateInfo` plus `appimageupdatetool`, which does zsync deltas.
+    /// `X-AppImg-UpdateInfo` pointing at a zsync file. The check reads that
+    /// file's header directly, applying the delta needs `appimageupdatetool`.
     Zsync {
         update_info: String,
     },
@@ -113,10 +114,16 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
         UpdateSource::None => {
             status.note = Some("no update source recorded".to_string());
         }
-        UpdateSource::Zsync { .. } => match zsync_check(&app.appimage_path) {
-            Some(available) => status.available = available,
-            None => status.note = Some("appimageupdatetool is not installed".to_string()),
-        },
+        UpdateSource::Zsync { update_info } => {
+            let url =
+                zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+            let header = zsync::fetch_header(&url)?;
+            status.latest_version =
+                header.filename.as_deref().and_then(version::extract).or_else(|| current.clone());
+            let (available, note) = zsync_compare(&header, &app.appimage_path)?;
+            status.available = available;
+            status.note = note;
+        }
         UpdateSource::GitHubRelease { owner, repo, asset } => {
             let release = latest_release(owner, repo)?;
             status.latest_version = release.version();
@@ -159,11 +166,8 @@ pub fn update(
     match &source {
         UpdateSource::None => Err(Error::NoUpdateSource(app.slug.clone())),
         UpdateSource::Zsync { .. } => {
-            if zsync_update(&target)? {
-                finish(paths, app, &target, None, source)
-            } else {
-                Err(Error::NoUpdateSource(app.slug.clone()))
-            }
+            zsync_update(&target)?;
+            finish(paths, app, &target, None, source)
         }
         UpdateSource::GitHubRelease { owner, repo, asset } => {
             let release = latest_release(owner, repo)?;
@@ -397,28 +401,67 @@ fn latest_release(owner: &str, repo: &str) -> Result<Release> {
     })
 }
 
-/// `appimageupdatetool --check-for-update` exits 1 when an update exists.
-fn zsync_check(appimage: &Path) -> Option<bool> {
-    let tool = fs_util::which("appimageupdatetool")?;
-    let status = Command::new(tool)
-        .arg("--check-for-update")
-        .arg(appimage)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
+/// The zsync URL out of an `X-AppImg-UpdateInfo` of the form
+/// `zsync|<url>`.
+fn zsync_url(update_info: &str) -> Option<String> {
+    let url = update_info.split('|').nth(1)?.trim();
+    download::is_url(url).then(|| url.to_string())
+}
 
-    match status.code() {
-        Some(0) => Some(false),
-        Some(1) => Some(true),
-        _ => None,
+/// Whether the local file still is the one a zsync header describes, and what
+/// to say about it. The length settles most cases on its own; the checksum
+/// only has to be computed when the two files are the same size.
+fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Option<String>)> {
+    let local = fs_util::file_size(appimage).ok_or_else(|| Error::NotFound(appimage.into()))?;
+
+    if local != header.length {
+        return Ok((
+            true,
+            Some(format!(
+                "the offered file is {}, the installed one {}",
+                human_size(header.length),
+                human_size(local)
+            )),
+        ));
+    }
+    let Some(remote) = header.sha1.as_deref() else {
+        return Ok((
+            false,
+            Some("the zsync file has no checksum, only the sizes match".to_string()),
+        ));
+    };
+    if zsync::sha1_file(appimage)? == remote {
+        Ok((false, None))
+    } else {
+        Ok((true, Some("same size as the installed file, different checksum".to_string())))
     }
 }
 
-fn zsync_update(appimage: &Path) -> Result<bool> {
+/// Byte counts for the note of a check, in the units a person reads.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// Applies the delta. This is the one step that still needs the external
+/// tool, and saying so is more use than silently doing nothing.
+fn zsync_update(appimage: &Path) -> Result<()> {
     let Some(tool) = fs_util::which("appimageupdatetool") else {
-        return Ok(false);
+        return Err(Error::MissingTool {
+            tool: "appimageupdatetool".to_string(),
+            purpose: "it applies the zsync delta an update of this application needs".to_string(),
+        });
     };
     let status = Command::new(tool)
         .arg("--overwrite")
@@ -429,7 +472,13 @@ fn zsync_update(appimage: &Path) -> Result<bool> {
         .status()
         .map_err(|e| Error::io(appimage, e))?;
 
-    Ok(status.success())
+    if !status.success() {
+        return Err(Error::Download(format!(
+            "appimageupdatetool could not update {}",
+            appimage.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -452,10 +501,67 @@ mod tests {
     }
 
     #[test]
-    fn plain_zsync_update_info_needs_the_external_tool() {
-        let source = source_from_update_info("zsync|https://example.com/App.AppImage.zsync");
+    fn plain_zsync_update_info_carries_the_url_of_the_zsync_file() {
+        let info = "zsync|https://example.com/App.AppImage.zsync";
+        let source = source_from_update_info(info);
         assert!(matches!(source, Some(UpdateSource::Zsync { .. })));
+        assert_eq!(zsync_url(info).as_deref(), Some("https://example.com/App.AppImage.zsync"));
         assert_eq!(source_from_update_info("nonsense"), None);
+        // Nothing that could be fetched, so nothing to check against.
+        assert_eq!(zsync_url("zsync|App.AppImage.zsync"), None);
+        assert_eq!(zsync_url("zsync"), None);
+    }
+
+    #[test]
+    fn a_different_length_is_an_update_and_names_both_sizes() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![0u8; 2048]).unwrap();
+        let header = zsync::Header {
+            filename: Some("App-2.0.0.AppImage".to_string()),
+            length: 4096,
+            sha1: Some("0".repeat(40)),
+            url: None,
+            mtime: None,
+        };
+
+        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        assert!(available);
+        let note = note.unwrap();
+        assert!(note.contains("4.0 KB"), "{note}");
+        assert!(note.contains("2.0 KB"), "{note}");
+    }
+
+    #[test]
+    fn the_same_length_is_decided_by_the_checksum() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"abc").unwrap();
+        let mut header = zsync::Header {
+            filename: None,
+            length: 3,
+            sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".to_string()),
+            url: None,
+            mtime: None,
+        };
+
+        assert_eq!(zsync_compare(&header, file.path()).unwrap(), (false, None));
+
+        header.sha1 = Some("0".repeat(40));
+        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        assert!(available);
+        assert!(note.unwrap().contains("checksum"));
+
+        // Without a checksum the sizes are all there is, and the check says so.
+        header.sha1 = None;
+        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        assert!(!available);
+        assert!(note.is_some());
+    }
+
+    #[test]
+    fn sizes_are_readable() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(90 * 1024 * 1024), "90.0 MB");
     }
 
     #[test]

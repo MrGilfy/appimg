@@ -21,7 +21,7 @@ const REQUIRED_TOOLS: &[(&str, &str)] = &[
 const OPTIONAL_TOOLS: &[(&str, &str)] = &[
     (
         "appimageupdatetool",
-        "delta updates via zsync are unavailable, updates re-download the whole file",
+        "zsync delta updates cannot be applied, checking for them works without it",
     ),
     ("unsquashfs", "AppImages with a broken runtime cannot be inspected"),
 ];
