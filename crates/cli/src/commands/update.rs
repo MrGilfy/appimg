@@ -47,9 +47,8 @@ fn targets(paths: &Paths, args: &UpdateArgs) -> Result<Vec<InstalledApp>> {
     match (&args.name, args.all) {
         (Some(name), _) => Ok(vec![list::find(paths, name)?]),
         (None, true) => Ok(list::list(paths)?),
-        (None, false) => {
-            bail!("give a name or pass --all")
-        }
+        // clap already rejects neither, this only keeps the match total.
+        (None, false) => Ok(Vec::new()),
     }
 }
 

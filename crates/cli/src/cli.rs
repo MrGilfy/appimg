@@ -38,7 +38,7 @@ pub enum Command {
     Update(UpdateArgs),
     /// Remove an installed AppImage.
     Remove(RemoveArgs),
-    /// Change the desktop entry of an installed AppImage.
+    /// Change the desktop entry of an installed AppImage in $EDITOR.
     Edit(EditArgs),
     /// Check the environment and look for leftovers.
     Doctor,
@@ -88,12 +88,13 @@ pub struct ListArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("target").args(["name", "all"]).required(true))]
 pub struct UpdateArgs {
     /// Name or slug of the application to update.
     pub name: Option<String>,
 
     /// Update every installed application.
-    #[arg(long, conflicts_with = "name")]
+    #[arg(long)]
     pub all: bool,
 
     /// Only report what is available, change nothing.
@@ -115,10 +116,6 @@ pub struct RemoveArgs {
 pub struct EditArgs {
     /// Name or slug of the application to edit.
     pub name: String,
-
-    /// Open the desktop entry in $EDITOR instead of the form.
-    #[arg(long)]
-    pub editor: bool,
 }
 
 #[derive(Debug, Args)]
