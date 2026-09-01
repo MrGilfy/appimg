@@ -38,8 +38,7 @@ Checking works out of the box. If the AppImage carries zsync update
 information, appimg reads the zsync header itself and compares it to the
 installed file.
 
-Applying a delta update needs `appimageupdatetool`, which is not packaged
-for Arch. Get it from the AppImageUpdate releases and put it on your PATH:
+Applying a delta update needs `appimageupdatetool`. Get it from the AppImageUpdate releases and put it on your PATH:
 
     appimg install https://github.com/AppImageCommunity/AppImageUpdate/releases/download/continuous/appimageupdatetool-x86_64.AppImage
 
