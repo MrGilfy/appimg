@@ -12,7 +12,6 @@ options=('!debug' '!strip')
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 optdepends=('fuse2: needed by most AppImages at runtime'
-            'appimageupdatetool: delta updates via zsync'
             'desktop-file-utils: desktop database updates'
             'gtk-update-icon-cache: icon cache updates')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/appimg-$pkgver-$CARCH-linux-musl.tar.gz")

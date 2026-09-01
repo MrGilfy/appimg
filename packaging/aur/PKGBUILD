@@ -11,7 +11,6 @@ options=('!lto')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('fuse2: needed by most AppImages at runtime'
-            'appimageupdatetool: delta updates via zsync'
             'desktop-file-utils: desktop database updates'
             'gtk-update-icon-cache: icon cache updates')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
