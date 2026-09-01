@@ -6,6 +6,45 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-02
+
+### Changed
+
+- A release that keeps moving is shown by the day it was published,
+  `2025-10-18`, instead of the build id its AppImages declare. The two
+  builds of one AppImageUpdate continuous release called themselves
+  `255-a211784` and `254-a211784`: the same commit, different build
+  numbers, and neither a version anyone can act on. A release counts as a
+  moving one when it names no version at all — anything with a dotted
+  number is out, however much else it carries — and carries a marker of a
+  build that keeps moving, either a word like `continuous` or `nightly` or
+  an abbreviated commit hash. So `2.0.0-alpha-1-20251018` and the
+  date-stamped `20251018` go on being shown as the versions they are, while
+  `continuous` and `255-a211784` do not. Without a date, which is all an
+  installed file on its own can offer, the commit is shown instead, so both
+  of those builds read `a211784`.
+
+### Fixed
+
+- `update --check` compares a moving release like with like. Two dates
+  order, so the check says whether the installed file is older and not
+  merely different. The commit settles identity: on a channel that only
+  ever moves forward the same commit is the same build, so a check names
+  the day that build was published, and a different commit is an update. A
+  build id is never ordered against a version; the check says it has
+  nothing to compare rather than deciding by how the two happen to be
+  spelled.
+- An update follows the tag it was installed from when that tag is a moving
+  one. `gh-releases-zsync|AppImage|AppImageUpdate|continuous|...` names
+  `continuous`, and appimg asked for the latest release regardless, which
+  on that repository is an entirely different release. A tag that names a
+  version is still ignored in favour of the latest release, since following
+  it would pin the application to the version it was installed at.
+- A zsync source whose file name carries no version reports the day the
+  offered file was built, out of the `MTime` of the header. Reading a
+  version out of `appimageupdatetool-x86_64.AppImage` yielded the `64` of
+  its architecture.
+
 ## [0.1.2] - 2026-09-01
 
 ### Fixed

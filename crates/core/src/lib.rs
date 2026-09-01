@@ -4,6 +4,7 @@
 //! user could make arrives as data, every path comes from [`Paths`].
 
 pub mod caches;
+pub mod date;
 pub mod desktop_entry;
 pub mod doctor;
 pub mod download;

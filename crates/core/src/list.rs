@@ -5,6 +5,7 @@ use crate::desktop_entry::{self, DesktopEntry};
 use crate::error::{Error, Result};
 use crate::fs_util;
 use crate::paths::Paths;
+use crate::version;
 
 /// What is left of an installation on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,7 +112,10 @@ fn build_app(paths: &Paths, entry: &DesktopEntry, desktop_entry_path: PathBuf) -
         name: entry.get("Name").unwrap_or(&slug).to_string(),
         comment: entry.get("Comment").map(str::to_string),
         categories: entry.categories(),
-        version: entry.get(desktop_entry::KEY_VERSION).map(str::to_string),
+        // A rolling build id is reduced to its commit whenever it is
+        // read, so an entry written before that rule existed shows the
+        // same thing as one written after it.
+        version: entry.get(desktop_entry::KEY_VERSION).map(version::display),
         origin: entry.get(desktop_entry::KEY_SOURCE).map(str::to_string),
         update_info: entry.get(desktop_entry::KEY_UPDATE_INFO).map(str::to_string),
         installed_at: entry.get(desktop_entry::KEY_INSTALLED_AT).map(str::to_string),

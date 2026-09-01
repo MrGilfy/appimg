@@ -90,6 +90,10 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
     if info.name.is_none() {
         info.name = Some(slug::name_from_filename(&file_name(appimage)));
     }
+    // Whatever the version came from, a build id is not a version. Reducing
+    // it here keeps the desktop entry, the table and the update check
+    // showing the same thing.
+    info.version = info.version.as_deref().map(version::display);
     Ok(info)
 }
 

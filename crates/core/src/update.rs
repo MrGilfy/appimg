@@ -9,7 +9,7 @@ use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, icon, json, version, zsync};
+use crate::{caches, date, icon, json, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -21,10 +21,13 @@ pub enum UpdateSource {
     Zsync {
         update_info: String,
     },
-    /// A GitHub release, queried through the API.
+    /// A GitHub release, queried through the API. `tag` is set only for a
+    /// tag that keeps moving, see [`tag_to_follow`]; without one the latest
+    /// release is asked for.
     GitHubRelease {
         owner: String,
         repo: String,
+        tag: Option<String>,
         asset: Option<String>,
     },
     /// Plain re-download of the stored URL.
@@ -118,20 +121,18 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             let url =
                 zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
             let header = zsync::fetch_header(&url)?;
-            status.latest_version =
-                header.filename.as_deref().and_then(version::extract).or_else(|| current.clone());
+            status.latest_version = offered_by_zsync(&header).or_else(|| current.clone());
             let (available, note) = zsync_compare(&header, &app.appimage_path)?;
             status.available = available;
             status.note = note;
         }
-        UpdateSource::GitHubRelease { owner, repo, asset } => {
-            let release = latest_release(owner, repo)?;
+        UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
+            let release = fetch_release(owner, repo, tag.as_deref())?;
             status.latest_version = release.version();
-            status.available = match (&current, &status.latest_version) {
-                (Some(current), Some(latest)) => version::is_newer(latest, current),
-                (None, Some(_)) => true,
-                _ => false,
-            };
+            let (installed, available, note) = compare_release(current.as_deref(), &release);
+            status.current_version = installed;
+            status.available = available;
+            status.note = note;
             if release.asset_url(asset.as_deref()).is_none() {
                 status.available = false;
                 status.note = Some("the latest release has no matching AppImage asset".to_string());
@@ -193,27 +194,28 @@ pub fn update(
         UpdateSource::Zsync { .. } => {
             zsync_update(&target)?;
             let backup = claim_zsync_backup(paths, &app.slug);
-            finish(paths, app, &target, backup, source)
+            finish(paths, app, &target, backup, source, None)
         }
-        UpdateSource::GitHubRelease { owner, repo, asset } => {
-            let release = latest_release(owner, repo)?;
+        UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
+            let release = fetch_release(owner, repo, tag.as_deref())?;
             let url = release
                 .asset_url(asset.as_deref())
                 .ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+            let recorded = release.recorded_version();
             let staged = download_staged(paths, &app.slug, &url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source)
+            finish(paths, app, &target, Some(backup), source, recorded)
         }
         UpdateSource::DirectUrl { url } => {
             let staged = download_staged(paths, &app.slug, url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source)
+            finish(paths, app, &target, Some(backup), source, None)
         }
         UpdateSource::LocalFile { path } => {
             let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
             fs_util::copy_atomic(path, &staged, MODE_EXEC)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source)
+            finish(paths, app, &target, Some(backup), source, None)
         }
     }
 }
@@ -266,12 +268,17 @@ fn claim_zsync_backup(paths: &Paths, slug: &str) -> Option<PathBuf> {
 /// Re-reads metadata and icons from the new binary and refreshes only the
 /// technical keys. Name, categories and launch arguments stay as they are,
 /// they may well have been edited by hand.
+///
+/// `from_release` is the version the source knows and the file does not: a
+/// rolling build declares a build number and a commit, while the release it
+/// came out of knows the day it was published.
 fn finish(
     paths: &Paths,
     app: &InstalledApp,
     target: &Path,
     backup: Option<PathBuf>,
     source: UpdateSource,
+    from_release: Option<String>,
 ) -> Result<UpdateOutcome> {
     let info = metadata::inspect(target, None).ok();
 
@@ -286,10 +293,16 @@ fn finish(
         None => Vec::new(),
     };
 
-    let new_version = info
-        .as_ref()
-        .and_then(|info| info.version.clone())
-        .or_else(|| version::extract(&target.file_name().unwrap_or_default().to_string_lossy()));
+    let new_version = match info.as_ref().and_then(|info| info.version.clone()) {
+        // A build id says nothing about age. Recording the date of the
+        // release it was downloaded from is what lets the next check tell
+        // whether this file has fallen behind.
+        Some(declared) if version::is_rolling(&declared) => from_release.or(Some(declared)),
+        Some(declared) => Some(declared),
+        None => from_release.or_else(|| {
+            version::extract(&target.file_name().unwrap_or_default().to_string_lossy())
+        }),
+    };
 
     let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
     entry.set_optional(desktop_entry::KEY_VERSION, new_version.clone());
@@ -356,6 +369,7 @@ fn source_from_update_info(info: &str) -> Option<UpdateSource> {
         Some("gh-releases-zsync") if parts.len() >= 5 => Some(UpdateSource::GitHubRelease {
             owner: parts[1].to_string(),
             repo: parts[2].to_string(),
+            tag: tag_to_follow(parts[3]),
             asset: Some(parts[4].to_string()),
         }),
         Some("zsync") if parts.len() >= 2 => {
@@ -375,21 +389,61 @@ fn github_source_from_url(url: &str) -> Option<UpdateSource> {
     if parts.next()? != "releases" {
         return None;
     }
+    // .../releases/download/<tag>/<asset>
+    let tag = match parts.next() {
+        Some("download") => parts.next().and_then(tag_to_follow),
+        _ => None,
+    };
     let asset = rest.rsplit('/').next().map(str::to_string);
-    Some(UpdateSource::GitHubRelease { owner, repo, asset })
+    Some(UpdateSource::GitHubRelease { owner, repo, tag, asset })
+}
+
+/// Which tag an update should follow, out of the one the application was
+/// installed from. A moving tag like `continuous` is the whole point of the
+/// channel and is followed as it is written, because the newest build only
+/// ever appears under it. A tag that names a version was a snapshot, and
+/// following that would pin the application to the version it was installed
+/// at, so the latest release is asked for instead. `latest` is GitHub's own
+/// word for exactly that, and no tag of that name has to exist.
+fn tag_to_follow(tag: &str) -> Option<String> {
+    let tag = tag.trim();
+    (version::is_rolling(tag) && !tag.eq_ignore_ascii_case("latest")).then(|| tag.to_string())
 }
 
 struct Release {
     tag: Option<String>,
     assets: Vec<String>,
+    /// The day it was published, `2025-10-18`.
+    published: Option<String>,
+    /// The commit it was built from, abbreviated.
+    commit: Option<String>,
 }
 
 impl Release {
+    /// Whether this release is a moving one rather than a cut version.
+    fn is_rolling(&self) -> bool {
+        self.tag.as_deref().is_some_and(version::is_rolling)
+    }
+
+    /// What to show as the version of this release. A tag that names a
+    /// version is that version, as it always was. A rolling tag names none,
+    /// and reading one out of an asset called `x86_64` would be a guess, so
+    /// the day the release was published stands in for it, and the commit
+    /// when there is not even a date.
     fn version(&self) -> Option<String> {
+        if self.is_rolling() {
+            return self.published.clone().or_else(|| self.commit.clone());
+        }
         self.tag
             .as_deref()
             .and_then(version::extract)
             .or_else(|| self.assets.first().and_then(|url| version::extract(url)))
+    }
+
+    /// The version to record for a file downloaded out of this release,
+    /// when the file itself will not carry one.
+    fn recorded_version(&self) -> Option<String> {
+        self.is_rolling().then(|| self.published.clone()).flatten()
     }
 
     /// Picks the asset that looks most like the one that was installed.
@@ -438,13 +492,84 @@ fn asset_signature(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-fn latest_release(owner: &str, repo: &str) -> Result<Release> {
-    let url = format!("{GITHUB_API}/repos/{owner}/{repo}/releases/latest");
+/// Reads a release: the one behind a moving tag, or the latest one when no
+/// tag is followed.
+fn fetch_release(owner: &str, repo: &str, tag: Option<&str>) -> Result<Release> {
+    let url = match tag {
+        Some(tag) => format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}"),
+        None => format!("{GITHUB_API}/repos/{owner}/{repo}/releases/latest"),
+    };
     let body = download::to_string(&url)?;
     Ok(Release {
         tag: json::string_field(&body, "tag_name"),
         assets: json::string_fields(&body, "browser_download_url"),
+        published: json::string_field(&body, "published_at")
+            .as_deref()
+            .and_then(date::from_timestamp),
+        // A continuous release points its tag at the commit it was built
+        // from, which is the same commit the builds themselves name.
+        commit: json::string_field(&body, "target_commitish")
+            .as_deref()
+            .and_then(version::short_commit),
     })
+}
+
+/// Whether `release` is newer than what is installed, and what to show as
+/// the installed version while saying so.
+///
+/// A rolling release names no version, and neither does a build out of one.
+/// What both carry is the commit: on a channel that only ever moves forward
+/// the same commit is the same build, and a different one supersedes it. An
+/// installed file that already carries a date is compared as a date, which
+/// orders, so it says whether the file is the older one and not merely a
+/// different one. Anything that names a version is compared exactly as it
+/// was before.
+fn compare_release(
+    current: Option<&str>,
+    release: &Release,
+) -> (Option<String>, bool, Option<String>) {
+    let latest = release.version();
+
+    if release.is_rolling() {
+        let installed = current.and_then(version::short_commit);
+        if let (Some(installed), Some(offered)) = (installed, release.commit.as_deref()) {
+            if installed != offered {
+                return (Some(installed), true, None);
+            }
+            // Same commit, same build: the installed file is that release,
+            // so it carries the day that release was published.
+            return (release.published.clone().or(Some(installed)), false, None);
+        }
+    }
+
+    match (current, latest.as_deref()) {
+        (Some(current), Some(latest)) if version::comparable(current, latest) => {
+            (Some(current.to_string()), version::is_newer(latest, current), None)
+        }
+        (Some(current), Some(_)) => (
+            Some(current.to_string()),
+            false,
+            Some(
+                "the installed build carries no version to compare with the offered one"
+                    .to_string(),
+            ),
+        ),
+        (None, Some(_)) => (None, true, None),
+        (current, None) => (current.map(str::to_string), false, None),
+    }
+}
+
+/// What the header of a zsync file says the offered version is. The name of
+/// the complete file carries one when the project ships versions at all; a
+/// continuous build does not, and reading a version out of `x86_64` would
+/// be a guess, so the day the file was built stands in for it.
+fn offered_by_zsync(header: &zsync::Header) -> Option<String> {
+    header
+        .filename
+        .as_deref()
+        .filter(|name| version::names_a_version(name))
+        .and_then(version::extract)
+        .or_else(|| header.mtime.as_deref().and_then(date::from_http_date))
 }
 
 /// The zsync URL out of an `X-AppImg-UpdateInfo` of the form
@@ -524,7 +649,35 @@ mod tests {
             Some(UpdateSource::GitHubRelease {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
+                tag: None,
                 asset: Some("App-*x86_64.AppImage.zsync".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_moving_tag_is_followed() {
+        // The continuous build only ever appears under its own tag, and
+        // the latest release is not it.
+        assert_eq!(tag_to_follow("continuous").as_deref(), Some("continuous"));
+        assert_eq!(tag_to_follow("nightly").as_deref(), Some("nightly"));
+        // Following a version tag would pin the application to the version
+        // it was installed at, forever.
+        assert_eq!(tag_to_follow("v1.2.3"), None);
+        assert_eq!(tag_to_follow("2.0.0-alpha-1-20251018"), None);
+        // GitHub's own word for the endpoint, not a tag that has to exist.
+        assert_eq!(tag_to_follow("latest"), None);
+
+        let source = source_from_update_info(
+            "gh-releases-zsync|AppImage|AppImageUpdate|continuous|AppImageUpdate-*x86_64.AppImage.zsync",
+        );
+        assert_eq!(
+            source,
+            Some(UpdateSource::GitHubRelease {
+                owner: "AppImage".to_string(),
+                repo: "AppImageUpdate".to_string(),
+                tag: Some("continuous".to_string()),
+                asset: Some("AppImageUpdate-*x86_64.AppImage.zsync".to_string()),
             })
         );
     }
@@ -645,10 +798,25 @@ mod tests {
             Some(UpdateSource::GitHubRelease {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
+                tag: None,
                 asset: Some("App.AppImage".to_string()),
             })
         );
         assert_eq!(github_source_from_url("https://example.com/App.AppImage"), None);
+
+        // A download out of a continuous release keeps following it.
+        let source = github_source_from_url(
+            "https://github.com/AppImage/AppImageUpdate/releases/download/continuous/appimageupdatetool-x86_64.AppImage",
+        );
+        assert_eq!(
+            source,
+            Some(UpdateSource::GitHubRelease {
+                owner: "AppImage".to_string(),
+                repo: "AppImageUpdate".to_string(),
+                tag: Some("continuous".to_string()),
+                asset: Some("appimageupdatetool-x86_64.AppImage".to_string()),
+            })
+        );
     }
 
     #[test]
@@ -660,6 +828,8 @@ mod tests {
                 "https://example.com/App-2.0.0-x86_64.AppImage".to_string(),
                 "https://example.com/App-2.0.0.tar.gz".to_string(),
             ],
+            published: Some("2025-10-18".to_string()),
+            commit: None,
         };
 
         assert_eq!(release.version().as_deref(), Some("2.0.0"));
@@ -674,7 +844,135 @@ mod tests {
         let release = Release {
             tag: Some("v1".to_string()),
             assets: vec!["https://x/App.tar.gz".to_string()],
+            published: None,
+            commit: None,
         };
         assert_eq!(release.asset_url(None), None);
+    }
+
+    /// The AppImageUpdate continuous release as the API returns it, and the
+    /// two builds out of it that started this.
+    fn continuous_release() -> Release {
+        Release {
+            tag: Some("continuous".to_string()),
+            assets: vec!["https://x/AppImageUpdate-x86_64.AppImage".to_string()],
+            published: Some("2025-10-18".to_string()),
+            commit: Some("a211784".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_continuous_release_is_dated_instead_of_guessed_at() {
+        let release = continuous_release();
+        // Not the `64` of `x86_64`, which is what reading a version out of
+        // the asset name yields.
+        assert_eq!(release.version().as_deref(), Some("2025-10-18"));
+        assert_eq!(release.recorded_version().as_deref(), Some("2025-10-18"));
+
+        // Without a date the commit is what is left.
+        let undated = Release { published: None, ..continuous_release() };
+        assert_eq!(undated.version().as_deref(), Some("a211784"));
+
+        // A release that names a version keeps naming it.
+        let tagged = Release { tag: Some("v2.0.0".to_string()), ..continuous_release() };
+        assert_eq!(tagged.version().as_deref(), Some("2.0.0"));
+        assert_eq!(tagged.recorded_version(), None);
+    }
+
+    #[test]
+    fn the_same_commit_is_the_same_build() {
+        // The two AppImages of the release differ in their build number and
+        // in nothing else, so both are up to date and both are shown as the
+        // day the release was published.
+        for installed in ["255-a211784", "254-a211784", "a211784"] {
+            let (current, available, note) =
+                compare_release(Some(installed), &continuous_release());
+            assert_eq!(current.as_deref(), Some("2025-10-18"), "{installed}");
+            assert!(!available, "{installed}");
+            assert_eq!(note, None);
+        }
+    }
+
+    #[test]
+    fn another_commit_on_the_channel_is_an_update() {
+        let (current, available, _) = compare_release(Some("255-b0b0b0b"), &continuous_release());
+        assert_eq!(current.as_deref(), Some("b0b0b0b"));
+        assert!(available);
+    }
+
+    #[test]
+    fn two_dates_say_which_build_is_older() {
+        // What the file was recorded as after its last update, against what
+        // the channel offers now.
+        let (current, available, note) = compare_release(Some("2025-09-01"), &continuous_release());
+        assert_eq!(current.as_deref(), Some("2025-09-01"));
+        assert!(available, "an older date is an update");
+        assert_eq!(note, None);
+
+        let newer = Release { published: Some("2025-09-01".to_string()), ..continuous_release() };
+        let (_, available, _) = compare_release(Some("2025-10-18"), &newer);
+        assert!(!available, "a newer date is not an update");
+
+        let (_, available, _) = compare_release(Some("2025-10-18"), &continuous_release());
+        assert!(!available, "the same date is not an update");
+    }
+
+    #[test]
+    fn a_version_release_is_still_compared_as_a_version() {
+        let release = Release {
+            tag: Some("v2.0.0".to_string()),
+            assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
+            published: Some("2025-10-18".to_string()),
+            commit: Some("a211784".to_string()),
+        };
+        let (current, available, note) = compare_release(Some("1.9.0"), &release);
+        assert_eq!(current.as_deref(), Some("1.9.0"));
+        assert!(available);
+        assert_eq!(note, None);
+
+        let (_, available, _) = compare_release(Some("2.0.0"), &release);
+        assert!(!available);
+
+        // Nothing installed is an update, as it always was.
+        assert!(compare_release(None, &release).1);
+    }
+
+    #[test]
+    fn a_build_id_against_a_version_is_not_guessed_at() {
+        // The build was installed off the continuous channel and the source
+        // now offers a numbered release: neither is older than the other,
+        // and saying so beats ordering `a211784` against `2.0.0`.
+        let release = Release {
+            tag: Some("v2.0.0".to_string()),
+            assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
+            published: Some("2025-10-18".to_string()),
+            commit: None,
+        };
+        let (current, available, note) = compare_release(Some("a211784"), &release);
+        assert_eq!(current.as_deref(), Some("a211784"));
+        assert!(!available);
+        assert!(note.unwrap().contains("no version"));
+    }
+
+    #[test]
+    fn a_zsync_header_without_a_version_falls_back_to_its_date() {
+        let mut header = zsync::Header {
+            filename: Some("appimageupdatetool-x86_64.AppImage".to_string()),
+            length: 4096,
+            sha1: None,
+            url: None,
+            mtime: Some("Sat, 18 Oct 2025 19:39:31 +0000".to_string()),
+        };
+        // Not the `64` of `x86_64`.
+        assert_eq!(offered_by_zsync(&header).as_deref(), Some("2025-10-18"));
+
+        // A name that carries a version still names it.
+        header.filename = Some("App-2.0.0-x86_64.AppImage".to_string());
+        assert_eq!(offered_by_zsync(&header).as_deref(), Some("2.0.0"));
+
+        // Neither a version nor a date: nothing is made up.
+        header.filename = Some("appimageupdatetool-x86_64.AppImage".to_string());
+        header.mtime = None;
+        assert_eq!(offered_by_zsync(&header), None);
     }
 }

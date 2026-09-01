@@ -393,6 +393,49 @@ fn a_rollback_puts_the_previous_version_back() {
     assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
 }
 
+/// The AppImages of a continuous release declare a build number and the
+/// commit they were built from, and two of them out of one release differ
+/// only in that build number. What is shown is the commit, so both name the
+/// build they actually are.
+#[test]
+fn a_continuous_build_is_shown_as_the_commit_it_came_from() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+
+    for (file_name, declared) in [
+        ("AppImageUpdate-x86_64.AppImage", "255-a211784"),
+        ("validate-x86_64.AppImage", "254-a211784"),
+    ] {
+        let source = FakeAppImage::new(file_name.split('-').next().unwrap())
+            .key("X-AppImage-Version", declared)
+            .build(&sandbox.downloads, file_name);
+
+        let info = metadata::inspect(&source, None).unwrap();
+        assert_eq!(info.version.as_deref(), Some("a211784"), "{declared}");
+
+        let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
+        let outcome = install::install(&sandbox.paths, &request).unwrap();
+        let app = list::find(&sandbox.paths, &outcome.slug).unwrap();
+        assert_eq!(app.version.as_deref(), Some("a211784"), "{declared}");
+    }
+
+    // An entry written before this rule existed carries the build number as
+    // it was declared, and is read the same way as one written after it.
+    let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+    let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    entry.set(desktop_entry::KEY_VERSION, "255-a211784");
+    entry.write(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(list::find(&sandbox.paths, "fake-app").unwrap().version.as_deref(), Some("a211784"));
+
+    // A version is left alone, whatever else its name carries.
+    entry.set(desktop_entry::KEY_VERSION, "2.0.0-alpha-1-20251018");
+    entry.write(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(
+        list::find(&sandbox.paths, "fake-app").unwrap().version.as_deref(),
+        Some("2.0.0-alpha-1-20251018")
+    );
+}
+
 #[test]
 fn check_reports_without_touching_anything() {
     let _serial = common::serial();
