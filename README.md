@@ -7,27 +7,30 @@ inside `$HOME`.
 
 ## Install
 
-```
-cargo install appimg
-```
+Arch, from the AUR:
 
-Arch/AUR: `appimg` or `appimg-bin` .
+    yay -S appimg        # builds from source
+    yay -S appimg-bin    # prebuilt binary
 
-Needs Rust 1.88, which is what ratatui's dependencies require, not the code
-itself.
+Anywhere else:
+
+    cargo install appimg
+
+Requires Rust 1.88. That comes from ratatui's dependencies, not from this code.
 
 ## Usage
 
-```
-appimg install ./someapp.AppImage
-appimg install https://example.com/someapp.AppImage
-appimg list --json
-appimg update --all --check
-appimg remove someapp
-appimg doctor
-```
+Run `appimg` without arguments for the TUI, or go straight to a command:
 
-Run `appimg` with no arguments for the TUI.
+    appimg install ./someapp.AppImage
+    appimg install https://example.com/someapp.AppImage
+    appimg list --json
+    appimg update --all --check
+    appimg remove someapp
+    appimg doctor
 
-Writes to `$XDG_DATA_HOME/appimages`, `$XDG_DATA_HOME/applications` and
-`$XDG_DATA_HOME/icons/hicolor`.
+## Where things go
+
+    $XDG_DATA_HOME/appimages/<name>.AppImage      the binary
+    $XDG_DATA_HOME/applications/<name>.desktop    the launcher entry
+    $XDG_DATA_HOME/icons/hicolor/*/apps/          every icon size it found
