@@ -29,6 +29,9 @@ Run `appimg` without arguments for the TUI, or go straight to a command:
     appimg remove someapp
     appimg doctor
 
+The entry is registered right away. Some launchers read their application
+list once at startup, so it may only show up after you restart your shell.
+
 ## Updates
 
     appimg update --all --check    check without changing anything
