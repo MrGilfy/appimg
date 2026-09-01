@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-01
+
+### Fixed
+
+- A zsync update no longer leaves a full copy of the previous version on
+  disk. `appimageupdatetool` hard-links the file it replaces to
+  `<slug>.AppImage.zs-old` and never deletes it, which costs as much as the
+  AppImage itself. appimg now claims that copy as its `.bak`, so a delta
+  update can be rolled back like every other one, and confirming the update
+  drops it along with everything else the run left behind.
+- `doctor` knows every name an update can leave next to an AppImage: the
+  `.bak` and `.new` of appimg's own updates, and the `.zs-old` and `.part`
+  of `appimageupdatetool`. It names what each file is and how much disk it
+  takes, and `remove` deletes all four with the application.
+
 ## [0.1.1] - 2026-08-31
 
 ### Added

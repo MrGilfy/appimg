@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use crate::desktop_entry::{self, DesktopEntry};
 use crate::download::{self, ProgressFn};
 use crate::error::{Error, Result};
-use crate::fs_util::{self, MODE_EXEC};
+use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
@@ -153,6 +153,31 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
     Ok(status)
 }
 
+/// Every name an update can leave next to `<slug>.AppImage`, whoever wrote
+/// it. `.new` is appimg's own staging file and `.bak` its backup of the
+/// previous version; `.zs-old` and `.part` come from the zsync client inside
+/// `appimageupdatetool`, which hard-links the previous version out of the
+/// way before the swap and downloads into a partial file. All four are named
+/// after the AppImage, so a file that carries one of these suffixes and a
+/// managed slug is provably ours.
+pub const LEFTOVER_SUFFIXES: &[&str] =
+    &["AppImage.bak", "AppImage.new", "AppImage.zs-old", "AppImage.part"];
+
+/// What `appimageupdatetool` calls the copy of the version it replaced. It
+/// never deletes it, so a delta update otherwise leaves a second full
+/// AppImage behind.
+const ZSYNC_BACKUP: &str = "AppImage.zs-old";
+
+/// The leftovers of `slug` that exist right now, in the order of
+/// [`LEFTOVER_SUFFIXES`].
+pub fn leftovers(paths: &Paths, slug: &str) -> Vec<PathBuf> {
+    LEFTOVER_SUFFIXES
+        .iter()
+        .map(|suffix| paths.appimage_dir.join(format!("{slug}.{suffix}")))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
 /// Updates one application in place. The previous binary stays as `.bak`
 /// until [`confirm`] removes it, so a broken update can be rolled back.
 pub fn update(
@@ -167,7 +192,8 @@ pub fn update(
         UpdateSource::None => Err(Error::NoUpdateSource(app.slug.clone())),
         UpdateSource::Zsync { .. } => {
             zsync_update(&target)?;
-            finish(paths, app, &target, None, source)
+            let backup = claim_zsync_backup(paths, &app.slug);
+            finish(paths, app, &target, backup, source)
         }
         UpdateSource::GitHubRelease { owner, repo, asset } => {
             let release = latest_release(owner, repo)?;
@@ -192,14 +218,18 @@ pub fn update(
     }
 }
 
-/// Drops the backup of a successful update.
+/// Drops the backup of a successful update, and with it anything else the
+/// update left next to the AppImage. Once the new binary is confirmed, none
+/// of it is worth the disk it sits on.
 pub fn confirm(paths: &Paths, slug: &str) -> Result<()> {
-    let backup = backup_path(paths, slug);
-    match fs::remove_file(&backup) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::io(&backup, e)),
+    for file in leftovers(paths, slug) {
+        match fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::io(&file, e)),
+        }
     }
+    Ok(())
 }
 
 /// Puts the previous version back.
@@ -215,6 +245,22 @@ pub fn rollback(paths: &Paths, slug: &str) -> Result<()> {
 
 pub fn backup_path(paths: &Paths, slug: &str) -> PathBuf {
     paths.appimage_dir.join(format!("{slug}.AppImage.bak"))
+}
+
+/// Renames the copy `appimageupdatetool` left behind to the `.bak` every
+/// other source uses, so one rollback and one cleanup cover them all.
+/// Returns `None` when the tool wrote no backup, which is what an update
+/// that had nothing to apply looks like.
+fn claim_zsync_backup(paths: &Paths, slug: &str) -> Option<PathBuf> {
+    let left_behind = paths.appimage_dir.join(format!("{slug}.{ZSYNC_BACKUP}"));
+    if !left_behind.is_file() {
+        return None;
+    }
+    let backup = backup_path(paths, slug);
+    // A rename inside one directory either works or leaves both files where
+    // they were, and doctor reports whatever stays.
+    fs::rename(&left_behind, &backup).ok()?;
+    Some(backup)
 }
 
 /// Re-reads metadata and icons from the new binary and refreshes only the
@@ -437,23 +483,6 @@ fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Optio
     }
 }
 
-/// Byte counts for the note of a check, in the units a person reads.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
 /// Applies the delta. This is the one step that still needs the external
 /// tool, and saying so is more use than silently doing nothing.
 fn zsync_update(appimage: &Path) -> Result<()> {
@@ -557,11 +586,53 @@ mod tests {
         assert!(note.is_some());
     }
 
+    /// A `Paths` whose AppImage directory is a temporary one, for the two
+    /// tests that only look at files next to the AppImage.
+    fn sandbox_paths(dir: &Path) -> Paths {
+        Paths {
+            appimage_dir: dir.to_path_buf(),
+            applications_dir: dir.join("applications"),
+            icons_root: dir.join("icons"),
+            config_home: dir.join("config"),
+            data_home: dir.to_path_buf(),
+        }
+    }
+
     #[test]
-    fn sizes_are_readable() {
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1536), "1.5 KB");
-        assert_eq!(human_size(90 * 1024 * 1024), "90.0 MB");
+    fn the_copy_appimageupdatetool_leaves_becomes_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = sandbox_paths(dir.path());
+        let left_behind = dir.path().join("krita.AppImage.zs-old");
+        fs::write(&left_behind, "the previous 371 MB").unwrap();
+
+        let backup = claim_zsync_backup(&paths, "krita").unwrap();
+        assert_eq!(backup, backup_path(&paths, "krita"));
+        assert!(!left_behind.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "the previous 371 MB");
+
+        // Confirming the update takes it away, so nothing of the previous
+        // version is left on disk.
+        confirm(&paths, "krita").unwrap();
+        assert!(leftovers(&paths, "krita").is_empty());
+
+        // An update that had nothing to apply writes no backup.
+        assert_eq!(claim_zsync_backup(&paths, "krita"), None);
+    }
+
+    #[test]
+    fn leftovers_cover_every_name_an_update_can_leave() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = sandbox_paths(dir.path());
+        for suffix in LEFTOVER_SUFFIXES {
+            fs::write(dir.path().join(format!("krita.{suffix}")), "x").unwrap();
+        }
+        // Neither the AppImage itself nor another application's leftovers.
+        fs::write(dir.path().join("krita.AppImage"), "x").unwrap();
+        fs::write(dir.path().join("osu.AppImage.zs-old"), "x").unwrap();
+
+        let found = leftovers(&paths, "krita");
+        assert_eq!(found.len(), LEFTOVER_SUFFIXES.len());
+        assert!(found.iter().all(|path| path.file_name().unwrap() != "krita.AppImage"));
     }
 
     #[test]

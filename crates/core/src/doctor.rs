@@ -8,6 +8,7 @@ use crate::error::Result;
 use crate::fs_util;
 use crate::list::{self, Health};
 use crate::paths::Paths;
+use crate::update;
 
 const LIBRARY_DIRS: &[&str] =
     &["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib", "/lib64", "/usr/local/lib"];
@@ -42,8 +43,9 @@ pub struct DoctorReport {
     pub optional_tools: Vec<ToolStatus>,
     /// Icons of a slug appimg manages whose entry no longer refers to them.
     pub orphaned_icons: Vec<PathBuf>,
-    /// `<slug>.AppImage.bak` and `.new` files an interrupted update left
-    /// behind, for slugs appimg manages.
+    /// Files an update left next to the AppImage of a slug appimg manages:
+    /// its own `.bak` and `.new`, and the `.zs-old` and `.part` of
+    /// `appimageupdatetool`. See [`update::LEFTOVER_SUFFIXES`].
     pub leftover_files: Vec<PathBuf>,
     /// Managed entries whose AppImage or slug is missing.
     pub broken_entries: Vec<(String, PathBuf)>,
@@ -189,19 +191,12 @@ fn in_apps_directory(icon: &Path) -> bool {
     icon.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("apps")
 }
 
-/// The staging and backup files an interrupted update leaves behind. Both
-/// are named after a managed slug, so they are provably appimg's own.
+/// The staging and backup files an update leaves behind, appimg's own as
+/// well as those of `appimageupdatetool`. Every one of them is named after a
+/// managed slug, so they are provably ours to report.
 fn collect_leftovers(paths: &Paths, managed: &HashMap<String, String>) -> Vec<PathBuf> {
-    let mut leftovers: Vec<PathBuf> = managed
-        .keys()
-        .flat_map(|slug| {
-            ["AppImage.bak", "AppImage.new"]
-                .iter()
-                .map(|suffix| paths.appimage_dir.join(format!("{slug}.{suffix}")))
-                .collect::<Vec<_>>()
-        })
-        .filter(|path| path.is_file())
-        .collect();
+    let mut leftovers: Vec<PathBuf> =
+        managed.keys().flat_map(|slug| update::leftovers(paths, slug)).collect();
 
     leftovers.sort();
     leftovers

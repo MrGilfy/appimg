@@ -1,6 +1,8 @@
+use std::path::Path;
+
 use anyhow::Result;
 use appimg_core::doctor::{self, DoctorReport};
-use appimg_core::Paths;
+use appimg_core::{fs_util, Paths};
 
 use crate::ui::Ui;
 use crate::Outcome;
@@ -83,11 +85,26 @@ fn report_leftovers(ui: &Ui, report: &DoctorReport) {
         ));
     }
     for file in &report.leftover_files {
+        let size = fs_util::file_size(file).map(fs_util::human_size).unwrap_or_default();
         ui.info(&format!(
-            "  {} leftover from an interrupted update: {}",
+            "  {} {}, {size}: {}",
             mark(ui, false),
-            file.display()
+            describe_leftover(file),
+            file.display(),
         ));
+    }
+}
+
+/// What a leftover is, going by the suffix that names it. `appimg update`
+/// drops its own once the new binary has run, so anything still here comes
+/// from a run that did not get that far, or from an older appimg.
+fn describe_leftover(file: &Path) -> &'static str {
+    match file.extension().and_then(|e| e.to_str()) {
+        Some("bak") => "backup of the previous version",
+        Some("new") => "half-finished download",
+        Some("zs-old") => "copy of the previous version, left by appimageupdatetool",
+        Some("part") => "partial zsync download, left by appimageupdatetool",
+        _ => "leftover from an update",
     }
 }
 

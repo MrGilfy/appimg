@@ -112,6 +112,23 @@ pub fn sniff_image_extension(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// Byte counts in the units a person reads.
+pub fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
 fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -164,6 +181,13 @@ mod tests {
 
         let found = find_files_with_stem(dir.path(), "thing").unwrap();
         assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn sizes_are_readable() {
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(90 * 1024 * 1024), "90.0 MB");
     }
 
     #[test]

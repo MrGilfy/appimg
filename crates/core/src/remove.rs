@@ -5,6 +5,7 @@ use crate::caches;
 use crate::error::{Error, Result};
 use crate::fs_util;
 use crate::paths::Paths;
+use crate::update;
 
 #[derive(Debug, Clone)]
 pub struct RemovalPlan {
@@ -35,12 +36,8 @@ pub fn plan(paths: &Paths, slug: &str) -> Result<RemovalPlan> {
         return Err(Error::NotInstalled(slug.to_string()));
     }
 
-    // A failed update can leave these behind, they belong to the slug too.
-    let leftovers = ["AppImage.new", "AppImage.bak"]
-        .iter()
-        .map(|suffix| paths.appimage_dir.join(format!("{slug}.{suffix}")))
-        .filter(|path| path.exists())
-        .collect();
+    // An update can leave these behind, they belong to the slug too.
+    let leftovers = update::leftovers(paths, slug);
 
     Ok(RemovalPlan {
         slug: slug.to_string(),

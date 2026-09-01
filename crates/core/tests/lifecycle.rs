@@ -218,17 +218,25 @@ fn doctor_reports_only_leftovers_of_managed_slugs() {
     let sandbox = Sandbox::new();
     let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
 
-    // An interrupted update leaves these two behind, both named after a slug
-    // appimg manages.
+    // An update leaves these behind, all of them named after a slug appimg
+    // manages. The first two are appimg's own, the other two are what
+    // `appimageupdatetool` leaves next to the file it updated.
     let backup = sandbox.paths.appimage_dir.join("fake-app.AppImage.bak");
     let staged = sandbox.paths.appimage_dir.join("fake-app.AppImage.new");
+    let zs_old = sandbox.paths.appimage_dir.join("fake-app.AppImage.zs-old");
+    let part = sandbox.paths.appimage_dir.join("fake-app.AppImage.part");
     fs::write(&backup, "the previous version").unwrap();
     fs::write(&staged, "half a download").unwrap();
+    fs::write(&zs_old, "the previous version, all 371 MB of it").unwrap();
+    fs::write(&part, "half a delta").unwrap();
     // Same shape, but for something appimg never installed.
-    fs::write(sandbox.paths.appimage_dir.join("osu.AppImage.bak"), "not ours").unwrap();
+    fs::write(sandbox.paths.appimage_dir.join("osu.AppImage.zs-old"), "not ours").unwrap();
 
     let report = doctor::run(&sandbox.paths).unwrap();
-    assert_eq!(report.leftover_files, vec![backup.clone(), staged.clone()]);
+    assert_eq!(
+        report.leftover_files,
+        vec![backup.clone(), staged.clone(), part.clone(), zs_old.clone()]
+    );
     assert!(report.orphaned_icons.is_empty());
     assert!(!report.is_clean());
 
@@ -237,8 +245,9 @@ fn doctor_reports_only_leftovers_of_managed_slugs() {
     let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
     entry.set("Icon", install::FALLBACK_ICON);
     entry.write(&outcome.desktop_entry_path).unwrap();
-    fs::remove_file(&backup).unwrap();
-    fs::remove_file(&staged).unwrap();
+    for leftover in [&backup, &staged, &zs_old, &part] {
+        fs::remove_file(leftover).unwrap();
+    }
 
     let report = doctor::run(&sandbox.paths).unwrap();
     assert!(report.leftover_files.is_empty());
@@ -282,13 +291,16 @@ fn remove_leaves_nothing_behind() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
-    // A failed update left this behind, removal has to take it along.
+    // A failed update left these behind, removal has to take them along.
     let stale = sandbox.paths.appimage_dir.join("fake-app.AppImage.new");
+    let zs_old = sandbox.paths.appimage_dir.join("fake-app.AppImage.zs-old");
     fs::write(&stale, "half a download").unwrap();
+    fs::write(&zs_old, "the version appimageupdatetool replaced").unwrap();
 
     let plan = remove::plan(&sandbox.paths, "fake-app").unwrap();
     assert!(plan.files().contains(&stale));
-    assert!(plan.files().len() >= 4);
+    assert!(plan.files().contains(&zs_old));
+    assert!(plan.files().len() >= 5);
 
     remove::remove(&sandbox.paths, "fake-app").unwrap();
     assert!(list::list(&sandbox.paths).unwrap().is_empty());
@@ -349,8 +361,15 @@ fn updating_from_a_local_file_keeps_manual_edits() {
     let icons = walk(&sandbox.paths.icons_root);
     assert!(icons.contains(&"128x128/apps/my-renamed-app.png".into()), "{icons:?}");
 
+    // Whatever else the update left next to the AppImage goes with the
+    // backup: `appimageupdatetool` writes these, and never cleans them up.
+    let zs_old = sandbox.paths.appimage_dir.join("my-renamed-app.AppImage.zs-old");
+    fs::write(&zs_old, "the previous version, a second time").unwrap();
+
     update::confirm(&sandbox.paths, "my-renamed-app").unwrap();
     assert!(!backup.exists());
+    assert!(!zs_old.exists());
+    assert!(update::leftovers(&sandbox.paths, "my-renamed-app").is_empty());
 }
 
 #[test]
