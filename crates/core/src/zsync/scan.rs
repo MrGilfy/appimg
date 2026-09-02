@@ -66,6 +66,17 @@ impl SourceMap {
         }
     }
 
+    /// A map with the given blocks found, for tests that want to pick which
+    /// blocks are missing rather than scan for them.
+    #[cfg(test)]
+    pub(crate) fn from_found(blocks: usize, found: &[usize]) -> Self {
+        let mut map = Self::new(blocks);
+        for &block in found {
+            map.record(block, block as u64);
+        }
+        map
+    }
+
     /// The first offset wins. A block found twice is the same bytes either
     /// way, and reading the earlier copy is the friendlier seek.
     fn record(&mut self, block: usize, offset: u64) {

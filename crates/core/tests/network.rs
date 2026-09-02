@@ -15,6 +15,9 @@ use appimg_core::{download, install, list, metadata, update, zsync};
 
 use common::{read, walk, FakeAppImage, Sandbox};
 
+/// The path a request was made to, and the `Range` header it carried.
+type Asked = (String, Option<String>);
+
 /// A one-file HTTP server on a random port. The body can be swapped between
 /// requests, which is how the update tests offer a newer version. Ranged
 /// requests are answered with the range that was asked for, so a client that
@@ -24,6 +27,8 @@ struct Server {
     body: Arc<Mutex<Vec<u8>>>,
     /// How many bytes every request so far was answered with.
     served: Arc<Mutex<Vec<usize>>>,
+    /// The path and `Range` header of every request so far.
+    asked: Arc<Mutex<Vec<Asked>>>,
     stop: Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -40,27 +45,56 @@ impl Server {
         let counted = Arc::clone(&served);
         let (stop, stopped) = channel();
 
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&asked);
+
         let handle = thread::spawn(move || loop {
             match server.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(Some(request)) => {
                     let whole = offered.lock().unwrap().clone();
-                    let wanted = request
+                    let path = request.url().to_string();
+                    let header = request
                         .headers()
                         .iter()
                         .find(|header| header.field.equiv("Range"))
-                        .and_then(|header| last_byte_of_range(header.value.as_str()));
+                        .map(|header| header.value.as_str().to_string());
+                    let wanted = header.as_deref().and_then(byte_range);
+                    recorded.lock().unwrap().push((path.clone(), header));
 
-                    let (status, bytes, extra) = match wanted {
-                        Some(last) if last + 1 < whole.len() => {
-                            let range = format!("bytes 0-{last}/{}", whole.len());
-                            let header = tiny_http::Header::from_bytes(
-                                &b"Content-Range"[..],
-                                range.as_bytes(),
-                            )
-                            .unwrap();
-                            (206, whole[..=last].to_vec(), vec![header])
+                    let (status, bytes, extra) = if let Some(rest) = path.strip_prefix("/moved/") {
+                        // What a GitHub release asset does: the download URL
+                        // sends the client somewhere else.
+                        let location = tiny_http::Header::from_bytes(
+                            &b"Location"[..],
+                            format!("http://{address}/{rest}").as_bytes(),
+                        )
+                        .unwrap();
+                        (302, Vec::new(), vec![location])
+                    } else if path.starts_with("/plain/") {
+                        // A server that ignores the range and sends the lot.
+                        (200, whole, Vec::new())
+                    } else {
+                        match wanted {
+                            // A range that covers the whole file is answered
+                            // the way a plain request would be.
+                            Some((0, last)) if last + 1 >= whole.len() => (200, whole, Vec::new()),
+                            Some((first, last)) => {
+                                let last = last.min(whole.len().saturating_sub(1));
+                                let range = format!("bytes {first}-{last}/{}", whole.len());
+                                let header = tiny_http::Header::from_bytes(
+                                    &b"Content-Range"[..],
+                                    range.as_bytes(),
+                                )
+                                .unwrap();
+                                let mut piece = whole[first..=last].to_vec();
+                                if path.starts_with("/short/") {
+                                    // A server that stops early.
+                                    piece.pop();
+                                }
+                                (206, piece, vec![header])
+                            }
+                            None => (200, whole, Vec::new()),
                         }
-                        _ => (200, whole, Vec::new()),
                     };
 
                     let length = bytes.len();
@@ -82,12 +116,17 @@ impl Server {
             }
         });
 
-        Self { address, body, served, stop, handle: Some(handle) }
+        Self { address, body, served, asked, stop, handle: Some(handle) }
     }
 
     /// The size of every response so far.
     fn served(&self) -> Vec<usize> {
         self.served.lock().unwrap().clone()
+    }
+
+    /// The path and `Range` header of every request so far.
+    fn asked(&self) -> Vec<Asked> {
+        self.asked.lock().unwrap().clone()
     }
 
     fn url(&self, path: &str) -> String {
@@ -108,17 +147,15 @@ impl Drop for Server {
     }
 }
 
-/// The last byte a `Range: bytes=0-8191` header asks for.
-fn last_byte_of_range(value: &str) -> Option<usize> {
+/// The bytes a `Range: bytes=4096-8191` header asks for, both ends
+/// included.
+fn byte_range(value: &str) -> Option<(usize, usize)> {
     let (unit, range) = value.split_once('=')?;
     if unit.trim() != "bytes" {
         return None;
     }
     let (first, last) = range.split_once('-')?;
-    if first.trim() != "0" {
-        return None;
-    }
-    last.trim().parse().ok()
+    Some((first.trim().parse().ok()?, last.trim().parse().ok()?))
 }
 
 /// A zsync file as `zsyncmake` writes one: the text header a check reads, a
@@ -351,4 +388,191 @@ fn without_appimageupdatetool<T>(check: impl FnOnce() -> T) -> T {
         None => std::env::remove_var("PATH"),
     }
     result
+}
+
+/// Bytes that do not repeat, so a block of them only matches where it
+/// belongs.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    (0..len as u64)
+        .map(|at| {
+            let mut x = seed ^ at.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+            (x >> 31) as u8
+        })
+        .collect()
+}
+
+/// A control file for these bytes as `zsyncmake` writes one: two bytes of
+/// rolling checksum and four of MD4 per block. The SHA-1 line is not the
+/// real one; nothing in a fetch looks at it.
+fn control_file(name: &str, target: &[u8], blocksize: usize) -> Vec<u8> {
+    let mut out = format!(
+        "zsync: 0.6.2\n\
+         Filename: {name}\n\
+         Blocksize: {blocksize}\n\
+         Length: {}\n\
+         Hash-Lengths: 2,2,4\n\
+         URL: {name}\n\
+         SHA-1: {}\n\
+         \n",
+        target.len(),
+        "0".repeat(40)
+    )
+    .into_bytes();
+
+    for start in (0..target.len()).step_by(blocksize) {
+        let mut block = vec![0u8; blocksize];
+        let end = (start + blocksize).min(target.len());
+        block[..end - start].copy_from_slice(&target[start..end]);
+
+        out.extend_from_slice(&zsync::Rsum::of(&block).value().to_be_bytes()[2..]);
+        out.extend_from_slice(&zsync::md4(&block)[..4]);
+    }
+    out
+}
+
+/// A target of 128 blocks, and a local file that is that target with two
+/// runs of five blocks rewritten: ten blocks have to be fetched, in two
+/// runs far enough apart not to be merged.
+fn target_and_seed() -> (Vec<u8>, tempfile::NamedTempFile) {
+    let blocksize = 2048;
+    let target = noise(1, 128 * blocksize);
+
+    let mut seed = target.clone();
+    seed[20 * blocksize..25 * blocksize].fill(0x5a);
+    seed[89 * blocksize..94 * blocksize].fill(0xa5);
+
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &seed).unwrap();
+    (target, file)
+}
+
+#[test]
+fn fetches_only_the_ranges_a_scan_did_not_find() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+    assert_eq!(map.matched(), 118, "ten blocks were rewritten");
+
+    let server = Server::start(target.clone());
+    let mut assembled = std::fs::read(seed.path()).unwrap();
+    let report = zsync::fetch_missing(&server.url("App.AppImage"), &control, &map, |at, bytes| {
+        assembled[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    })
+    .unwrap();
+
+    // Two runs, two requests, ten blocks of bytes and nothing else.
+    assert_eq!(report.requests, 2);
+    assert_eq!(report.received, 10 * 2048);
+    assert!(!report.whole_file);
+    assert!(report.received < target.len() as u64 / 10);
+
+    // The ranges the server was asked for, and only those.
+    let asked: Vec<Option<String>> = server.asked().into_iter().map(|(_, range)| range).collect();
+    assert_eq!(
+        asked,
+        vec![Some("bytes=40960-51199".to_string()), Some("bytes=182272-192511".to_string()),]
+    );
+
+    // What arrived is what was missing, in the right places.
+    assert_eq!(assembled, target);
+}
+
+#[test]
+fn a_seed_that_holds_everything_asks_for_nothing() {
+    let _serial = common::serial();
+    let target = noise(2, 16 * 2048 + 77);
+    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+
+    let seed = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(seed.path(), &target).unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+    assert!(map.is_complete());
+
+    let server = Server::start(target);
+    let report = zsync::fetch_missing(&server.url("App.AppImage"), &control, &map, |_, _| {
+        panic!("nothing should have been fetched")
+    })
+    .unwrap();
+
+    assert_eq!(report, zsync::FetchReport { received: 0, requests: 0, whole_file: false });
+    assert!(server.asked().is_empty());
+}
+
+#[test]
+fn follows_a_redirect_and_still_asks_for_the_range() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+
+    let server = Server::start(target.clone());
+    let mut assembled = std::fs::read(seed.path()).unwrap();
+    let report =
+        zsync::fetch_missing(&server.url("moved/App.AppImage"), &control, &map, |at, bytes| {
+            assembled[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(report.received, 10 * 2048);
+    assert!(!report.whole_file);
+    assert_eq!(assembled, target);
+
+    // Each range was asked for twice, once at the URL that moved and once
+    // where it moved to, and the second request still carried the range.
+    let asked = server.asked();
+    assert_eq!(asked.len(), 4);
+    assert_eq!(asked[0].0, "/moved/App.AppImage");
+    assert_eq!(asked[1].0, "/App.AppImage");
+    assert_eq!(asked[0].1, asked[1].1);
+    assert_eq!(asked[1].1.as_deref(), Some("bytes=40960-51199"));
+}
+
+#[test]
+fn a_server_that_ignores_the_range_becomes_a_plain_download() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+
+    let server = Server::start(target.clone());
+    let mut assembled = vec![0u8; target.len()];
+    let report =
+        zsync::fetch_missing(&server.url("plain/App.AppImage"), &control, &map, |at, bytes| {
+            assembled[at as usize..at as usize + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+
+    // One request, the whole file, and the caller was handed all of it from
+    // the first byte, so what it holds is complete either way.
+    assert!(report.whole_file);
+    assert_eq!(report.requests, 1);
+    assert_eq!(report.received, target.len() as u64);
+    assert_eq!(server.asked().len(), 1);
+    assert_eq!(assembled, target);
+}
+
+#[test]
+fn a_range_that_stops_early_is_an_error() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+
+    let server = Server::start(target);
+    let error =
+        zsync::fetch_missing(&server.url("short/App.AppImage"), &control, &map, |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+
+    assert!(error.contains("10240"), "{error}");
+    assert!(error.contains("10239"), "{error}");
 }

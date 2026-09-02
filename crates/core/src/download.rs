@@ -119,6 +119,71 @@ pub fn head_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// What a ranged request came back with. A server that honours the range
+/// sends the piece that was asked for; one that does not starts sending the
+/// whole file instead, and says so with a 200.
+pub enum Ranged {
+    /// The bytes that were asked for, in order.
+    Partial(Box<dyn Read>),
+    /// The whole file from its first byte, because the server ignored the
+    /// range.
+    Whole(Box<dyn Read>),
+}
+
+/// Asks for one byte range of a URL, both ends included, as `Range` counts.
+///
+/// Redirects are followed, which is what a GitHub release asset needs: the
+/// download URL answers with a 302 to another host.
+pub fn range(url: &str, first: u64, last: u64) -> Result<Ranged> {
+    let response = agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .header("Range", format!("bytes={first}-{last}"))
+        .call();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(416)) => {
+            return Err(Error::Download(format!(
+                "{url}: the server has no bytes {first} to {last}, the file it offers is a \
+                 different one from the zsync file that described it"
+            )));
+        }
+        Err(e) => return Err(Error::Download(format!("{url}: {e}"))),
+    };
+
+    let status = response.status().as_u16();
+    let content_range =
+        response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(str::to_string);
+
+    match status {
+        206 => {
+            // A server that answers with a different range than the one that
+            // was asked for would quietly put the wrong bytes in the file.
+            if let Some(start) = content_range.as_deref().and_then(first_byte_of_content_range) {
+                if start != first {
+                    return Err(Error::Download(format!(
+                        "{url}: asked for byte {first} onwards, the server sent byte {start} onwards"
+                    )));
+                }
+            }
+            Ok(Ranged::Partial(Box::new(response.into_body().into_reader())))
+        }
+        200 => Ok(Ranged::Whole(Box::new(response.into_body().into_reader()))),
+        other => Err(Error::Download(format!("{url}: the server answered {other}"))),
+    }
+}
+
+/// The first byte a `Content-Range: bytes 4096-8191/99999` header reports.
+fn first_byte_of_content_range(value: &str) -> Option<u64> {
+    let (unit, range) = value.split_once(' ')?;
+    if unit.trim() != "bytes" {
+        return None;
+    }
+    let (first, _) = range.trim().split_once('-')?;
+    first.trim().parse().ok()
+}
+
 /// Fetches a URL as text, used for the GitHub release API.
 pub fn to_string(url: &str) -> Result<String> {
     let response = agent()
