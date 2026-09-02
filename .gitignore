@@ -6,3 +6,4 @@ packaging/aur/*.pkg.tar.zst
 packaging/aur/*.tar.gz
 packaging/aur/src/
 packaging/aur/pkg/
+ZSYNC.md
