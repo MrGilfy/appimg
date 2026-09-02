@@ -37,38 +37,39 @@ list once at startup, so it may only show up after you restart your shell.
     appimg update --all --check    check without changing anything
     appimg update --all            download and replace
 
-Checking works out of the box. If the AppImage carries zsync update
-information, appimg reads the zsync header itself and compares it to the
-installed file. Both forms of it are a delta source: `zsync|<url>`, and
-`gh-releases-zsync|...`, where the zsync file is an asset of a GitHub
-release.
+Both halves of an update work with nothing else installed. If the AppImage
+carries zsync update information, appimg reads the zsync file itself: the
+header says whether the file on disk is still the one on offer, and the block
+checksums that follow it say which parts of the new version you already have.
+Only the missing ranges are fetched, and the assembled file is checked against
+the checksum the zsync file carries before it replaces anything. A file that
+does not match is thrown away and the installed version stays as it is.
 
-Applying the delta is appimg's own work as well: it reads the block checksums
-out of the zsync file, works out which blocks the installed AppImage already
-holds, fetches only the ranges it is missing and verifies the assembled file
-against the checksum the zsync file carries. Every update says which path it
-took and what it cost:
+Both forms of zsync update information are a delta source: `zsync|<url>`, and
+`gh-releases-zsync|...`, where the zsync file is an asset of a GitHub release.
+Everything else is a full download, because there is nothing to apply a delta
+from.
+
+Every update says which path it took and what it cost:
 
     Updating ImHex...
       1.38.0 -> 1.38.1
       reused 19054 of 46308 blocks, fetched 107.0 MB in 22 requests
 
-A source with no zsync file says so as plainly:
-
     Updating Some App...
       1.0.0 -> 1.1.0
       no delta for this source, downloaded 42.0 MB
 
-`appimageupdatetool` is kept as a fallback for the cases the native path
-cannot handle, and an update says when it ran. It is not packaged for Arch;
-if you want the fallback, it has to be on your PATH:
+How much a delta saves is up to the AppImage. One that changes a little
+between builds fetches a few megabytes; one whose squashfs shifts under every
+change fetches most of itself either way.
 
-    mkdir -p ~/.local/bin
-    curl -L -o ~/.local/bin/appimageupdatetool \
-      https://github.com/AppImageCommunity/AppImageUpdate/releases/download/continuous/appimageupdatetool-x86_64.AppImage
-    chmod +x ~/.local/bin/appimageupdatetool
+The previous version is kept as `<slug>.AppImage.bak` until the new one has
+run once, so a broken update can be rolled back.
 
-`appimg doctor` tells you whether it found it.
+`appimageupdatetool` is not needed. appimg falls back to it when its own delta
+path fails, and says so when that happens, but nothing has to be installed for
+updates to work. `appimg doctor` reports whether it is around.
 
 ## Where things go
 

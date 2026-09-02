@@ -6,6 +6,48 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-02
+
+### Added
+
+- appimg applies zsync delta updates itself. An update of an application
+  whose update information points at a zsync file no longer downloads the
+  whole AppImage: appimg works out which blocks of the new version the
+  installed file already holds, fetches only the ranges it is missing, and
+  checks the assembled file against the checksum the zsync file carries
+  before installing it. A file that does not match that checksum is thrown
+  away and the installed version stays where it is.
+- Every update says which path it took and what it cost:
+
+      Updating ImHex...
+        1.38.0 -> 1.38.1
+        reused 19054 of 46308 blocks, fetched 107.0 MB in 22 requests
+
+  A source with no delta to apply says `no delta for this source,
+  downloaded 42.0 MB`, and an update that fell back to `appimageupdatetool`
+  says so too, along with what stopped appimg from doing it.
+
+### Changed
+
+- `appimageupdatetool` no longer has to be installed. It is used only when
+  appimg's own delta path fails, and `doctor` now says as much rather than
+  reporting that delta updates cannot be applied without it.
+
+### Fixed
+
+- An application whose update information is `gh-releases-zsync|...` gets a
+  delta update instead of a full download. The asset such an update
+  information names is a zsync file, and appimg treated it as an AppImage to
+  download, so every update of ImHex, and of everything else published this
+  way, fetched the whole file. `appimg list` and `update --check` called
+  those applications GitHub sources; they are zsync sources and are now
+  shown as such. Updating ImHex 1.38.0 to 1.38.1 fetched 190 MB before and
+  fetches 107 MB now.
+- The asset pattern of a `gh-releases-zsync` source is matched properly,
+  including a placeholder like `{{ARCHITECTURE_FILE_NAME}}` that a build
+  system left behind, and including projects that call a 64 bit ARM build
+  `arm64` rather than `aarch64`.
+
 ## [0.1.3] - 2026-09-02
 
 ### Changed
