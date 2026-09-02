@@ -31,6 +31,9 @@ struct Server {
     served: Arc<Mutex<Vec<usize>>>,
     /// The path and `Range` header of every request so far.
     asked: Arc<Mutex<Vec<Asked>>>,
+    /// The client address of every request so far. A reused connection
+    /// keeps its port, so this counts the connections that were opened.
+    from: Arc<Mutex<Vec<String>>>,
     stop: Sender<()>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -50,6 +53,9 @@ impl Server {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&asked);
 
+        let from = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&from);
+
         let handle = thread::spawn(move || loop {
             match server.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(Some(request)) => {
@@ -62,6 +68,8 @@ impl Server {
                         .map(|header| header.value.as_str().to_string());
                     let wanted = header.as_deref().and_then(byte_range);
                     recorded.lock().unwrap().push((path.clone(), header));
+                    let peer = request.remote_addr().map(|a| a.to_string()).unwrap_or_default();
+                    seen.lock().unwrap().push(peer);
 
                     let (status, bytes, extra) = if let Some(rest) = path.strip_prefix("/moved/") {
                         // What a GitHub release asset does: the download URL
@@ -72,6 +80,20 @@ impl Server {
                         )
                         .unwrap();
                         (302, Vec::new(), vec![location])
+                    } else if path.starts_with("/gone/") {
+                        // A file that does not hold the range asked for.
+                        (416, Vec::new(), Vec::new())
+                    } else if path.starts_with("/askew/") {
+                        // A server that answers with a range of its own
+                        // choosing: the bytes are real, they belong
+                        // somewhere else in the file.
+                        let (first, last) = wanted.unwrap_or((0, whole.len() - 1));
+                        let last = last.min(whole.len().saturating_sub(1));
+                        let range = format!("bytes {}-{}/{}", first + 4096, last, whole.len());
+                        let header =
+                            tiny_http::Header::from_bytes(&b"Content-Range"[..], range.as_bytes())
+                                .unwrap();
+                        (206, whole[first..=last].to_vec(), vec![header])
                     } else if path.starts_with("/plain/") {
                         // A server that ignores the range and sends the lot.
                         (200, whole, Vec::new())
@@ -118,7 +140,7 @@ impl Server {
             }
         });
 
-        Self { address, body, served, asked, stop, handle: Some(handle) }
+        Self { address, body, served, asked, from, stop, handle: Some(handle) }
     }
 
     /// The size of every response so far.
@@ -129,6 +151,14 @@ impl Server {
     /// The path and `Range` header of every request so far.
     fn asked(&self) -> Vec<Asked> {
         self.asked.lock().unwrap().clone()
+    }
+
+    /// How many connections the requests so far arrived on.
+    fn connections(&self) -> usize {
+        let mut ports = self.from.lock().unwrap().clone();
+        ports.sort();
+        ports.dedup();
+        ports.len()
     }
 
     fn url(&self, path: &str) -> String {
@@ -487,6 +517,10 @@ fn fetches_only_the_ranges_a_scan_did_not_find() {
         vec![Some("bytes=40960-51199".to_string()), Some("bytes=182272-192511".to_string()),]
     );
 
+    // Both of them down one connection: a range that opened its own would
+    // pay for a handshake it does not need.
+    assert_eq!(server.connections(), 1);
+
     // What arrived is what was missing, in the right places.
     assert_eq!(assembled, target);
 }
@@ -546,14 +580,69 @@ fn follows_a_redirect_and_still_asks_for_the_range() {
     assert!(!report.whole_file);
     assert_eq!(assembled, target);
 
-    // Each range was asked for twice, once at the URL that moved and once
-    // where it moved to, and the second request still carried the range.
+    // The first range was asked for twice, once at the URL that moved and
+    // once where it moved to, and the second request still carried the
+    // range. The second range went straight to where the first one landed,
+    // so it cost one request, not two.
     let asked = server.asked();
-    assert_eq!(asked.len(), 4);
+    assert_eq!(asked.len(), 3);
     assert_eq!(asked[0].0, "/moved/App.AppImage");
     assert_eq!(asked[1].0, "/App.AppImage");
     assert_eq!(asked[0].1, asked[1].1);
     assert_eq!(asked[1].1.as_deref(), Some("bytes=40960-51199"));
+    assert_eq!(asked[2].0, "/App.AppImage");
+    assert_eq!(asked[2].1.as_deref(), Some("bytes=182272-192511"));
+
+    assert_eq!(server.connections(), 1);
+}
+
+#[test]
+fn a_range_the_file_does_not_hold_is_an_error() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+
+    let server = Server::start(target);
+    let error = zsync::fetch_missing(&server.url("gone/App.AppImage"), &control, &map, |_, _| {
+        panic!("nothing should have been written")
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("no bytes 40960 to 51199"), "{error}");
+}
+
+#[test]
+fn a_range_that_starts_somewhere_else_is_an_error() {
+    let _serial = common::serial();
+    let (target, seed) = target_and_seed();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
+    let map = zsync::scan_file(&control, seed.path()).unwrap();
+
+    let server = Server::start(target);
+    let error = zsync::fetch_missing(&server.url("askew/App.AppImage"), &control, &map, |_, _| {
+        panic!("bytes from the wrong place must never be written")
+    })
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("asked for byte 40960 onwards"), "{error}");
+    assert!(error.contains("sent byte 45056 onwards"), "{error}");
 }
 
 #[test]

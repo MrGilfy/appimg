@@ -8,7 +8,7 @@
 use std::io::Read;
 use std::ops::Range;
 
-use crate::download::{self, Ranged};
+use crate::download::{Ranged, Session};
 use crate::error::{Error, Result};
 
 use super::control::ControlFile;
@@ -79,11 +79,15 @@ where
     W: FnMut(u64, &[u8]) -> Result<()>,
 {
     let mut report = FetchReport::default();
+    // One session for the whole update: every range after the first reuses
+    // the connection, and the redirect a release asset answers with is
+    // resolved once instead of per request.
+    let mut session = Session::new();
 
     for range in missing_ranges(control, map) {
         report.requests += 1;
 
-        match download::range(url, range.start, range.end - 1)? {
+        match session.range(url, range.start, range.end - 1)? {
             Ranged::Partial(reader) => {
                 let wanted = range.end - range.start;
                 let got = copy(url, reader, range.start, wanted, &mut write)?;
@@ -126,7 +130,7 @@ where
 
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) => return Ok(done),
+            Ok(0) => break,
             Ok(read) => {
                 write(offset + done, &buffer[..read])?;
                 done += read as u64;
@@ -134,6 +138,23 @@ where
             Err(e) => return Err(Error::Download(format!("{url}: {e}"))),
         }
     }
+
+    finish(reader.into_inner());
+    Ok(done)
+}
+
+/// Reads the end of a body that has already given up everything that was
+/// asked for.
+///
+/// A range holds exactly as many bytes as were asked for, so the reader
+/// above stops at its limit without ever asking the body whether more is
+/// coming. That last read is what hands the connection back to the pool, so
+/// the next range can go down it instead of opening one of its own. Whatever
+/// it returns says nothing about the bytes that were handed on, which the
+/// caller has already counted.
+fn finish(mut reader: Box<dyn Read>) {
+    let mut ignored = [0u8; 1];
+    let _ = reader.read(&mut ignored);
 }
 
 #[cfg(test)]

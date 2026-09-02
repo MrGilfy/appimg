@@ -3,6 +3,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use ureq::ResponseExt;
+
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
 
@@ -122,6 +124,10 @@ pub fn head_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
 /// What a ranged request came back with. A server that honours the range
 /// sends the piece that was asked for; one that does not starts sending the
 /// whole file instead, and says so with a 200.
+///
+/// Either reader has to be read to its end before it is dropped. A body that
+/// stops one read short of the end leaves the connection out of the pool,
+/// and the next range pays for a new one.
 pub enum Ranged {
     /// The bytes that were asked for, in order.
     Partial(Box<dyn Read>),
@@ -130,47 +136,128 @@ pub enum Ranged {
     Whole(Box<dyn Read>),
 }
 
-/// Asks for one byte range of a URL, both ends included, as `Range` counts.
+/// The ranged requests of one update, over as few connections as the server
+/// allows.
 ///
-/// Redirects are followed, which is what a GitHub release asset needs: the
-/// download URL answers with a 302 to another host.
-pub fn range(url: &str, first: u64, last: u64) -> Result<Ranged> {
-    let response = agent()
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Range", format!("bytes={first}-{last}"))
-        .call();
+/// ureq keeps its connection pool inside the agent, so a session that asks
+/// for one range after another sends them down the connection the last one
+/// left open instead of opening a socket and shaking hands over TLS again.
+/// Where a redirect took the first range is remembered as well: a GitHub
+/// release asset answers every request with a 302 to a CDN, and asking that
+/// CDN directly saves a round trip per range.
+///
+/// A session belongs to a single update and is never stored: the URL a
+/// redirect hands out is signed and expires, so it must not be reused for
+/// another file, another update, or another run.
+pub struct Session {
+    agent: ureq::Agent,
+    /// A URL that was asked for, and where the redirects led.
+    resolved: Option<(String, String)>,
+}
 
-    let response = match response {
-        Ok(response) => response,
-        Err(ureq::Error::StatusCode(416)) => {
-            return Err(Error::Download(format!(
-                "{url}: the server has no bytes {first} to {last}, the file it offers is a \
-                 different one from the zsync file that described it"
-            )));
+impl Session {
+    pub fn new() -> Self {
+        Self { agent: agent(), resolved: None }
+    }
+
+    /// Asks for one byte range of a URL, both ends included, as `Range`
+    /// counts.
+    ///
+    /// Redirects are followed, which is what a GitHub release asset needs:
+    /// the download URL answers with a 302 to another host.
+    ///
+    /// The reader that comes back has to be read to its end for the
+    /// connection to go back into the pool, which is what [`Ranged`] says.
+    pub fn range(&mut self, url: &str, first: u64, last: u64) -> Result<Ranged> {
+        let target = self.target_for(url);
+        let mut response = self.ask(&target, first, last);
+
+        // A remembered redirect target is signed and can expire while an
+        // update is still running. Anything but a plain "no such range" is
+        // reason enough to forget it and ask the URL that was given, which
+        // resolves it again at the cost of one request.
+        let stale = match &response {
+            Ok(_) | Err(ureq::Error::StatusCode(416)) => false,
+            Err(_) => target != url,
+        };
+        if stale {
+            self.resolved = None;
+            response = self.ask(url, first, last);
         }
-        Err(e) => return Err(Error::Download(format!("{url}: {e}"))),
-    };
 
-    let status = response.status().as_u16();
-    let content_range =
-        response.headers().get("content-range").and_then(|v| v.to_str().ok()).map(str::to_string);
-
-    match status {
-        206 => {
-            // A server that answers with a different range than the one that
-            // was asked for would quietly put the wrong bytes in the file.
-            if let Some(start) = content_range.as_deref().and_then(first_byte_of_content_range) {
-                if start != first {
-                    return Err(Error::Download(format!(
-                        "{url}: asked for byte {first} onwards, the server sent byte {start} onwards"
-                    )));
-                }
+        let response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(416)) => {
+                return Err(Error::Download(format!(
+                    "{url}: the server has no bytes {first} to {last}, the file it offers is a \
+                     different one from the zsync file that described it"
+                )));
             }
-            Ok(Ranged::Partial(Box::new(response.into_body().into_reader())))
+            Err(e) => return Err(Error::Download(format!("{url}: {e}"))),
+        };
+        self.remember(url, &response);
+
+        let status = response.status().as_u16();
+        let content_range = response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        match status {
+            206 => {
+                // A server that answers with a different range than the one
+                // that was asked for would quietly put the wrong bytes in
+                // the file.
+                if let Some(start) = content_range.as_deref().and_then(first_byte_of_content_range)
+                {
+                    if start != first {
+                        return Err(Error::Download(format!(
+                            "{url}: asked for byte {first} onwards, the server sent byte {start} \
+                             onwards"
+                        )));
+                    }
+                }
+                Ok(Ranged::Partial(Box::new(response.into_body().into_reader())))
+            }
+            200 => Ok(Ranged::Whole(Box::new(response.into_body().into_reader()))),
+            other => Err(Error::Download(format!("{url}: the server answered {other}"))),
         }
-        200 => Ok(Ranged::Whole(Box::new(response.into_body().into_reader()))),
-        other => Err(Error::Download(format!("{url}: the server answered {other}"))),
+    }
+
+    fn ask(
+        &self,
+        url: &str,
+        first: u64,
+        last: u64,
+    ) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        self.agent
+            .get(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Range", format!("bytes={first}-{last}"))
+            .call()
+    }
+
+    /// Where to send a request for `url`: the redirect target an earlier
+    /// range of the same URL ended at, or the URL itself.
+    fn target_for(&self, url: &str) -> String {
+        match &self.resolved {
+            Some((asked, landed)) if asked == url => landed.clone(),
+            _ => url.to_string(),
+        }
+    }
+
+    fn remember(&mut self, url: &str, response: &ureq::http::Response<ureq::Body>) {
+        let landed = response.get_uri().to_string();
+        if landed != url {
+            self.resolved = Some((url.to_string(), landed));
+        }
+    }
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
