@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-02
+
+### Fixed
+
+- A delta update is faster than downloading the whole file again, which it
+  was not before: the connections it fetched over were not being reused, so
+  every range paid for a new one. Updating ImHex 1.38.0 to 1.38.1 takes 16
+  seconds where it took 46, against 44 seconds for the full download it
+  replaces.
+
 ## [0.2.0] - 2026-09-02
 
 ### Added
