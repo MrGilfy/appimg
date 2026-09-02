@@ -704,6 +704,8 @@ mod tests {
             sha1: Some("0".repeat(40)),
             url: None,
             mtime: None,
+            blocksize: None,
+            hash_lengths: zsync::HashLengths::DEFAULT,
         };
 
         let (available, note) = zsync_compare(&header, file.path()).unwrap();
@@ -723,6 +725,8 @@ mod tests {
             sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".to_string()),
             url: None,
             mtime: None,
+            blocksize: None,
+            hash_lengths: zsync::HashLengths::DEFAULT,
         };
 
         assert_eq!(zsync_compare(&header, file.path()).unwrap(), (false, None));
@@ -962,6 +966,8 @@ mod tests {
             sha1: None,
             url: None,
             mtime: Some("Sat, 18 Oct 2025 19:39:31 +0000".to_string()),
+            blocksize: None,
+            hash_lengths: zsync::HashLengths::DEFAULT,
         };
         // Not the `64` of `x86_64`.
         assert_eq!(offered_by_zsync(&header).as_deref(), Some("2025-10-18"));
