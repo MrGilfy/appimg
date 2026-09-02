@@ -126,11 +126,9 @@ fn update_one(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<Option<Updat
         outcome.from_version.as_deref().unwrap_or("unknown"),
         outcome.to_version.as_deref().unwrap_or("unknown")
     ));
-    // Which path applied the delta, and what it cost. This is the only
-    // place that says whether the blocks on disk were of any use.
-    if let Some(delta) = &outcome.delta {
-        ui.info(&format!("  {}", ui.dim(&delta.describe())));
-    }
+    // Which path the update took, and what it cost. Every source reports
+    // one, so this line is always there.
+    ui.info(&format!("  {}", ui.dim(&outcome.path.describe())));
     Ok(Some(outcome))
 }
 

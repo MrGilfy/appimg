@@ -31,6 +31,16 @@ pub enum UpdateSource {
         tag: Option<String>,
         asset: Option<String>,
     },
+    /// `gh-releases-zsync`: a GitHub release whose named asset is a zsync
+    /// file. The release says which assets exist, the zsync file inside it
+    /// says what the update is, and from there this is a zsync source like
+    /// any other. `asset` is the pattern the update information names.
+    GitHubZsync {
+        owner: String,
+        repo: String,
+        tag: Option<String>,
+        asset: String,
+    },
     /// Plain re-download of the stored URL.
     DirectUrl {
         url: String,
@@ -46,6 +56,9 @@ impl UpdateSource {
     pub fn describe(&self) -> String {
         match self {
             UpdateSource::Zsync { .. } => "zsync".to_string(),
+            // The release is where the zsync file is found, not what the
+            // update is: a delta is a delta.
+            UpdateSource::GitHubZsync { .. } => "zsync".to_string(),
             UpdateSource::GitHubRelease { owner, repo, .. } => format!("github:{owner}/{repo}"),
             UpdateSource::DirectUrl { .. } => "url".to_string(),
             UpdateSource::LocalFile { .. } => "file".to_string(),
@@ -66,59 +79,70 @@ pub struct UpdateStatus {
     pub note: Option<String>,
 }
 
-/// What a zsync update did, and which path did it. `appimg` applies the
-/// delta itself; `appimageupdatetool` is still there to take over when that
-/// fails.
+/// How an update was carried out. Every update reports one of these, so it
+/// is always clear which path ran and what it cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeltaReport {
-    /// appimg assembled the file itself.
-    Native {
-        /// Blocks the complete file has.
+pub enum UpdatePath {
+    /// appimg applied a zsync delta itself.
+    Delta {
+        /// Blocks the new version has.
         blocks: usize,
         /// Blocks that were already on disk.
         reused: usize,
         /// Bytes that came over the wire.
         fetched: u64,
         requests: usize,
-        /// The server ignored the ranges and sent the whole file, so this
-        /// was a plain download that happened to start as a delta.
-        whole_file: bool,
     },
-    /// The native path failed and `appimageupdatetool` did the update.
+    /// A zsync source whose server ignored the range requests and sent the
+    /// whole file, so there was no delta to apply after all.
+    ZsyncWithoutRanges { bytes: u64 },
+    /// `appimageupdatetool` did it, after appimg's own delta path failed.
     ExternalTool {
         /// Why the native path gave up.
         reason: String,
     },
+    /// The whole file was downloaded, because the source offers no delta.
+    FullDownload { bytes: u64 },
+    /// Copied from the local file the application was installed from.
+    LocalCopy { bytes: u64 },
 }
 
-impl DeltaReport {
+impl UpdatePath {
     /// One line saying what happened, for a caller that reports to a user.
     pub fn describe(&self) -> String {
         match self {
-            DeltaReport::Native { whole_file: true, fetched, .. } => format!(
-                "the server ignored the range requests, downloaded the whole file, {}",
-                human_size(*fetched)
-            ),
-            DeltaReport::Native { blocks, reused, fetched, requests, .. } => format!(
+            UpdatePath::Delta { blocks, reused, fetched, requests } => format!(
                 "reused {reused} of {blocks} blocks, fetched {} in {requests} {}",
                 human_size(*fetched),
                 if *requests == 1 { "request" } else { "requests" }
             ),
-            DeltaReport::ExternalTool { reason } => {
+            UpdatePath::ZsyncWithoutRanges { bytes } => format!(
+                "the server ignored the range requests, downloaded the whole file, {}",
+                human_size(*bytes)
+            ),
+            UpdatePath::ExternalTool { reason } => {
                 format!("applied with appimageupdatetool, appimg's own delta path failed: {reason}")
+            }
+            UpdatePath::FullDownload { bytes } => {
+                format!("no delta for this source, downloaded {}", human_size(*bytes))
+            }
+            UpdatePath::LocalCopy { bytes } => {
+                format!("copied {} from the file it was installed from", human_size(*bytes))
             }
         }
     }
 }
 
-impl From<zsync::Applied> for DeltaReport {
+impl From<zsync::Applied> for UpdatePath {
     fn from(applied: zsync::Applied) -> Self {
-        DeltaReport::Native {
+        if applied.whole_file {
+            return UpdatePath::ZsyncWithoutRanges { bytes: applied.fetched };
+        }
+        UpdatePath::Delta {
             blocks: applied.blocks,
             reused: applied.reused,
             fetched: applied.fetched,
             requests: applied.requests,
-            whole_file: applied.whole_file,
         }
     }
 }
@@ -132,8 +156,8 @@ pub struct UpdateOutcome {
     pub backup_path: Option<PathBuf>,
     pub icons: Vec<PathBuf>,
     pub source: UpdateSource,
-    /// How a zsync update went, for the sources that apply a delta.
-    pub delta: Option<DeltaReport>,
+    /// Which path the update took, and what it cost.
+    pub path: UpdatePath,
 }
 
 /// Works out how an application would be updated, without changing anything.
@@ -185,6 +209,37 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             let (available, note) = zsync_compare(&header, &app.appimage_path)?;
             status.available = available;
             status.note = note;
+        }
+        UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
+            let release = fetch_release(owner, repo, tag.as_deref())?;
+
+            match zsync_asset_url(&release, asset) {
+                // From here on this is a zsync source: the zsync file says
+                // what the new version is and whether the file on disk is
+                // still it, which is more than a release tag can say.
+                Some(url) => {
+                    let header = zsync::fetch_header(&url)?;
+                    status.latest_version = offered_by_zsync(&header)
+                        .or_else(|| release.version())
+                        .or_else(|| current.clone());
+                    let (available, note) = zsync_compare(&header, &app.appimage_path)?;
+                    status.available = available;
+                    status.note = note;
+                }
+                None => {
+                    status.latest_version = release.version();
+                    let (installed, available, note) =
+                        compare_release(current.as_deref(), &release);
+                    status.current_version = installed;
+                    status.available = available;
+                    status.note = note.or_else(|| {
+                        Some(
+                            "the release has no zsync file, an update would be a full download"
+                                .to_string(),
+                        )
+                    });
+                }
+            }
         }
         UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
             let release = fetch_release(owner, repo, tag.as_deref())?;
@@ -254,25 +309,24 @@ pub fn update(
         UpdateSource::Zsync { update_info } => {
             let url =
                 zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+            apply_zsync(paths, app, &target, &url, source, None, progress)
+        }
+        UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
+            let release = fetch_release(owner, repo, tag.as_deref())?;
+            let recorded = release.recorded_version();
 
-            match apply_delta(paths, &app.slug, &url, &target, progress) {
-                Ok((staged, applied)) => {
+            match zsync_asset_url(&release, asset) {
+                Some(url) => apply_zsync(paths, app, &target, &url, source, recorded, progress),
+                // A release that ships no zsync file leaves nothing to apply
+                // a delta from, so the whole file it is.
+                None => {
+                    let url = release
+                        .asset_url(Some(asset))
+                        .ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+                    let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
                     let backup = swap_in(&staged, &target)?;
-                    let delta = Some(DeltaReport::from(applied));
-                    finish(paths, app, &target, Some(backup), source, None, delta)
-                }
-                // The native path is young. When it fails for any reason,
-                // the tool that has always done this gets its turn, and the
-                // outcome says which one ran.
-                Err(native) => {
-                    if let Err(tool) = zsync_update(&target) {
-                        return Err(Error::Download(format!(
-                            "{native}; appimageupdatetool could not take over either: {tool}"
-                        )));
-                    }
-                    let backup = claim_zsync_backup(paths, &app.slug);
-                    let delta = Some(DeltaReport::ExternalTool { reason: native.to_string() });
-                    finish(paths, app, &target, backup, source, None, delta)
+                    let path = UpdatePath::FullDownload { bytes };
+                    finish(paths, app, &target, Some(backup), source, recorded, path)
                 }
             }
         }
@@ -282,20 +336,24 @@ pub fn update(
                 .asset_url(asset.as_deref())
                 .ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
             let recorded = release.recorded_version();
-            let staged = download_staged(paths, &app.slug, &url, progress)?;
+            let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, recorded, None)
+            let path = UpdatePath::FullDownload { bytes };
+            finish(paths, app, &target, Some(backup), source, recorded, path)
         }
         UpdateSource::DirectUrl { url } => {
-            let staged = download_staged(paths, &app.slug, url, progress)?;
+            let (staged, bytes) = download_staged(paths, &app.slug, url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, None, None)
+            let path = UpdatePath::FullDownload { bytes };
+            finish(paths, app, &target, Some(backup), source, None, path)
         }
         UpdateSource::LocalFile { path } => {
             let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
             fs_util::copy_atomic(path, &staged, MODE_EXEC)?;
+            let bytes = fs_util::file_size(&staged).unwrap_or(0);
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, None, None)
+            let taken = UpdatePath::LocalCopy { bytes };
+            finish(paths, app, &target, Some(backup), source, None, taken)
         }
     }
 }
@@ -359,7 +417,7 @@ fn finish(
     backup: Option<PathBuf>,
     source: UpdateSource,
     from_release: Option<String>,
-    delta: Option<DeltaReport>,
+    path: UpdatePath,
 ) -> Result<UpdateOutcome> {
     let info = metadata::inspect(target, None).ok();
 
@@ -405,7 +463,7 @@ fn finish(
         backup_path: backup,
         icons,
         source,
-        delta,
+        path,
     })
 }
 
@@ -414,16 +472,16 @@ fn download_staged(
     slug: &str,
     url: &str,
     progress: Option<ProgressFn<'_>>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, u64)> {
     let staged = paths.appimage_dir.join(format!("{slug}.AppImage.new"));
-    download::to_file(url, &staged, progress)?;
+    let bytes = download::to_file(url, &staged, progress)?;
 
     if fs_util::file_size(&staged).unwrap_or(0) == 0 {
         let _ = fs::remove_file(&staged);
         return Err(Error::Download(format!("{url}: the downloaded file is empty")));
     }
     fs_util::set_mode(&staged, MODE_EXEC)?;
-    Ok(staged)
+    Ok((staged, bytes))
 }
 
 /// Moves the new binary into place and keeps the old one as `.bak`. A failure
@@ -448,11 +506,11 @@ fn source_from_update_info(info: &str) -> Option<UpdateSource> {
     let parts: Vec<&str> = info.split('|').collect();
     match parts.first().copied() {
         // gh-releases-zsync|owner|repo|tag|pattern
-        Some("gh-releases-zsync") if parts.len() >= 5 => Some(UpdateSource::GitHubRelease {
+        Some("gh-releases-zsync") if parts.len() >= 5 => Some(UpdateSource::GitHubZsync {
             owner: parts[1].to_string(),
             repo: parts[2].to_string(),
             tag: tag_to_follow(parts[3]),
-            asset: Some(parts[4].to_string()),
+            asset: parts[4].to_string(),
         }),
         Some("zsync") if parts.len() >= 2 => {
             Some(UpdateSource::Zsync { update_info: info.to_string() })
@@ -550,6 +608,122 @@ impl Release {
             .or_else(|| appimages.first())
             .map(|url| (*url).clone())
     }
+}
+
+/// The zsync file of a release, out of the pattern a `gh-releases-zsync`
+/// update information names, e.g.
+/// `imhex-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync`.
+///
+/// The pattern carries two kinds of hole. `*` is a wildcard, and a
+/// `{{...}}` placeholder is one a build system was supposed to fill in and
+/// sometimes did not: what it stands for is the architecture, so the names
+/// this machine's architecture goes by are tried in its place.
+fn zsync_asset_url(release: &Release, pattern: &str) -> Option<String> {
+    let zsyncs: Vec<String> = release
+        .assets
+        .iter()
+        .filter(|url| url.to_lowercase().ends_with(".zsync"))
+        .cloned()
+        .collect();
+
+    if zsyncs.is_empty() {
+        return None;
+    }
+
+    for arch in arch_names() {
+        let wanted = fill_placeholders(pattern, arch);
+        if let Some(url) = zsyncs.iter().find(|url| glob_matches(&wanted, &asset_name(url))) {
+            return Some(url.clone());
+        }
+    }
+
+    // The placeholder stood for something else, or the names moved on. Take
+    // the zsync files the rest of the pattern still fits, and out of those
+    // the one built for this machine.
+    let loose = fill_placeholders(pattern, "*");
+    let matching: Vec<&String> =
+        zsyncs.iter().filter(|url| glob_matches(&loose, &asset_name(url))).collect();
+    let candidates: Vec<&String> =
+        if matching.is_empty() { zsyncs.iter().collect() } else { matching };
+
+    for arch in arch_names() {
+        if let Some(url) = candidates.iter().find(|url| asset_name(url).contains(arch)) {
+            return Some((*url).clone());
+        }
+    }
+    candidates.first().map(|url| (*url).clone())
+}
+
+/// The file name at the end of an asset URL, lowercased.
+fn asset_name(url: &str) -> String {
+    url.rsplit('/').next().unwrap_or(url).to_lowercase()
+}
+
+/// The names a release asset might use for the architecture this is running
+/// on. `x86_64` is written the same way everywhere, but a 64 bit ARM build
+/// is called `aarch64` by some projects and `arm64` by others.
+fn arch_names() -> &'static [&'static str] {
+    match std::env::consts::ARCH {
+        "x86_64" => &["x86_64", "amd64", "x64"],
+        "aarch64" => &["aarch64", "arm64"],
+        "arm" => &["armhf", "armv7l", "arm"],
+        "x86" => &["i686", "i386", "x86"],
+        // Whatever it is, its own name is the best guess there is.
+        other => std::slice::from_ref(Box::leak(Box::new(other))),
+    }
+}
+
+/// Replaces every `{{...}}` in a pattern with the same text.
+fn fill_placeholders(pattern: &str, with: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("}}") {
+            Some(end) => {
+                out.push_str(with);
+                rest = &rest[start + end + 2..];
+            }
+            // An opening brace with no closing one is not a placeholder.
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether a name fits a pattern of literal text and `*` wildcards. Case is
+/// ignored: the pattern comes out of an AppImage's update information, the
+/// name off a server, and neither is careful about it.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.to_lowercase();
+    let name = name.to_lowercase();
+    let mut parts = pattern.split('*');
+
+    // Everything before the first wildcard has to be where it says.
+    let Some(first) = parts.next() else { return false };
+    let Some(mut rest) = name.strip_prefix(first) else { return false };
+
+    let mut parts = parts.peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            // The last piece has to sit at the end, unless the pattern
+            // ended in a wildcard, in which case it is empty.
+            return rest.ends_with(part);
+        }
+        if part.is_empty() {
+            continue;
+        }
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    true
 }
 
 /// An asset name with all digits stripped, so `App-1.2.3-x86_64.AppImage` and
@@ -692,6 +866,37 @@ fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Optio
 
 /// Applies the delta. This is the one step that still needs the external
 /// tool, and saying so is more use than silently doing nothing.
+/// The whole of a zsync update: appimg's own delta path, and the tool it
+/// falls back to when that fails, for any reason. The outcome says which one
+/// ran either way.
+fn apply_zsync(
+    paths: &Paths,
+    app: &InstalledApp,
+    target: &Path,
+    zsync_url: &str,
+    source: UpdateSource,
+    from_release: Option<String>,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<UpdateOutcome> {
+    match apply_delta(paths, &app.slug, zsync_url, target, progress) {
+        Ok((staged, applied)) => {
+            let backup = swap_in(&staged, target)?;
+            let path = UpdatePath::from(applied);
+            finish(paths, app, target, Some(backup), source, from_release, path)
+        }
+        Err(native) => {
+            if let Err(tool) = zsync_update(target) {
+                return Err(Error::Download(format!(
+                    "{native}; appimageupdatetool could not take over either: {tool}"
+                )));
+            }
+            let backup = claim_zsync_backup(paths, &app.slug);
+            let path = UpdatePath::ExternalTool { reason: native.to_string() };
+            finish(paths, app, target, backup, source, from_release, path)
+        }
+    }
+}
+
 /// Applies the delta with appimg's own zsync: reads the control file, works
 /// out which blocks the installed AppImage already holds, fetches the rest
 /// and assembles `<slug>.AppImage.new`. The file is verified against the
@@ -803,33 +1008,141 @@ mod tests {
         assert_eq!(payload_url(zsync, &header_with_url(Some(""))), None);
     }
 
+    /// A release with these assets, named as GitHub names them.
+    fn release_with(tag: &str, assets: &[&str]) -> Release {
+        Release {
+            tag: Some(tag.to_string()),
+            assets: assets
+                .iter()
+                .map(|name| {
+                    format!("https://github.com/WerWolv/ImHex/releases/download/{tag}/{name}")
+                })
+                .collect(),
+            published: None,
+            commit: None,
+        }
+    }
+
+    /// The assets of an ImHex release, which is what this was written for.
+    fn imhex_release() -> Release {
+        release_with(
+            "v1.38.1",
+            &[
+                "imhex-1.38.1-arm64.AppImage",
+                "imhex-1.38.1-arm64.AppImage.zsync",
+                "imhex-1.38.1-x86_64.AppImage",
+                "imhex-1.38.1-x86_64.AppImage.zsync",
+                "imhex-1.38.1-Windows-x86_64.msi",
+            ],
+        )
+    }
+
     #[test]
-    fn a_delta_says_what_it_did() {
-        let native = DeltaReport::Native {
-            blocks: 1061,
-            reused: 1060,
-            fetched: 2048,
-            requests: 1,
-            whole_file: false,
-        };
-        let described = native.describe();
+    fn the_zsync_file_of_a_release_is_found_through_the_architecture_placeholder() {
+        // What ImHex ships: a placeholder its build system left behind.
+        let chosen =
+            zsync_asset_url(&imhex_release(), "imhex-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync")
+                .unwrap();
+
+        assert!(chosen.ends_with(".AppImage.zsync"), "{chosen}");
+        assert!(
+            arch_names().iter().any(|arch| chosen.contains(arch)),
+            "{chosen} is not a build for {}",
+            std::env::consts::ARCH
+        );
+        // Never the AppImage itself, which is what made this a full
+        // download before.
+        assert!(!chosen.ends_with(".AppImage"), "{chosen}");
+    }
+
+    #[test]
+    fn a_pattern_that_names_an_architecture_is_taken_at_its_word() {
+        assert_eq!(
+            zsync_asset_url(&imhex_release(), "imhex-*-arm64.AppImage.zsync").as_deref(),
+            Some(
+                "https://github.com/WerWolv/ImHex/releases/download/v1.38.1/imhex-1.38.1-arm64.AppImage.zsync"
+            )
+        );
+    }
+
+    #[test]
+    fn a_placeholder_that_is_not_an_architecture_still_matches() {
+        // `{{VERSION}}` stands for none of the architecture names, so the
+        // rest of the pattern has to carry it.
+        let release = release_with("v2", &["App-1.2.3-x86_64.AppImage.zsync"]);
+        assert!(zsync_asset_url(&release, "App-{{VERSION}}-x86_64.AppImage.zsync").is_some());
+    }
+
+    #[test]
+    fn a_release_with_no_zsync_file_offers_none() {
+        let release = release_with("v1", &["App-1.0.0-x86_64.AppImage", "App-1.0.0.tar.gz"]);
+        assert_eq!(zsync_asset_url(&release, "App-*.AppImage.zsync"), None);
+    }
+
+    #[test]
+    fn a_zsync_file_is_still_found_when_the_names_moved_on() {
+        // The pattern was written for a name the project no longer uses.
+        let release = release_with("v9", &["renamed-9.0-x86_64.AppImage.zsync"]);
+        assert_eq!(
+            zsync_asset_url(&release, "App-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync").as_deref(),
+            Some("https://github.com/WerWolv/ImHex/releases/download/v9/renamed-9.0-x86_64.AppImage.zsync")
+        );
+    }
+
+    #[test]
+    fn a_pattern_matches_the_way_a_shell_glob_does() {
+        assert!(glob_matches(
+            "imhex-*-x86_64.AppImage.zsync",
+            "imhex-1.38.1-x86_64.AppImage.zsync"
+        ));
+        assert!(!glob_matches(
+            "imhex-*-x86_64.AppImage.zsync",
+            "imhex-1.38.1-arm64.AppImage.zsync"
+        ));
+        // Wildcards at either end, and none at all.
+        assert!(glob_matches("*.zsync", "app.AppImage.zsync"));
+        assert!(glob_matches("app*", "app.AppImage.zsync"));
+        assert!(glob_matches("app.AppImage.zsync", "app.AppImage.zsync"));
+        assert!(!glob_matches("app.AppImage.zsync", "app.AppImage"));
+        // Several wildcards, and one that has to match nothing.
+        assert!(glob_matches("a*b*c", "abc"));
+        assert!(glob_matches("a*b*c", "a-b-c"));
+        assert!(!glob_matches("a*b*c", "a-c-b"));
+        // Case is not what tells two assets apart.
+        assert!(glob_matches("App-*.AppImage.zsync", "app-1.0-x86_64.appimage.zsync"));
+    }
+
+    #[test]
+    fn placeholders_are_filled_in_wherever_they_are() {
+        assert_eq!(fill_placeholders("a-{{X}}.zsync", "64"), "a-64.zsync");
+        assert_eq!(fill_placeholders("{{A}}-{{B}}", "*"), "*-*");
+        assert_eq!(fill_placeholders("nothing to fill", "*"), "nothing to fill");
+        // A brace that opens and never closes is part of the name.
+        assert_eq!(fill_placeholders("a-{{X.zsync", "*"), "a-{{X.zsync");
+    }
+
+    #[test]
+    fn every_update_path_says_what_it_did() {
+        let delta = UpdatePath::Delta { blocks: 1061, reused: 1060, fetched: 2048, requests: 1 };
+        let described = delta.describe();
         assert!(described.contains("reused 1060 of 1061 blocks"), "{described}");
         assert!(described.contains("2.0 KB"), "{described}");
         assert!(described.contains("1 request"), "{described}");
 
         // A server that ignored the ranges did not apply a delta at all.
-        let whole = DeltaReport::Native {
-            blocks: 1061,
-            reused: 1060,
-            fetched: 2_172_096,
-            requests: 1,
-            whole_file: true,
-        };
+        let whole = UpdatePath::ZsyncWithoutRanges { bytes: 2_172_096 };
         assert!(whole.describe().contains("ignored the range requests"), "{}", whole.describe());
 
-        let tool = DeltaReport::ExternalTool { reason: "the server hung up".to_string() };
+        let tool = UpdatePath::ExternalTool { reason: "the server hung up".to_string() };
         assert!(tool.describe().contains("appimageupdatetool"), "{}", tool.describe());
         assert!(tool.describe().contains("the server hung up"), "{}", tool.describe());
+
+        // And the sources that have no delta to apply say so too.
+        let full = UpdatePath::FullDownload { bytes: 190 * 1024 * 1024 };
+        assert!(full.describe().contains("no delta"), "{}", full.describe());
+        assert!(full.describe().contains("190.0 MB"), "{}", full.describe());
+        let local = UpdatePath::LocalCopy { bytes: 4096 };
+        assert!(local.describe().contains("copied"), "{}", local.describe());
     }
 
     #[test]
@@ -837,15 +1150,18 @@ mod tests {
         let source = source_from_update_info(
             "gh-releases-zsync|owner|repo|latest|App-*x86_64.AppImage.zsync",
         );
+        // The asset it names is a zsync file, so this is a zsync source
+        // that happens to find its zsync file through a release.
         assert_eq!(
             source,
-            Some(UpdateSource::GitHubRelease {
+            Some(UpdateSource::GitHubZsync {
                 owner: "owner".to_string(),
                 repo: "repo".to_string(),
                 tag: None,
-                asset: Some("App-*x86_64.AppImage.zsync".to_string()),
+                asset: "App-*x86_64.AppImage.zsync".to_string(),
             })
         );
+        assert_eq!(source.unwrap().describe(), "zsync");
     }
 
     #[test]
@@ -866,11 +1182,11 @@ mod tests {
         );
         assert_eq!(
             source,
-            Some(UpdateSource::GitHubRelease {
+            Some(UpdateSource::GitHubZsync {
                 owner: "AppImage".to_string(),
                 repo: "AppImageUpdate".to_string(),
                 tag: Some("continuous".to_string()),
-                asset: Some("AppImageUpdate-*x86_64.AppImage.zsync".to_string()),
+                asset: "AppImageUpdate-*x86_64.AppImage.zsync".to_string(),
             })
         );
     }

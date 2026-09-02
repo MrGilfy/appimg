@@ -699,18 +699,17 @@ fn a_zsync_update_applies_the_delta_itself_and_reports_what_it_did() {
     assert_eq!(outcome.to_version.as_deref(), Some("2.0.0"));
 
     // One block differs between the two builds, so one block was fetched.
-    match outcome.delta {
-        Some(update::DeltaReport::Native { blocks, reused, fetched, requests, whole_file }) => {
+    match outcome.path {
+        update::UpdatePath::Delta { blocks, reused, fetched, requests } => {
             assert_eq!(blocks, 129);
             assert_eq!(reused, 128);
             assert_eq!(fetched, 2048);
             assert_eq!(requests, 1);
-            assert!(!whole_file);
         }
-        other => panic!("the native path should have run: {other:?}"),
+        ref other => panic!("the native path should have run: {other:?}"),
     }
 
-    let described = outcome.delta.unwrap().describe();
+    let described = outcome.path.describe();
     assert!(described.contains("reused 128 of 129 blocks"), "{described}");
 
     // And the server sent that one block and nothing else.
@@ -770,13 +769,13 @@ fn a_server_that_ignores_ranges_still_updates_and_says_so() {
     .unwrap();
 
     assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
-    match outcome.delta {
-        Some(update::DeltaReport::Native { fetched, whole_file: true, .. }) => {
-            assert_eq!(fetched, delta.payload.len() as u64);
+    match outcome.path {
+        update::UpdatePath::ZsyncWithoutRanges { bytes } => {
+            assert_eq!(bytes, delta.payload.len() as u64);
         }
-        other => panic!("a plain download should have been reported as one: {other:?}"),
+        ref other => panic!("a plain download should have been reported as one: {other:?}"),
     }
-    let described = outcome.delta.unwrap().describe();
+    let described = outcome.path.describe();
     assert!(described.contains("ignored the range requests"), "{described}");
 }
 
@@ -815,13 +814,13 @@ fn a_native_path_that_fails_hands_over_to_appimageupdatetool_and_says_so() {
     // The copy the tool left behind became the backup a rollback uses.
     assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), delta.v1);
 
-    match &outcome.delta {
-        Some(update::DeltaReport::ExternalTool { reason }) => {
+    match &outcome.path {
+        update::UpdatePath::ExternalTool { reason } => {
             assert!(reason.contains("zsync"), "{reason}");
         }
         other => panic!("the fallback should have been reported: {other:?}"),
     }
-    let described = outcome.delta.unwrap().describe();
+    let described = outcome.path.describe();
     assert!(described.contains("appimageupdatetool"), "{described}");
 }
 

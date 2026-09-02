@@ -39,16 +39,25 @@ list once at startup, so it may only show up after you restart your shell.
 
 Checking works out of the box. If the AppImage carries zsync update
 information, appimg reads the zsync header itself and compares it to the
-installed file.
+installed file. Both forms of it are a delta source: `zsync|<url>`, and
+`gh-releases-zsync|...`, where the zsync file is an asset of a GitHub
+release.
 
 Applying the delta is appimg's own work as well: it reads the block checksums
 out of the zsync file, works out which blocks the installed AppImage already
 holds, fetches only the ranges it is missing and verifies the assembled file
-against the checksum the zsync file carries. An update says what that cost:
+against the checksum the zsync file carries. Every update says which path it
+took and what it cost:
 
-    Updating Krita...
-      5.2.9 -> 5.3.3
-      reused 92104 of 94217 blocks, fetched 8.4 MB in 37 requests
+    Updating ImHex...
+      1.38.0 -> 1.38.1
+      reused 19054 of 46308 blocks, fetched 107.0 MB in 22 requests
+
+A source with no zsync file says so as plainly:
+
+    Updating Some App...
+      1.0.0 -> 1.1.0
+      no delta for this source, downloaded 42.0 MB
 
 `appimageupdatetool` is kept as a fallback for the cases the native path
 cannot handle, and an update says when it ran. It is not packaged for Arch;
