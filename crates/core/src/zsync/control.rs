@@ -161,6 +161,23 @@ pub fn fetch_header(url: &str) -> Result<Header> {
     parse_header(&head).map_err(|reason| Error::Zsync { url: url.to_string(), reason })
 }
 
+/// The largest zsync file that will be read. A control file is about a fifth
+/// of a percent of what it describes, so this covers an AppImage of several
+/// gigabytes.
+const CONTROL_MAX: usize = 16 * 1024 * 1024;
+
+/// Fetches a whole zsync file and parses it, header and block table both.
+pub fn fetch_control(url: &str) -> Result<ControlFile> {
+    let bytes = download::head_bytes(url, CONTROL_MAX)?;
+    if bytes.len() >= CONTROL_MAX {
+        return Err(Error::Zsync {
+            url: url.to_string(),
+            reason: format!("the zsync file is larger than {CONTROL_MAX} bytes"),
+        });
+    }
+    parse_control(&bytes).map_err(|reason| Error::Zsync { url: url.to_string(), reason })
+}
+
 /// Parses the text part of a zsync file. The error is a plain reason, the
 /// caller knows which URL it came from.
 pub fn parse_header(bytes: &[u8]) -> std::result::Result<Header, String> {

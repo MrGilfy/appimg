@@ -5,12 +5,14 @@ mod common;
 
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use appimg_core::desktop_entry::{DesktopEntry, KEY_UPDATE_INFO};
 use appimg_core::install::InstallRequest;
+use appimg_core::list::InstalledApp;
 use appimg_core::{download, install, list, metadata, update, zsync};
 
 use common::{read, walk, FakeAppImage, Sandbox};
@@ -406,20 +408,18 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// A control file for these bytes as `zsyncmake` writes one: two bytes of
-/// rolling checksum and four of MD4 per block. The SHA-1 line is not the
-/// real one; nothing in a fetch looks at it.
-fn control_file(name: &str, target: &[u8], blocksize: usize) -> Vec<u8> {
+/// rolling checksum and four of MD4 per block.
+fn control_file(name: &str, url: &str, target: &[u8], blocksize: usize, sha1: &str) -> Vec<u8> {
     let mut out = format!(
         "zsync: 0.6.2\n\
          Filename: {name}\n\
          Blocksize: {blocksize}\n\
          Length: {}\n\
          Hash-Lengths: 2,2,4\n\
-         URL: {name}\n\
-         SHA-1: {}\n\
+         URL: {url}\n\
+         SHA-1: {sha1}\n\
          \n",
         target.len(),
-        "0".repeat(40)
     )
     .into_bytes();
 
@@ -454,7 +454,14 @@ fn target_and_seed() -> (Vec<u8>, tempfile::NamedTempFile) {
 fn fetches_only_the_ranges_a_scan_did_not_find() {
     let _serial = common::serial();
     let (target, seed) = target_and_seed();
-    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
 
     let map = zsync::scan_file(&control, seed.path()).unwrap();
     assert_eq!(map.matched(), 118, "ten blocks were rewritten");
@@ -488,7 +495,14 @@ fn fetches_only_the_ranges_a_scan_did_not_find() {
 fn a_seed_that_holds_everything_asks_for_nothing() {
     let _serial = common::serial();
     let target = noise(2, 16 * 2048 + 77);
-    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
 
     let seed = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(seed.path(), &target).unwrap();
@@ -509,7 +523,14 @@ fn a_seed_that_holds_everything_asks_for_nothing() {
 fn follows_a_redirect_and_still_asks_for_the_range() {
     let _serial = common::serial();
     let (target, seed) = target_and_seed();
-    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
     let map = zsync::scan_file(&control, seed.path()).unwrap();
 
     let server = Server::start(target.clone());
@@ -539,7 +560,14 @@ fn follows_a_redirect_and_still_asks_for_the_range() {
 fn a_server_that_ignores_the_range_becomes_a_plain_download() {
     let _serial = common::serial();
     let (target, seed) = target_and_seed();
-    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
     let map = zsync::scan_file(&control, seed.path()).unwrap();
 
     let server = Server::start(target.clone());
@@ -564,7 +592,14 @@ fn a_server_that_ignores_the_range_becomes_a_plain_download() {
 fn a_range_that_stops_early_is_an_error() {
     let _serial = common::serial();
     let (target, seed) = target_and_seed();
-    let control = zsync::parse_control(&control_file("App.AppImage", &target, 2048)).unwrap();
+    let control = zsync::parse_control(&control_file(
+        "App.AppImage",
+        "App.AppImage",
+        &target,
+        2048,
+        &"0".repeat(40),
+    ))
+    .unwrap();
     let map = zsync::scan_file(&control, seed.path()).unwrap();
 
     let server = Server::start(target);
@@ -575,4 +610,247 @@ fn a_range_that_stops_early_is_an_error() {
 
     assert!(error.contains("10240"), "{error}");
     assert!(error.contains("10239"), "{error}");
+}
+
+/// An installed version one, the version two that a zsync update should
+/// arrive at, and the two servers it talks to: one holding the zsync file,
+/// one holding the AppImage that file describes.
+struct Delta {
+    app: InstalledApp,
+    installed: PathBuf,
+    v1: Vec<u8>,
+    payload: Vec<u8>,
+    payload_server: Server,
+    _zsync_server: Server,
+}
+
+/// Two builds of the same fake AppImage that differ in one byte near the
+/// front, so a delta update has exactly one block to fetch. `payload_path`
+/// decides how the AppImage is served: a plain name is answered with ranges,
+/// `plain/...` is a server that ignores them.
+fn delta_fixture(sandbox: &Sandbox, payload_path: &str) -> Delta {
+    // A quarter of a megabyte of filler inside the runtime's comment line,
+    // so the two builds share 127 blocks of 2048 bytes.
+    let filler: String =
+        noise(4, 256 * 1024).into_iter().map(|byte| char::from(b'a' + byte % 26)).collect();
+
+    // Both builds are written under the same name, so the only difference
+    // between the two files is the version in the runtime's comment: one
+    // byte, in the first block. Version one is installed before version two
+    // is built, because the second build replaces what the first extracts.
+    let build = |version: &str| {
+        FakeAppImage::new("Fake App")
+            .key("X-AppImage-Version", version)
+            .marker(&format!("{version}{filler}"))
+            .build(&sandbox.root, "App.AppImage")
+    };
+
+    let one = sandbox.root.join("build1.AppImage");
+    std::fs::copy(build("1.0.0"), &one).unwrap();
+
+    let info = metadata::inspect(&one, None).unwrap();
+    let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
+    let installed = install::install(&sandbox.paths, &request).unwrap();
+
+    let two = sandbox.root.join("build2.AppImage");
+    std::fs::copy(build("2.0.0"), &two).unwrap();
+    let payload = std::fs::read(&two).unwrap();
+    let payload_server = Server::start(payload.clone());
+    let control = control_file(
+        "Fake_App-2.0.0.AppImage",
+        &payload_server.url(payload_path),
+        &payload,
+        2048,
+        &zsync::sha1_file(&two).unwrap(),
+    );
+    let zsync_server = Server::start(control);
+
+    let mut entry = DesktopEntry::read(&installed.desktop_entry_path).unwrap();
+    entry.set(KEY_UPDATE_INFO, format!("zsync|{}", zsync_server.url("Fake_App.AppImage.zsync")));
+    entry.write(&installed.desktop_entry_path).unwrap();
+
+    Delta {
+        app: list::find(&sandbox.paths, "fake-app").unwrap(),
+        installed: installed.appimage_path,
+        v1: std::fs::read(&one).unwrap(),
+        payload,
+        payload_server,
+        _zsync_server: zsync_server,
+    }
+}
+
+#[test]
+fn a_zsync_update_applies_the_delta_itself_and_reports_what_it_did() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
+
+    // The tool is there and refuses to work: if the native path had not
+    // done this, there would be no update at all.
+    let outcome = with_failing_appimageupdatetool(&sandbox, || {
+        update::update(&sandbox.paths, &delta.app, None)
+    })
+    .unwrap();
+
+    // The installed file is the one the zsync file described, byte for byte.
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
+    assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), delta.v1);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    assert_eq!(outcome.to_version.as_deref(), Some("2.0.0"));
+
+    // One block differs between the two builds, so one block was fetched.
+    match outcome.delta {
+        Some(update::DeltaReport::Native { blocks, reused, fetched, requests, whole_file }) => {
+            assert_eq!(blocks, 129);
+            assert_eq!(reused, 128);
+            assert_eq!(fetched, 2048);
+            assert_eq!(requests, 1);
+            assert!(!whole_file);
+        }
+        other => panic!("the native path should have run: {other:?}"),
+    }
+
+    let described = outcome.delta.unwrap().describe();
+    assert!(described.contains("reused 128 of 129 blocks"), "{described}");
+
+    // And the server sent that one block and nothing else.
+    assert_eq!(delta.payload_server.served(), vec![2048]);
+    assert!(delta.payload.len() > 100 * 2048);
+}
+
+#[test]
+fn bytes_that_do_not_assemble_into_the_right_file_are_thrown_away() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
+    let before = std::fs::read(&delta.installed).unwrap();
+
+    // The server answers the range with the right number of bytes, at the
+    // right offset, with a 206 like any other: they are simply not the bytes
+    // the zsync file describes. Nothing before the whole-file checksum can
+    // tell the difference.
+    let mut wrong = delta.payload.clone();
+    wrong[..2048].fill(b'#');
+    delta.payload_server.serve(wrong);
+
+    let error = with_failing_appimageupdatetool(&sandbox, || {
+        update::update(&sandbox.paths, &delta.app, None)
+    })
+    .unwrap_err()
+    .to_string();
+
+    // The checksum caught it, and the message says what did not match.
+    assert!(error.contains("checksummed"), "{error}");
+    assert!(
+        error.contains(&zsync::sha1_file(&sandbox.root.join("build2.AppImage")).unwrap()),
+        "{error}"
+    );
+    // The fallback was tried, and it failed too, so nothing was installed.
+    assert!(error.contains("appimageupdatetool could not take over"), "{error}");
+
+    // Nothing was installed, nothing was staged, nothing was backed up.
+    assert_eq!(std::fs::read(&delta.installed).unwrap(), before);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
+
+    // And the entry still describes the version that is on disk.
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(app.version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn a_server_that_ignores_ranges_still_updates_and_says_so() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = delta_fixture(&sandbox, "plain/Fake_App-2.0.0.AppImage");
+
+    let outcome = with_failing_appimageupdatetool(&sandbox, || {
+        update::update(&sandbox.paths, &delta.app, None)
+    })
+    .unwrap();
+
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
+    match outcome.delta {
+        Some(update::DeltaReport::Native { fetched, whole_file: true, .. }) => {
+            assert_eq!(fetched, delta.payload.len() as u64);
+        }
+        other => panic!("a plain download should have been reported as one: {other:?}"),
+    }
+    let described = outcome.delta.unwrap().describe();
+    assert!(described.contains("ignored the range requests"), "{described}");
+}
+
+#[test]
+fn a_native_path_that_fails_hands_over_to_appimageupdatetool_and_says_so() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
+
+    // A zsync file appimg cannot read at all, so the native path is out.
+    let broken = Server::start(b"not a zsync file at all".to_vec());
+    let mut entry = DesktopEntry::read(&delta.app.desktop_entry_path).unwrap();
+    entry.set(KEY_UPDATE_INFO, format!("zsync|{}", broken.url("Fake_App.AppImage.zsync")));
+    entry.write(&delta.app.desktop_entry_path).unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+
+    // A stand-in for the tool that does what it does: replaces the file and
+    // leaves the previous version behind as `.zs-old`.
+    let tools = sandbox.root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tool = tools.join("appimageupdatetool");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\ntarget=\"$2\"\ncp \"$target\" \"$target.zs-old\"\ncp '{}' \"$target\"\n",
+            sandbox.root.join("build2.AppImage").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let outcome =
+        with_tools_on_path(&tools, || update::update(&sandbox.paths, &app, None)).unwrap();
+
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
+    // The copy the tool left behind became the backup a rollback uses.
+    assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), delta.v1);
+
+    match &outcome.delta {
+        Some(update::DeltaReport::ExternalTool { reason }) => {
+            assert!(reason.contains("zsync"), "{reason}");
+        }
+        other => panic!("the fallback should have been reported: {other:?}"),
+    }
+    let described = outcome.delta.unwrap().describe();
+    assert!(described.contains("appimageupdatetool"), "{described}");
+}
+
+/// Runs something with an `appimageupdatetool` on `PATH` that always fails.
+/// Whether the real one is installed on the machine running the tests is
+/// then neither here nor there.
+fn with_failing_appimageupdatetool<T>(sandbox: &Sandbox, run: impl FnOnce() -> T) -> T {
+    let dir = sandbox.root.join("failing-tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("appimageupdatetool");
+    std::fs::write(&tool, "#!/bin/sh\necho 'stand-in, not the real thing' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    with_tools_on_path(&dir, run)
+}
+
+/// Runs something with a directory prepended to `PATH`. The tests run one at
+/// a time, which is what makes this safe.
+fn with_tools_on_path<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
+    let previous = std::env::var_os("PATH");
+    let mut path = dir.as_os_str().to_os_string();
+    if let Some(existing) = &previous {
+        path.push(":");
+        path.push(existing);
+    }
+    std::env::set_var("PATH", path);
+    let result = run();
+    match previous {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
+    result
 }

@@ -17,7 +17,8 @@ const GITHUB_API: &str = "https://api.github.com";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSource {
     /// `X-AppImg-UpdateInfo` pointing at a zsync file. The check reads that
-    /// file's header directly, applying the delta needs `appimageupdatetool`.
+    /// file's header directly, and appimg applies the delta itself;
+    /// `appimageupdatetool` is the fallback when that fails.
     Zsync {
         update_info: String,
     },
@@ -65,6 +66,63 @@ pub struct UpdateStatus {
     pub note: Option<String>,
 }
 
+/// What a zsync update did, and which path did it. `appimg` applies the
+/// delta itself; `appimageupdatetool` is still there to take over when that
+/// fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaReport {
+    /// appimg assembled the file itself.
+    Native {
+        /// Blocks the complete file has.
+        blocks: usize,
+        /// Blocks that were already on disk.
+        reused: usize,
+        /// Bytes that came over the wire.
+        fetched: u64,
+        requests: usize,
+        /// The server ignored the ranges and sent the whole file, so this
+        /// was a plain download that happened to start as a delta.
+        whole_file: bool,
+    },
+    /// The native path failed and `appimageupdatetool` did the update.
+    ExternalTool {
+        /// Why the native path gave up.
+        reason: String,
+    },
+}
+
+impl DeltaReport {
+    /// One line saying what happened, for a caller that reports to a user.
+    pub fn describe(&self) -> String {
+        match self {
+            DeltaReport::Native { whole_file: true, fetched, .. } => format!(
+                "the server ignored the range requests, downloaded the whole file, {}",
+                human_size(*fetched)
+            ),
+            DeltaReport::Native { blocks, reused, fetched, requests, .. } => format!(
+                "reused {reused} of {blocks} blocks, fetched {} in {requests} {}",
+                human_size(*fetched),
+                if *requests == 1 { "request" } else { "requests" }
+            ),
+            DeltaReport::ExternalTool { reason } => {
+                format!("applied with appimageupdatetool, appimg's own delta path failed: {reason}")
+            }
+        }
+    }
+}
+
+impl From<zsync::Applied> for DeltaReport {
+    fn from(applied: zsync::Applied) -> Self {
+        DeltaReport::Native {
+            blocks: applied.blocks,
+            reused: applied.reused,
+            fetched: applied.fetched,
+            requests: applied.requests,
+            whole_file: applied.whole_file,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UpdateOutcome {
     pub slug: String,
@@ -74,6 +132,8 @@ pub struct UpdateOutcome {
     pub backup_path: Option<PathBuf>,
     pub icons: Vec<PathBuf>,
     pub source: UpdateSource,
+    /// How a zsync update went, for the sources that apply a delta.
+    pub delta: Option<DeltaReport>,
 }
 
 /// Works out how an application would be updated, without changing anything.
@@ -191,10 +251,30 @@ pub fn update(
 
     match &source {
         UpdateSource::None => Err(Error::NoUpdateSource(app.slug.clone())),
-        UpdateSource::Zsync { .. } => {
-            zsync_update(&target)?;
-            let backup = claim_zsync_backup(paths, &app.slug);
-            finish(paths, app, &target, backup, source, None)
+        UpdateSource::Zsync { update_info } => {
+            let url =
+                zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+
+            match apply_delta(paths, &app.slug, &url, &target, progress) {
+                Ok((staged, applied)) => {
+                    let backup = swap_in(&staged, &target)?;
+                    let delta = Some(DeltaReport::from(applied));
+                    finish(paths, app, &target, Some(backup), source, None, delta)
+                }
+                // The native path is young. When it fails for any reason,
+                // the tool that has always done this gets its turn, and the
+                // outcome says which one ran.
+                Err(native) => {
+                    if let Err(tool) = zsync_update(&target) {
+                        return Err(Error::Download(format!(
+                            "{native}; appimageupdatetool could not take over either: {tool}"
+                        )));
+                    }
+                    let backup = claim_zsync_backup(paths, &app.slug);
+                    let delta = Some(DeltaReport::ExternalTool { reason: native.to_string() });
+                    finish(paths, app, &target, backup, source, None, delta)
+                }
+            }
         }
         UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
             let release = fetch_release(owner, repo, tag.as_deref())?;
@@ -204,18 +284,18 @@ pub fn update(
             let recorded = release.recorded_version();
             let staged = download_staged(paths, &app.slug, &url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, recorded)
+            finish(paths, app, &target, Some(backup), source, recorded, None)
         }
         UpdateSource::DirectUrl { url } => {
             let staged = download_staged(paths, &app.slug, url, progress)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, None)
+            finish(paths, app, &target, Some(backup), source, None, None)
         }
         UpdateSource::LocalFile { path } => {
             let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
             fs_util::copy_atomic(path, &staged, MODE_EXEC)?;
             let backup = swap_in(&staged, &target)?;
-            finish(paths, app, &target, Some(backup), source, None)
+            finish(paths, app, &target, Some(backup), source, None, None)
         }
     }
 }
@@ -279,6 +359,7 @@ fn finish(
     backup: Option<PathBuf>,
     source: UpdateSource,
     from_release: Option<String>,
+    delta: Option<DeltaReport>,
 ) -> Result<UpdateOutcome> {
     let info = metadata::inspect(target, None).ok();
 
@@ -324,6 +405,7 @@ fn finish(
         backup_path: backup,
         icons,
         source,
+        delta,
     })
 }
 
@@ -610,6 +692,49 @@ fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Optio
 
 /// Applies the delta. This is the one step that still needs the external
 /// tool, and saying so is more use than silently doing nothing.
+/// Applies the delta with appimg's own zsync: reads the control file, works
+/// out which blocks the installed AppImage already holds, fetches the rest
+/// and assembles `<slug>.AppImage.new`. The file is verified against the
+/// checksum in the zsync header before it is handed back, and removed if it
+/// does not match.
+fn apply_delta(
+    paths: &Paths,
+    slug: &str,
+    zsync_url: &str,
+    appimage: &Path,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<(PathBuf, zsync::Applied)> {
+    if !appimage.is_file() {
+        return Err(Error::NotFound(appimage.to_path_buf()));
+    }
+
+    let control = zsync::fetch_control(zsync_url)?;
+    let url = payload_url(zsync_url, &control.header).ok_or_else(|| Error::Zsync {
+        url: zsync_url.to_string(),
+        reason: "the zsync file names no URL for the file it describes".to_string(),
+    })?;
+
+    let staged = paths.appimage_dir.join(format!("{slug}.AppImage.new"));
+    let applied = zsync::apply(&control, &url, appimage, &staged, progress)?;
+    Ok((staged, applied))
+}
+
+/// Where the complete file lives, as the zsync header names it. A relative
+/// URL is resolved against the zsync file's own URL, which is what makes
+/// `URL: App-2.0.0-x86_64.AppImage` work.
+fn payload_url(zsync_url: &str, header: &zsync::Header) -> Option<String> {
+    let url = header.url.as_deref()?;
+    if url.is_empty() {
+        return None;
+    }
+    if download::is_url(url) {
+        return Some(url.to_string());
+    }
+    let without_query = zsync_url.split(['?', '#']).next().unwrap_or(zsync_url);
+    let (directory, _) = without_query.rsplit_once('/')?;
+    Some(format!("{directory}/{url}"))
+}
+
 fn zsync_update(appimage: &Path) -> Result<()> {
     let Some(tool) = fs_util::which("appimageupdatetool") else {
         return Err(Error::MissingTool {
@@ -638,6 +763,74 @@ fn zsync_update(appimage: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_with_url(url: Option<&str>) -> zsync::Header {
+        zsync::Header {
+            filename: None,
+            length: 4096,
+            sha1: None,
+            url: url.map(str::to_string),
+            mtime: None,
+            blocksize: Some(2048),
+            hash_lengths: zsync::HashLengths::DEFAULT,
+        }
+    }
+
+    #[test]
+    fn the_file_a_zsync_describes_is_found_next_to_the_zsync_file() {
+        let zsync = "https://example.com/releases/App.AppImage.zsync";
+
+        // The usual case: a bare name, which means the same directory.
+        assert_eq!(
+            payload_url(zsync, &header_with_url(Some("App-2.0.0-x86_64.AppImage"))),
+            Some("https://example.com/releases/App-2.0.0-x86_64.AppImage".to_string())
+        );
+        // An absolute URL is used as it stands, wherever it points.
+        assert_eq!(
+            payload_url(zsync, &header_with_url(Some("https://cdn.example.net/App.AppImage"))),
+            Some("https://cdn.example.net/App.AppImage".to_string())
+        );
+        // A query on the zsync URL is not part of the directory it sits in.
+        assert_eq!(
+            payload_url(
+                "https://example.com/d/App.zsync?token=1",
+                &header_with_url(Some("App.AppImage"))
+            ),
+            Some("https://example.com/d/App.AppImage".to_string())
+        );
+        // Nothing to go on.
+        assert_eq!(payload_url(zsync, &header_with_url(None)), None);
+        assert_eq!(payload_url(zsync, &header_with_url(Some(""))), None);
+    }
+
+    #[test]
+    fn a_delta_says_what_it_did() {
+        let native = DeltaReport::Native {
+            blocks: 1061,
+            reused: 1060,
+            fetched: 2048,
+            requests: 1,
+            whole_file: false,
+        };
+        let described = native.describe();
+        assert!(described.contains("reused 1060 of 1061 blocks"), "{described}");
+        assert!(described.contains("2.0 KB"), "{described}");
+        assert!(described.contains("1 request"), "{described}");
+
+        // A server that ignored the ranges did not apply a delta at all.
+        let whole = DeltaReport::Native {
+            blocks: 1061,
+            reused: 1060,
+            fetched: 2_172_096,
+            requests: 1,
+            whole_file: true,
+        };
+        assert!(whole.describe().contains("ignored the range requests"), "{}", whole.describe());
+
+        let tool = DeltaReport::ExternalTool { reason: "the server hung up".to_string() };
+        assert!(tool.describe().contains("appimageupdatetool"), "{}", tool.describe());
+        assert!(tool.describe().contains("the server hung up"), "{}", tool.describe());
+    }
 
     #[test]
     fn reads_github_coordinates_from_update_info() {

@@ -41,16 +41,25 @@ Checking works out of the box. If the AppImage carries zsync update
 information, appimg reads the zsync header itself and compares it to the
 installed file.
 
-Applying a delta update needs `appimageupdatetool`, which is not packaged for
-Arch. It has to be on your PATH:
+Applying the delta is appimg's own work as well: it reads the block checksums
+out of the zsync file, works out which blocks the installed AppImage already
+holds, fetches only the ranges it is missing and verifies the assembled file
+against the checksum the zsync file carries. An update says what that cost:
+
+    Updating Krita...
+      5.2.9 -> 5.3.3
+      reused 92104 of 94217 blocks, fetched 8.4 MB in 37 requests
+
+`appimageupdatetool` is kept as a fallback for the cases the native path
+cannot handle, and an update says when it ran. It is not packaged for Arch;
+if you want the fallback, it has to be on your PATH:
 
     mkdir -p ~/.local/bin
     curl -L -o ~/.local/bin/appimageupdatetool \
       https://github.com/AppImageCommunity/AppImageUpdate/releases/download/continuous/appimageupdatetool-x86_64.AppImage
     chmod +x ~/.local/bin/appimageupdatetool
 
-`appimg doctor` tells you whether it found it. Without the tool, updates from
-a zsync source fail with a message saying so.
+`appimg doctor` tells you whether it found it.
 
 ## Where things go
 

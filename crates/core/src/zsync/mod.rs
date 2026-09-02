@@ -3,8 +3,9 @@
 //!
 //! [`control`] parses the file a server publishes, [`rsum`] and [`md4`] are
 //! the two checksums it holds per block, [`scan`] slides one over a local
-//! file to find the blocks that need no fetching, and [`fetch`] asks the
-//! server for the rest. Everything follows zsync 0.6.2; each module names
+//! file to find the blocks that need no fetching, [`fetch`] asks the server
+//! for the rest, and [`apply`] puts the two together and checks the
+//! result. Everything follows zsync 0.6.2; each module names
 //! the lines it was derived from.
 
 use std::fs::File;
@@ -13,14 +14,17 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+pub mod apply;
 pub mod control;
 pub mod fetch;
 pub mod md4;
 pub mod rsum;
 pub mod scan;
 
+pub use apply::{apply, Applied};
 pub use control::{
-    fetch_header, parse_control, parse_header, BlockSum, ControlFile, HashLengths, Header,
+    fetch_control, fetch_header, parse_control, parse_header, BlockSum, ControlFile, HashLengths,
+    Header,
 };
 pub use fetch::{fetch_missing, missing_ranges, FetchReport};
 pub use md4::{md4, Md4};
