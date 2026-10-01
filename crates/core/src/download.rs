@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ureq::ResponseExt;
 
+use crate::elf;
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
 
@@ -96,6 +97,32 @@ pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Resu
     fs_util::set_mode(&partial, MODE_EXEC)?;
     std::fs::rename(&partial, dest).map_err(|e| Error::io(dest, e))?;
     Ok(written)
+}
+
+/// Downloads an AppImage the way [`to_file`] downloads anything, then makes
+/// sure it is one. Both an install and an update from a URL come through
+/// here, before the file goes anywhere permanent. A file that fails the
+/// check is removed again before the error comes back.
+pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Result<u64> {
+    let bytes = to_file(url, dest, progress)?;
+
+    if fs_util::file_size(dest).unwrap_or(0) == 0 {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::Download(format!("{url}: the downloaded file is empty")));
+    }
+    // A transfer that arrived whole can still be the wrong file: an error
+    // page sent with a 200 and a matching Content-Length passes every check
+    // on the transfer. Nothing is installed, and nothing replaces an
+    // installed AppImage, unless it at least starts the way every AppImage
+    // does.
+    if !elf::has_magic(dest) {
+        let _ = std::fs::remove_file(dest);
+        return Err(Error::Download(format!(
+            "{url}: the server sent a file that is not an AppImage, it does not start with an \
+             ELF header"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Fetches at most `max_bytes` from the start of a URL, with a ranged

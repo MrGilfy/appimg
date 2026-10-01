@@ -88,8 +88,11 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
 
     ui.info(&format!("Downloading {}", ui.accent(source)));
     let mut progress = ui.progress();
-    let bytes =
-        download::to_file(source, &dest, Some(&mut |done, total| progress.update(done, total)))?;
+    let bytes = download::appimage_to_file(
+        source,
+        &dest,
+        Some(&mut |done, total| progress.update(done, total)),
+    )?;
     progress.finish();
     ui.info(&format!("  {} downloaded", human_size(bytes)));
 

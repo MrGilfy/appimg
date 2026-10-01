@@ -9,7 +9,7 @@ use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, date, elf, icon, json, version, zsync};
+use crate::{caches, date, icon, json, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -474,23 +474,7 @@ fn download_staged(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<(PathBuf, u64)> {
     let staged = paths.appimage_dir.join(format!("{slug}.AppImage.new"));
-    let bytes = download::to_file(url, &staged, progress)?;
-
-    if fs_util::file_size(&staged).unwrap_or(0) == 0 {
-        let _ = fs::remove_file(&staged);
-        return Err(Error::Download(format!("{url}: the downloaded file is empty")));
-    }
-    // A transfer that arrived whole can still be the wrong file: an error
-    // page sent with a 200 and a matching Content-Length passes every check
-    // on the transfer. Nothing replaces the installed AppImage unless it at
-    // least starts the way every AppImage does.
-    if !elf::has_magic(&staged) {
-        let _ = fs::remove_file(&staged);
-        return Err(Error::Download(format!(
-            "{url}: the server sent a file that is not an AppImage, it does not start with an \
-             ELF header"
-        )));
-    }
+    let bytes = download::appimage_to_file(url, &staged, progress)?;
     fs_util::set_mode(&staged, MODE_EXEC)?;
     Ok((staged, bytes))
 }

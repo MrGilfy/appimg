@@ -13,6 +13,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   as an error page sent with a 200, used to replace the installed version;
   anything that does not start with an ELF header is now refused before the
   swap, and the installed version stays where it is.
+- `appimg install <url>` refuses the same kind of download. An error page
+  sent with a 200 used to be installed as the application, with a desktop
+  entry and the generic icon, whenever `--yes` answered the question about
+  the missing metadata. Now nothing is installed and the error names the URL.
 
 ## [0.2.1] - 2026-09-02
 
