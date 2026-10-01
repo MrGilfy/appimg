@@ -32,6 +32,9 @@ Run `appimg` without arguments for the TUI, or go straight to a command:
 The entry is registered right away, though some launchers only read their
 application list at startup.
 
+The output of `list --json` is not a stable interface: its field set may
+change between versions without notice.
+
 ## Updates
 
     appimg update --all --check    check without changing anything

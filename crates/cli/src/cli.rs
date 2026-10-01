@@ -82,7 +82,8 @@ pub struct InstallArgs {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Machine-readable output.
+    /// Machine-readable output. The field set may change between versions
+    /// without notice.
     #[arg(long)]
     pub json: bool,
 }
