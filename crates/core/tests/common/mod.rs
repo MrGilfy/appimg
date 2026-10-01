@@ -81,6 +81,8 @@ pub struct FakeAppImage {
     pub failure: Option<(i32, String)>,
     /// Extra bytes appended to the runtime, so two builds differ.
     pub marker: String,
+    /// Whether the file starts with an ELF header instead of a shebang.
+    pub elf: bool,
 }
 
 impl FakeAppImage {
@@ -95,6 +97,7 @@ impl FakeAppImage {
             executable: true,
             failure: None,
             marker: String::new(),
+            elf: false,
         }
     }
 
@@ -126,8 +129,18 @@ impl FakeAppImage {
         self
     }
 
+    /// Builds a file that starts with the ELF magic, as a real AppImage
+    /// does and as an update insists on. It has no runtime that could run,
+    /// so it only extracts through `unsquashfs`, and only through a stand-in
+    /// for it that copies the payload the file names on its `payload=` line.
+    pub fn elf(mut self) -> Self {
+        self.elf = true;
+        self
+    }
+
     /// Writes a shell script that behaves like an AppImage runtime: called
     /// with `--appimage-extract` it drops a `squashfs-root` next to itself.
+    /// With [`Self::elf`], writes a file that only starts like one instead.
     pub fn build(&self, dir: &Path, file_name: &str) -> PathBuf {
         let payload = dir.join(format!(".payload-{file_name}"));
         let apps_root = payload.join("usr/share/icons/hicolor");
@@ -160,16 +173,29 @@ impl FakeAppImage {
                 format!("mkdir -p squashfs-root\ncp -R '{}/.' squashfs-root/\n", payload.display())
             }
         };
-        let script = format!(
-            "#!/bin/sh\n\
-             # fake AppImage runtime {marker}\n\
-             if [ \"$1\" != \"--appimage-extract\" ]; then\n\
-             \techo 'fake appimage'\n\
-             \texit 0\n\
-             fi\n\
-             {extract}",
-            marker = self.marker,
-        );
+        let script = if self.elf {
+            // The squashfs magic at the end is what tells appimg where the
+            // payload starts, once the ELF header leads nowhere.
+            format!(
+                "\x7fELF\n\
+                 payload={payload}\n\
+                 # fake AppImage runtime {marker}\n\
+                 hsqs\n",
+                payload = payload.display(),
+                marker = self.marker,
+            )
+        } else {
+            format!(
+                "#!/bin/sh\n\
+                 # fake AppImage runtime {marker}\n\
+                 if [ \"$1\" != \"--appimage-extract\" ]; then\n\
+                 \techo 'fake appimage'\n\
+                 \texit 0\n\
+                 fi\n\
+                 {extract}",
+                marker = self.marker,
+            )
+        };
 
         // The script only appears under its final name once it is complete
         // and closed: no reader, and no `exec`, ever sees a half-written file.

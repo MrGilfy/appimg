@@ -7,6 +7,13 @@ const CLASS_64: u8 = 2;
 const DATA_LITTLE_ENDIAN: u8 = 1;
 const SECTION_HEADER_SIZE: usize = 64;
 
+/// Whether a file starts with the ELF magic bytes. Every AppImage does,
+/// whatever its architecture, because its runtime is an ELF binary.
+pub fn has_magic(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    File::open(path).and_then(|mut file| file.read_exact(&mut magic)).is_ok() && &magic == ELF_MAGIC
+}
+
 /// Where the ELF part of the file ends, which is where an AppImage keeps
 /// its squashfs payload. Reading the header beats scanning for magic bytes,
 /// because the magic can also appear inside the payload itself.
@@ -229,6 +236,24 @@ mod tests {
         let script = dir.path().join("script.sh");
         write_atomic(&script, b"#!/bin/sh\n", MODE_FILE).unwrap();
         assert_eq!(payload_offset(&script), None);
+    }
+
+    #[test]
+    fn only_a_file_that_starts_with_the_elf_magic_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("fake.elf");
+        write_atomic(&elf, &elf_with_section(".upd_info", b"data"), MODE_FILE).unwrap();
+        assert!(has_magic(&elf));
+
+        let page = dir.path().join("page.html");
+        write_atomic(&page, b"<!DOCTYPE html>\n<html></html>\n", MODE_FILE).unwrap();
+        assert!(!has_magic(&page));
+
+        let short = dir.path().join("short");
+        write_atomic(&short, &ELF_MAGIC[..3], MODE_FILE).unwrap();
+        assert!(!has_magic(&short));
+
+        assert!(!has_magic(&dir.path().join("missing")));
     }
 
     #[test]

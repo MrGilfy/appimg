@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- An update that downloads the whole file no longer installs whatever the
+  server sends. A file that arrived complete but is no AppImage at all, such
+  as an error page sent with a 200, used to replace the installed version;
+  anything that does not start with an ELF header is now refused before the
+  swap, and the installed version stays where it is.
+
 ## [0.2.1] - 2026-09-02
 
 ### Fixed

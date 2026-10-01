@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::io::Cursor;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{Cursor, Read, Write};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -261,6 +261,74 @@ fn a_download_that_fails_leaves_no_half_file() {
     assert!(!dest.exists());
 }
 
+/// A server that answers one request with exactly these bytes and hangs up.
+/// Whatever the response says about its own length, the connection ends
+/// where the bytes do, which is what a server that dies mid-transfer does.
+fn answer_once_and_hang_up(response: Vec<u8>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let url = format!("http://{}/App.AppImage", listener.local_addr().unwrap());
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        // The request is read to its end first: a socket closed with unread
+        // bytes in it resets the connection, and a reset is an error the
+        // client would report whatever the body looked like.
+        let mut request = Vec::new();
+        let mut byte = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap() == 1 {
+            request.push(byte[0]);
+        }
+        let _ = stream.write_all(&response);
+        let _ = stream.shutdown(Shutdown::Write);
+    });
+    (url, handle)
+}
+
+/// One chunk of a `Transfer-Encoding: chunked` body: its size in hex, the
+/// bytes, and the line break after them.
+fn chunk(data: &[u8]) -> Vec<u8> {
+    [format!("{:x}\r\n", data.len()).as_bytes(), data, b"\r\n"].concat()
+}
+
+const CHUNKED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+/// The empty chunk that says a chunked body is complete.
+const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
+/// A chunked body announces no length, so a server that dies partway leaves
+/// nothing to compare the bytes against. What gives it away is the empty
+/// chunk that never arrives, and ureq treats a body without it as an error
+/// rather than a short file, wherever the cut falls.
+#[test]
+fn a_chunked_download_that_is_cut_off_is_an_error_not_a_short_file() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let first = vec![b'a'; 4096];
+    let second = vec![b'b'; 4096];
+
+    // The same body finished properly arrives whole, so the failures below
+    // come from the cut and not from how the chunks are written.
+    let complete = [CHUNKED_HEAD, &chunk(&first), &chunk(&second), LAST_CHUNK].concat();
+    let (url, server) = answer_once_and_hang_up(complete);
+    let dest = sandbox.downloads.join("Complete.AppImage");
+    assert_eq!(download::to_file(&url, &dest, None).unwrap(), 8192);
+    server.join().unwrap();
+
+    let cut_off = [
+        ("between two chunks", [CHUNKED_HEAD, &chunk(&first)].concat()),
+        ("inside a chunk", [CHUNKED_HEAD, &chunk(&first), &chunk(&second)[..1000]].concat()),
+    ];
+    for (place, response) in cut_off {
+        let (url, server) = answer_once_and_hang_up(response);
+        let dest = sandbox.downloads.join("App.AppImage");
+        let result = download::to_file(&url, &dest, None);
+        server.join().unwrap();
+
+        assert!(result.is_err(), "cut off {place}: {result:?}");
+        assert!(!dest.exists(), "cut off {place}");
+        assert!(!dest.with_extension("part").exists(), "cut off {place}");
+    }
+}
+
 #[test]
 fn install_from_a_url_records_it_and_updates_from_it() {
     let _serial = common::serial();
@@ -289,13 +357,17 @@ fn install_from_a_url_records_it_and_updates_from_it() {
     assert_eq!(walk(&sandbox.paths.data_home), before);
 
     // The server now offers a different build, so the update picks it up.
+    // A download only replaces the installed file if it starts with an ELF
+    // header, so this one does.
     let newer = FakeAppImage::new("Fake App")
         .marker("v2")
         .icon_sizes(&[64])
+        .elf()
         .build(&sandbox.root, "build2.AppImage");
     server.serve(std::fs::read(&newer).unwrap());
 
-    let result = update::update(&sandbox.paths, &app, None).unwrap();
+    let result =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &app, None)).unwrap();
     assert!(read(&result.appimage_path).contains("v2"));
     assert!(read(result.backup_path.as_ref().unwrap()).contains("v1"));
     assert!(walk(&sandbox.paths.icons_root).contains(&"64x64/apps/fake-app.png".into()));
@@ -328,6 +400,40 @@ fn a_failing_update_leaves_the_installed_version_alone() {
 
     assert!(read(&app.appimage_path).contains("v1"));
     assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+}
+
+/// A transfer that arrives whole is not yet an AppImage. An error page sent
+/// with a 200 and a Content-Length that matches it gets through every check
+/// on the transfer, and has to be stopped before it replaces anything.
+#[test]
+fn a_download_that_is_not_an_appimage_never_replaces_the_installed_one() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
+    let server = Server::start(std::fs::read(&built).unwrap());
+    let url = server.url("Fake_App-1.0.0.AppImage");
+
+    let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
+    download::to_file(&url, &downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None).unwrap();
+    install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info)).unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    let entry = read(&app.desktop_entry_path);
+
+    let page = b"<!DOCTYPE html>\n<html><body>Something went wrong</body></html>\n".to_vec();
+    server.serve(page.clone());
+    let error = update::update(&sandbox.paths, &app, None).unwrap_err().to_string();
+
+    // The whole page arrived, at the length the server announced for it.
+    // Nothing about the transfer gave it away, only what it was.
+    assert_eq!(server.served().last(), Some(&page.len()));
+    assert!(error.contains(&url), "{error}");
+    assert!(error.contains("not an AppImage"), "{error}");
+
+    assert!(read(&app.appimage_path).contains("v1"));
+    assert_eq!(read(&app.desktop_entry_path), entry);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
 }
 
 /// `update --check` on a zsync source, without `appimageupdatetool`: the
@@ -921,6 +1027,26 @@ fn with_failing_appimageupdatetool<T>(sandbox: &Sandbox, run: impl FnOnce() -> T
     std::fs::create_dir_all(&dir).unwrap();
     let tool = dir.join("appimageupdatetool");
     std::fs::write(&tool, "#!/bin/sh\necho 'stand-in, not the real thing' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    with_tools_on_path(&dir, run)
+}
+
+/// Runs something with a stand-in for `unsquashfs` on `PATH`, the one way a
+/// `FakeAppImage::elf` build extracts: it copies the payload the file names
+/// into the directory it is asked to unpack to.
+fn with_unsquashfs_stand_in<T>(sandbox: &Sandbox, run: impl FnOnce() -> T) -> T {
+    let dir = sandbox.root.join("unsquashfs-tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("unsquashfs");
+    // Called as `unsquashfs -no-progress -o OFFSET -d ROOT FILE`.
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\n\
+         payload=$(sed -n 's/^payload=//p' \"$6\")\n\
+         mkdir -p \"$5\"\n\
+         cp -R \"$payload/.\" \"$5/\"\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     with_tools_on_path(&dir, run)
 }
