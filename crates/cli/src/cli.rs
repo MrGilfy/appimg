@@ -102,7 +102,8 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub check: bool,
 
-    /// Machine-readable output, with --check.
+    /// Machine-readable output, with --check. The field set may change
+    /// between versions without notice.
     #[arg(long)]
     pub json: bool,
 }

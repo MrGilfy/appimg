@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-01
+
+### Changed
+
+- The output of `list --json` and `update --check --json` is documented as
+  unstable: the README and the `--help` of both say that its field set may
+  change between versions without notice. The output itself is the same as
+  in 0.2.1.
+
 ### Fixed
 
 - An update that downloads the whole file no longer installs whatever the
