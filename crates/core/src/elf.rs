@@ -7,6 +7,16 @@ const CLASS_64: u8 = 2;
 const DATA_LITTLE_ENDIAN: u8 = 1;
 const SECTION_HEADER_SIZE: usize = 64;
 
+/// The squashfs magic, `0x73717368` stored little-endian.
+pub const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
+/// The squashfs version whose superblock layout [`minimum_length`] reads.
+const SQUASHFS_MAJOR: u16 = 4;
+/// How much of a squashfs superblock [`minimum_length`] reads, and a floor
+/// under what a complete AppImage carries behind its ELF part: a squashfs
+/// superblock alone is 96 bytes, and an ISO 9660 image keeps its first
+/// volume descriptor 32 KiB in.
+const SUPERBLOCK_PREFIX: u64 = 48;
+
 /// Whether a file starts with the ELF magic bytes. Every AppImage does,
 /// whatever its architecture, because its runtime is an ELF binary.
 pub fn has_magic(path: &Path) -> bool {
@@ -19,7 +29,58 @@ pub fn has_magic(path: &Path) -> bool {
 /// because the magic can also appear inside the payload itself.
 pub fn payload_offset(path: &Path) -> Option<u64> {
     let mut file = File::open(path).ok()?;
+    let end = section_table_end(&mut file)?;
+    let size = file.metadata().ok()?.len();
+    (end < size).then_some(end)
+}
 
+/// How long a complete AppImage has to be at least, going by what its front
+/// says. A file shorter than that was cut off.
+///
+/// The ELF header says where the section table ends, which is where the
+/// payload starts, and a complete file holds both its section table and at
+/// least [`SUPERBLOCK_PREFIX`] bytes of payload. A squashfs 4.0
+/// superblock there adds the size of the filesystem behind it. A file can
+/// be longer than that, because mksquashfs pads what it writes to a
+/// multiple of 4 KiB.
+///
+/// `None` when the front says nothing about the length: the file is no
+/// 64-bit little-endian ELF, its header is cut short or names no section
+/// table, or the payload is no squashfs 4.0 image, as in a type 1 AppImage,
+/// which carries an ISO 9660 image instead.
+pub fn minimum_length(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let offset = section_table_end(&mut file)?;
+    let size = file.metadata().ok()?.len();
+
+    // A complete ELF contains its own section table.
+    if size < offset {
+        return Some(offset);
+    }
+    // Behind it comes a squashfs superblock or the rest of an ISO 9660
+    // image, either way more than the part of a superblock read below.
+    let floor = offset.checked_add(SUPERBLOCK_PREFIX)?;
+    if size < floor {
+        return Some(floor);
+    }
+
+    // The superblock is little-endian, laid out as `struct
+    // squashfs_super_block` in squashfs-tools: the magic at 0, the major
+    // version at 28, and `bytes_used` at 40. Version 3 keeps its major
+    // version at 28 as well, but not its size at 40.
+    let mut superblock = [0u8; SUPERBLOCK_PREFIX as usize];
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut superblock).ok()?;
+    if &superblock[0..4] != SQUASHFS_MAGIC || read_u16(&superblock, 28)? != SQUASHFS_MAJOR {
+        return None;
+    }
+    offset.checked_add(read_u64(&superblock, 40)?)
+}
+
+/// Where the section table of a 64-bit little-endian ELF file ends, going
+/// by its header alone, whether or not the file is that long. `None` for
+/// any other file, a header cut short, or a header without a section table.
+fn section_table_end(file: &mut File) -> Option<u64> {
     let mut ident = [0u8; 16];
     file.read_exact(&mut ident).ok()?;
     if &ident[0..4] != ELF_MAGIC || ident[4] != CLASS_64 || ident[5] != DATA_LITTLE_ENDIAN {
@@ -33,8 +94,7 @@ pub fn payload_offset(path: &Path) -> Option<u64> {
     let section_count = read_u16(&header, 44)? as u64;
 
     let end = section_table_offset.checked_add(section_entry_size.checked_mul(section_count)?)?;
-    let size = file.metadata().ok()?.len();
-    (end > 0 && end < size).then_some(end)
+    (end > 0).then_some(end)
 }
 
 /// Reads one section out of a 64-bit little-endian ELF file. Anything else,
@@ -236,6 +296,41 @@ mod tests {
         let script = dir.path().join("script.sh");
         write_atomic(&script, b"#!/bin/sh\n", MODE_FILE).unwrap();
         assert_eq!(payload_offset(&script), None);
+    }
+
+    #[test]
+    fn the_payload_ends_where_its_superblock_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = elf_with_section(".upd_info", b"data");
+        let offset = elf.len() as u64;
+
+        // Magic, the major version at 28 and bytes_used at 40, and the
+        // rest of a 96-byte superblock.
+        let superblock = |magic: &[u8; 4], major: u16, bytes_used: u64| {
+            let mut out = elf.clone();
+            out.extend_from_slice(magic);
+            out.extend_from_slice(&[0u8; 24]);
+            out.extend_from_slice(&major.to_le_bytes());
+            out.extend_from_slice(&[0u8; 10]);
+            out.extend_from_slice(&bytes_used.to_le_bytes());
+            out.extend_from_slice(&[0u8; 48]);
+            out
+        };
+
+        let path = dir.path().join("squashfs.AppImage");
+        write_atomic(&path, &superblock(SQUASHFS_MAGIC, 4, 12_345), MODE_FILE).unwrap();
+        assert_eq!(minimum_length(&path), Some(offset + 12_345));
+
+        // A type 1 AppImage carries an ISO 9660 image, which has no
+        // superblock to read a size from.
+        let iso = dir.path().join("iso.AppImage");
+        write_atomic(&iso, &superblock(b"\0\0\0\0", 4, 12_345), MODE_FILE).unwrap();
+        assert_eq!(minimum_length(&iso), None);
+
+        // Squashfs 3 keeps something else at byte 40.
+        let old = dir.path().join("squashfs3.AppImage");
+        write_atomic(&old, &superblock(SQUASHFS_MAGIC, 3, 12_345), MODE_FILE).unwrap();
+        assert_eq!(minimum_length(&old), None);
     }
 
     #[test]

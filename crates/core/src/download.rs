@@ -101,8 +101,8 @@ pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Resu
 
 /// Downloads an AppImage the way [`to_file`] downloads anything, then makes
 /// sure it is one. Both an install and an update from a URL come through
-/// here, before the file goes anywhere permanent. A file that fails the
-/// check is removed again before the error comes back.
+/// here, before the file goes anywhere permanent. A file that fails a check
+/// is removed again before the error comes back.
 pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Result<u64> {
     let bytes = to_file(url, dest, progress)?;
 
@@ -121,6 +121,21 @@ pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>
             "{url}: the server sent a file that is not an AppImage, it does not start with an \
              ELF header"
         )));
+    }
+    // A server that sends neither a Content-Length nor a chunked body and
+    // hangs up early leaves a file whose front is intact, so it passes the
+    // check above. That front says how long a complete file is at least:
+    // the ELF header says where the payload starts, and a squashfs
+    // superblock there says how long the payload is.
+    if let Some(minimum) = elf::minimum_length(dest) {
+        let actual = fs_util::file_size(dest).unwrap_or(0);
+        if actual < minimum {
+            let _ = std::fs::remove_file(dest);
+            return Err(Error::Download(format!(
+                "{url}: the download is cut short, a complete file is at least {minimum} bytes \
+                 and the server sent {actual}"
+            )));
+        }
     }
     Ok(bytes)
 }

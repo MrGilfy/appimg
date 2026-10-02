@@ -329,6 +329,178 @@ fn a_chunked_download_that_is_cut_off_is_an_error_not_a_short_file() {
     }
 }
 
+/// The head of a response that says nothing about how long the body is: no
+/// Content-Length and no chunked encoding, so the body ends wherever the
+/// connection does.
+const UNSIZED_HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+
+/// Where [`elf_with_squashfs`] puts the payload: after the 64-byte ELF
+/// header and the one section header that follows it.
+const PAYLOAD_OFFSET: usize = 128;
+
+/// An AppImage as far as its length goes: a 64-bit ELF header whose section
+/// table, one empty entry, ends where the payload starts, then a squashfs
+/// 4.0 superblock that says the filesystem is `bytes_used` long, that many
+/// bytes, and zeros up to the next 4 KiB the way mksquashfs pads.
+fn elf_with_squashfs(bytes_used: usize) -> Vec<u8> {
+    let mut out = b"\x7fELF\x02\x01\x01".to_vec();
+    out.resize(16, 0);
+    out.extend_from_slice(&2u16.to_le_bytes()); // e_type
+    out.extend_from_slice(&62u16.to_le_bytes()); // e_machine
+    out.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    out.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+    out.extend_from_slice(&0u64.to_le_bytes()); // e_phoff
+    out.extend_from_slice(&64u64.to_le_bytes()); // e_shoff
+    out.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    out.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_phentsize
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_phnum
+    out.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    out.extend_from_slice(&1u16.to_le_bytes()); // e_shnum
+    out.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    out.resize(PAYLOAD_OFFSET, 0); // the null section header
+
+    // struct squashfs_super_block, 96 bytes, little-endian.
+    out.extend_from_slice(b"hsqs");
+    out.extend_from_slice(&1u32.to_le_bytes()); // inodes
+    out.extend_from_slice(&0u32.to_le_bytes()); // mkfs_time
+    out.extend_from_slice(&131_072u32.to_le_bytes()); // block_size
+    out.extend_from_slice(&0u32.to_le_bytes()); // fragments
+    out.extend_from_slice(&1u16.to_le_bytes()); // compression
+    out.extend_from_slice(&17u16.to_le_bytes()); // block_log
+    out.extend_from_slice(&0u16.to_le_bytes()); // flags
+    out.extend_from_slice(&1u16.to_le_bytes()); // no_ids
+    out.extend_from_slice(&4u16.to_le_bytes()); // s_major
+    out.extend_from_slice(&0u16.to_le_bytes()); // s_minor
+    out.extend_from_slice(&0u64.to_le_bytes()); // root_inode
+    out.extend_from_slice(&(bytes_used as u64).to_le_bytes()); // bytes_used
+    out.extend_from_slice(&[0xff; 48]); // six table offsets, never read
+
+    out.extend(noise(12, PAYLOAD_OFFSET + bytes_used - out.len()));
+    out.resize(out.len().next_multiple_of(4096), 0);
+    out
+}
+
+/// Serves `body` with no length, the way a server that hangs up early does,
+/// and checks that the download is refused as cut short, naming the URL and
+/// both lengths, and that nothing is left behind.
+fn assert_cut_short(sandbox: &Sandbox, body: &[u8], minimum: usize, place: &str) {
+    let (url, server) = answer_once_and_hang_up([UNSIZED_HEAD, body].concat());
+    let dest = sandbox.downloads.join("App.AppImage");
+    let result = download::appimage_to_file(&url, &dest, None);
+    server.join().unwrap();
+
+    let error = match result {
+        Ok(bytes) => panic!("cut off {place}: kept {bytes} bytes"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains(&url), "cut off {place}: {error}");
+    assert!(error.contains(&format!("at least {minimum} bytes")), "cut off {place}: {error}");
+    assert!(error.contains(&format!("sent {}", body.len())), "cut off {place}: {error}");
+    assert!(walk(&sandbox.downloads).is_empty(), "cut off {place}");
+}
+
+/// A server that sends no length and hangs up early leaves a file whose
+/// front is intact, so it starts with an ELF header like any AppImage. The
+/// squashfs superblock in that front still says how long the file has to be.
+#[test]
+fn a_download_shorter_than_its_squashfs_payload_is_refused() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let file = elf_with_squashfs(10_000);
+    let minimum = PAYLOAD_OFFSET + 10_000;
+
+    for (place, length) in
+        [("after the superblock", PAYLOAD_OFFSET + 96), ("one byte short", minimum - 1)]
+    {
+        assert_cut_short(&sandbox, &file[..length], minimum, place);
+    }
+}
+
+/// A complete ELF contains its own section table, so a file that ends
+/// before the table its header describes was cut off, whatever its payload.
+#[test]
+fn a_download_that_ends_before_its_section_table_is_refused() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let file = elf_with_squashfs(10_000);
+
+    // The header is whole in both, the section table behind it is not.
+    for (place, length) in
+        [("after the header", 64), ("inside the section table", PAYLOAD_OFFSET - 1)]
+    {
+        assert_cut_short(&sandbox, &file[..length], PAYLOAD_OFFSET, place);
+    }
+}
+
+/// Behind its section table a complete AppImage carries a squashfs
+/// superblock of 96 bytes or an ISO 9660 image of far more, so a file that
+/// ends less than 48 bytes behind it was cut off, whichever it carries.
+#[test]
+fn a_download_that_ends_right_behind_its_section_table_is_refused() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let squashfs = elf_with_squashfs(10_000);
+    let mut other = squashfs.clone();
+    other[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].copy_from_slice(&[0; 4]);
+
+    for (payload, file) in [("squashfs", &squashfs), ("no squashfs", &other)] {
+        for (place, length) in
+            [("at the payload", PAYLOAD_OFFSET), ("47 bytes in", PAYLOAD_OFFSET + 47)]
+        {
+            let place = format!("{place}, {payload}");
+            assert_cut_short(&sandbox, &file[..length], PAYLOAD_OFFSET + 48, &place);
+        }
+    }
+}
+
+/// The superblock gives a floor, not a length. mksquashfs pads its output to
+/// a multiple of 4 KiB, and with `-nopad` it does not.
+#[test]
+fn a_download_as_long_as_its_squashfs_payload_or_longer_is_kept() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let file = elf_with_squashfs(10_000);
+    assert!(file.len() > PAYLOAD_OFFSET + 10_000);
+
+    for (name, length) in [("padded", file.len()), ("unpadded", PAYLOAD_OFFSET + 10_000)] {
+        let (url, server) = answer_once_and_hang_up([UNSIZED_HEAD, &file[..length]].concat());
+        let dest = sandbox.downloads.join(format!("{name}.AppImage"));
+        let result = download::appimage_to_file(&url, &dest, None);
+        server.join().unwrap();
+
+        assert_eq!(result.unwrap(), length as u64, "{name}");
+        assert_eq!(std::fs::read(&dest).unwrap(), &file[..length], "{name}");
+    }
+}
+
+/// What the front of a file cannot vouch for is not held against it. A type
+/// 1 AppImage carries an ISO 9660 image where a type 2 carries its squashfs,
+/// with no superblock to take a length from, and the header of a 32-bit ELF
+/// is not read at all.
+#[test]
+fn a_download_whose_front_says_nothing_about_its_length_is_kept() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let mut no_squashfs = elf_with_squashfs(10_000);
+    no_squashfs[PAYLOAD_OFFSET..PAYLOAD_OFFSET + 4].copy_from_slice(&[0; 4]);
+    // Read as a 64-bit header, this one ends before its section table.
+    let mut elf32 = elf_with_squashfs(10_000);
+    elf32[4] = 1;
+
+    for (name, file, length) in
+        [("no squashfs", &no_squashfs, PAYLOAD_OFFSET + 5_000), ("32-bit", &elf32, 100)]
+    {
+        let (url, server) = answer_once_and_hang_up([UNSIZED_HEAD, &file[..length]].concat());
+        let dest = sandbox.downloads.join(format!("{name}.AppImage"));
+        let result = download::appimage_to_file(&url, &dest, None);
+        server.join().unwrap();
+
+        assert_eq!(result.unwrap(), length as u64, "{name}");
+        assert_eq!(std::fs::read(&dest).unwrap(), &file[..length], "{name}");
+    }
+}
+
 #[test]
 fn install_from_a_url_records_it_and_updates_from_it() {
     let _serial = common::serial();

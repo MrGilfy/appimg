@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A download that was cut off is no longer installed, and no longer
+  replaces the installed version in an update. A server that sends neither
+  a Content-Length nor a chunked body and hangs up early leaves a file that
+  starts like an AppImage, so it got past the check for an ELF header. The
+  front of the file says how long a complete one is at least: the ELF
+  header says where the payload starts, and the squashfs superblock there
+  says how long the payload is. A file that ends before its ELF section
+  table, less than 48 bytes behind it, or before the end of its squashfs
+  payload is now removed and refused with an error that names the URL, the
+  length it needs at least and the length that arrived. The size of a type
+  1 AppImage's payload is not checked, since it is not squashfs, and a
+  32-bit AppImage is not checked at all.
+
 ## [0.2.2] - 2026-10-01
 
 ### Changed

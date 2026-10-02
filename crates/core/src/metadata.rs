@@ -6,11 +6,10 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 use crate::desktop_entry::{self, DesktopEntry};
+use crate::elf::SQUASHFS_MAGIC;
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
 use crate::{elf, slug, version};
-
-const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
 
 /// A temporary directory holding an extracted AppImage. Dropping it removes
 /// the extracted tree.
