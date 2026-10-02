@@ -3,7 +3,9 @@
 Installs, updates and removes AppImages as proper desktop applications, entirely
 inside `$HOME`.
 
-![appimg](docs/screenshot.png)
+
+https://github.com/user-attachments/assets/c6752237-69ac-4ea1-ba8a-b70a516be8b7
+
 
 ## Install
 
