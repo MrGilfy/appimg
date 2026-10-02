@@ -749,18 +749,25 @@ impl Release {
     /// [`Release::appimage`] matches them.
     fn fitting(&self, hint: Option<&str>, here: Option<Arch>) -> Vec<&String> {
         let wanted = hint.map(AssetName::parse);
-        self.appimages()
+        let appimages: Vec<(&String, AssetName)> =
+            self.appimages().into_iter().map(|url| (url, AssetName::parse(url))).collect();
+        // A name without an architecture is the build for this machine,
+        // unless another AppImage of the release names this machine's: then
+        // it is the build for some other one, the way electron-builder leaves
+        // the x86_64 AppImage unlabeled next to an `-arm64` one. Only the
+        // AppImages count, Obsidian's `_amd64.deb` says nothing about them.
+        let labels_here = here.is_some() && appimages.iter().any(|(_, name)| name.arch == here);
+        let unlabeled = if labels_here { None } else { here };
+        appimages
             .into_iter()
-            .filter(|url| {
-                let candidate = AssetName::parse(url);
-                match &wanted {
-                    Some(wanted) => {
-                        candidate.words == wanted.words
-                            && arch_fits(wanted.arch, candidate.arch, here)
-                    }
-                    None => arch_fits(None, candidate.arch, here),
+            .filter(|(_, candidate)| match &wanted {
+                Some(wanted) => {
+                    candidate.words == wanted.words
+                        && arch_fits(wanted.arch, candidate.arch, here, unlabeled)
                 }
+                None => arch_fits(None, candidate.arch, here, unlabeled),
             })
+            .map(|(url, _)| url)
             .collect()
     }
 
@@ -879,11 +886,19 @@ impl Arch {
     }
 }
 
-/// Whether a file built for `candidate` is one for `wanted`. A name that
-/// carries no architecture is taken to be built for the machine this runs
-/// on, which is what a project that ships one build usually means.
-fn arch_fits(wanted: Option<Arch>, candidate: Option<Arch>, here: Option<Arch>) -> bool {
-    wanted.or(here) == candidate.or(here)
+/// Whether a file built for `candidate` is one for `wanted`, on a machine
+/// that is `here`. An installed name that carries no architecture is the
+/// build for this machine. A release file that carries none is the build
+/// for `unlabeled`: this machine, which is what a project that ships one
+/// build usually means, or no machine at all when the release labels
+/// another file as this machine's build.
+fn arch_fits(
+    wanted: Option<Arch>,
+    candidate: Option<Arch>,
+    here: Option<Arch>,
+    unlabeled: Option<Arch>,
+) -> bool {
+    wanted.or(here) == candidate.or(unlabeled)
 }
 
 /// An asset name as the matching sees it: the words of the name without
@@ -1892,20 +1907,55 @@ mod tests {
 
     #[test]
     fn a_name_without_an_architecture_is_built_for_this_machine() {
-        let next =
-            names_in("v1.5.4", &["Obsidian-1.5.4.AppImage", "Obsidian-1.5.4-arm64.AppImage"]);
-        let installed = Some("Obsidian-1.5.3.AppImage");
+        let next = names_in("v2.0.0", &["App-2.0.0.AppImage", "App-2.0.0.dmg"]);
+        for here in [Arch::X86_64, Arch::Aarch64] {
+            assert_eq!(
+                picked(&next, Some("App-1.0.0.AppImage"), here).as_deref(),
+                Some("App-2.0.0.AppImage"),
+                "{here:?}"
+            );
+            assert_eq!(
+                picked(&next, None, here).as_deref(),
+                Some("App-2.0.0.AppImage"),
+                "{here:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_with_this_machines_architecture_beats_one_without() {
+        // electron-builder's way, and Obsidian's: the x86_64 build without
+        // an architecture in its name, the arm64 build with one.
+        let next = names_in(
+            "v1.13.8",
+            &[
+                "Obsidian-1.13.8.AppImage",
+                "Obsidian-1.13.8-arm64.AppImage",
+                "obsidian_1.13.8_amd64.deb",
+            ],
+        );
         assert_eq!(
-            picked(&next, installed, Arch::X86_64).as_deref(),
-            Some("Obsidian-1.5.4.AppImage")
+            picked(&next, Some("Obsidian-1.13.7-arm64.AppImage"), Arch::Aarch64).as_deref(),
+            Some("Obsidian-1.13.8-arm64.AppImage")
         );
-        // On an arm64 machine both fit, and nothing says which one it was.
-        let error = next.appimage(installed, Some(Arch::Aarch64)).unwrap_err();
-        assert!(error.contains("2 of its AppImages match Obsidian-1.5.3.AppImage"), "{error}");
-        assert!(
-            error.contains("Obsidian-1.5.4.AppImage, Obsidian-1.5.4-arm64.AppImage"),
-            "{error}"
+        // An installed name without one is this machine's build, which the
+        // release labels.
+        assert_eq!(
+            picked(&next, Some("Obsidian-1.13.7.AppImage"), Arch::Aarch64).as_deref(),
+            Some("Obsidian-1.13.8-arm64.AppImage")
         );
+        assert_eq!(
+            picked(&next, None, Arch::Aarch64).as_deref(),
+            Some("Obsidian-1.13.8-arm64.AppImage")
+        );
+
+        // No AppImage names x86_64, so the unlabeled one is still that build,
+        // whatever the `.deb` calls itself.
+        assert_eq!(
+            picked(&next, Some("Obsidian-1.13.7.AppImage"), Arch::X86_64).as_deref(),
+            Some("Obsidian-1.13.8.AppImage")
+        );
+        assert_eq!(picked(&next, None, Arch::X86_64).as_deref(), Some("Obsidian-1.13.8.AppImage"));
     }
 
     #[test]

@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `github:` source on an aarch64 machine finds the arm64 AppImage of a
+  release that names its x86_64 build without an architecture, the way
+  electron-builder does: `Obsidian-1.13.8.AppImage` next to
+  `Obsidian-1.13.8-arm64.AppImage`. Both used to count as this machine's,
+  and the check stopped at "2 of its AppImages match". An AppImage that
+  names this machine's architecture now beats one that names none, and an
+  unlabeled AppImage only counts when no AppImage of the release names this
+  machine's architecture. A release of unlabeled AppImages alone works as
+  before, on either machine.
+
 ## [0.3.0] - 2026-10-02
 
 ### Added
