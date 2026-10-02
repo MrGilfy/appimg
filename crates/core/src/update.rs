@@ -481,9 +481,16 @@ fn download_staged(
 
 /// Moves the new binary into place and keeps the old one as `.bak`. A failure
 /// while swapping restores the previous state.
+///
+/// Every update that installs a file appimg wrote ends here, whether it was
+/// downloaded whole, assembled from a delta or copied. The new file reaches
+/// the disk before it gets the installed name: a power cut right after a
+/// rename of a file that is not on disk yet can leave an empty or partial
+/// AppImage under that name.
 fn swap_in(staged: &Path, target: &Path) -> Result<PathBuf> {
     let backup = target.with_extension("AppImage.bak");
 
+    fs_util::sync(staged)?;
     if target.exists() {
         fs::rename(target, &backup).map_err(|e| Error::io(target, e))?;
     }
@@ -492,6 +499,14 @@ fn swap_in(staged: &Path, target: &Path) -> Result<PathBuf> {
             let _ = fs::rename(&backup, target);
         }
         return Err(Error::io(target, e));
+    }
+    // This makes the renames themselves last. Its failure does not fail the
+    // update: the new version is in place and on disk by now, and without
+    // the sync a power cut can only undo renames, which a power cut just
+    // before it could do anyway. Every file such a cut leaves behind is a
+    // complete one. Some filesystems refuse to sync a directory at all.
+    if let Some(dir) = target.parent() {
+        let _ = fs_util::sync(dir);
     }
     fs_util::set_mode(target, MODE_EXEC)?;
     Ok(backup)

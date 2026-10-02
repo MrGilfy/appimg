@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -28,6 +29,11 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
 }
 
 /// Copies a file into place through a temporary file in the target directory.
+///
+/// An install puts an AppImage under its installed name this way, replacing
+/// any previous one. The copy reaches the disk before it takes that name: a
+/// power cut right after a rename of a file that is not on disk yet can
+/// leave an empty or partial file under it.
 pub fn copy_atomic(source: &Path, dest: &Path, mode: u32) -> Result<()> {
     let dir = parent_dir(dest);
     fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
@@ -39,8 +45,19 @@ pub fn copy_atomic(source: &Path, dest: &Path, mode: u32) -> Result<()> {
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(mode))
         .map_err(|e| Error::io(dest, e))?;
+    tmp.as_file().sync_all().map_err(|e| Error::io(dest, e))?;
     tmp.persist(dest).map_err(|e| Error::io(dest, e.error))?;
+    // This makes the rename last. Its failure does not fail the copy, as in
+    // `swap_in` of an update: without it a power cut can only undo the
+    // rename, and whatever file is left under the name is a complete one.
+    let _ = sync(dir);
     Ok(())
+}
+
+/// Flushes a file to disk, or the entries of a directory: what a rename
+/// inside it changed. Until then a power cut can undo whichever was written.
+pub fn sync(path: &Path) -> Result<()> {
+    File::open(path).and_then(|file| file.sync_all()).map_err(|e| Error::io(path, e))
 }
 
 pub fn set_mode(path: &Path, mode: u32) -> Result<()> {
@@ -57,8 +74,13 @@ pub fn file_size(path: &Path) -> Option<u64> {
 
 /// Looks up an executable on `PATH`.
 pub fn which(binary: &str) -> Option<PathBuf> {
-    let path_var = env::var_os("PATH")?;
-    env::split_paths(&path_var).find_map(|dir| {
+    which_in(binary.as_ref(), &env::var_os("PATH")?)
+}
+
+/// Looks up an executable in the directories `path_var` lists, the way
+/// [`which`] does on `PATH`.
+pub fn which_in(binary: &OsStr, path_var: &OsStr) -> Option<PathBuf> {
+    env::split_paths(path_var).find_map(|dir| {
         let candidate = dir.join(binary);
         is_executable(&candidate).then_some(candidate)
     })

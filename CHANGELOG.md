@@ -20,6 +20,25 @@ project adheres to [Semantic Versioning](https://semver.org/).
   length it needs at least and the length that arrived. The size of a type
   1 AppImage's payload is not checked, since it is not squashfs, and a
   32-bit AppImage is not checked at all.
+- A power cut right after an update or an install no longer can leave an
+  empty or partial AppImage under the installed name. The new file got that
+  name by a rename, and the rename could reach the disk before the file did.
+  The file is now flushed to disk before the rename, and the directory after
+  it, in every update that installs a file appimg wrote: a full download, a
+  zsync delta and a copy from a local file. The same goes for an install,
+  from a file or a URL, including one that replaces an installed AppImage.
+  A filesystem that refuses to flush the directory does not fail the update
+  or the install, since the new file is complete on disk by then. An update that falls back to `appimageupdatetool` swaps the
+  file itself, as before.
+- `appimg edit`, and editing in the TUI, no longer fail when `EDITOR` is not
+  set and there is no `vi`. The editor is now `VISUAL`, then `EDITOR`, then
+  the first of `nvim`, `vim` and `nano` that is installed. `VISUAL` and
+  `EDITOR` are split on whitespace into the program and its arguments, so
+  `code --wait` and `subl -w` work; the arguments go before the file, and
+  there is no quoting. A variable whose program does not exist is passed
+  over, and only when nothing is found is that an error, one that says to
+  set `EDITOR`. `VISUAL` now comes before `EDITOR`, where it used to come
+  after it, and `vi` is no longer tried.
 
 ## [0.2.2] - 2026-10-01
 
