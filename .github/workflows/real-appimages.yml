@@ -1,0 +1,38 @@
+name: Real AppImages
+
+# Runs appimg against real AppImages on GitHub once a week: a delta update of
+# ImHex from 1.38.0 to its newest release, and a github: source whose newest
+# release has no AppImage. See .github/scripts/real-appimages.sh.
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  real-appimages:
+    name: ImHex delta update, github source
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --locked
+
+      # appimg sends the token with its own requests to api.github.com, so
+      # a runner sharing its address with others does not run into the
+      # limit for requests without one.
+      - name: Install, update and check against GitHub
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/real-appimages.sh target/release/appimg

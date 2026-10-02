@@ -18,7 +18,8 @@ git push origin v0.1.0
 ```
 
 Wait for the release workflow to finish. `appimg-bin` needs the
-`appimg-<version>-x86_64-linux-musl.tar.gz` asset it produces.
+`appimg-<version>-x86_64-linux-musl.tar.gz` and
+`appimg-<version>-aarch64-linux-musl.tar.gz` assets it produces.
 
 ## 2. Prepare a working copy of the AUR repository
 

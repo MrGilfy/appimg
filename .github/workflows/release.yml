@@ -4,40 +4,82 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: write
-
 jobs:
+  build:
+    name: static ${{ matrix.arch }} binary
+    # Each architecture builds natively on a runner of its own, no cross
+    # compiling.
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The C parts of the dependencies are compiled against musl too, with
+      # the musl-gcc wrapper for the runner's own architecture.
+      - run: |
+          export "CC_$(echo "$TARGET" | tr - _)=musl-gcc"
+          cargo build --release --locked --target "$TARGET"
+
+      - name: The binary runs
+        run: '"target/$TARGET/release/appimg" --version'
+
+      - name: Collect the artifacts
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          staging="appimg-${version}-${{ matrix.arch }}-linux-musl"
+          mkdir -p "$staging"
+          cp "target/$TARGET/release/appimg" "$staging/"
+          cp LICENSE README.md CHANGELOG.md "$staging/"
+          cp -r man completions "$staging/"
+          rm -f "$staging"/man/.gitignore "$staging"/completions/.gitignore
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" "$staging/appimg" > "sha256sums-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimg-${{ matrix.arch }}
+          path: |
+            appimg-*-linux-musl.tar.gz
+            sha256sums-${{ matrix.arch }}.txt
+          if-no-files-found: error
+
   release:
-    name: static x86_64 binary
+    name: publish
+    needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
 
       - name: Take the release notes from the changelog
         run: .github/scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
 
-      - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
         with:
-          targets: x86_64-unknown-linux-musl
+          pattern: appimg-*
+          merge-multiple: true
 
-      - name: Install musl tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
-
-      - name: Collect the artifacts
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          staging="appimg-${version}-x86_64-linux-musl"
-          mkdir -p "$staging"
-          cp target/x86_64-unknown-linux-musl/release/appimg "$staging/"
-          cp LICENSE README.md CHANGELOG.md "$staging/"
-          cp -r man completions "$staging/"
-          rm -f "$staging"/man/.gitignore "$staging"/completions/.gitignore
-          tar czf "${staging}.tar.gz" "$staging"
-          sha256sum "${staging}.tar.gz" "$staging/appimg" > sha256sums.txt
+      - name: Put the checksums together
+        run: cat sha256sums-x86_64.txt sha256sums-aarch64.txt > sha256sums.txt
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
@@ -45,4 +87,5 @@ jobs:
           body_path: release-notes.md
           files: |
             appimg-*-x86_64-linux-musl.tar.gz
+            appimg-*-aarch64-linux-musl.tar.gz
             sha256sums.txt
