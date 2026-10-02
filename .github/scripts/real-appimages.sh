@@ -5,6 +5,10 @@
 # whose newest release ships no AppImage. Kept to a handful of requests on
 # purpose.
 #
+# ImHex is the build for the machine this runs on, x86_64 or arm64, since
+# appimg runs the AppImage it installs and picks the zsync file for its own
+# architecture.
+#
 # GITHUB_TOKEN, when set, is used for the two API requests this script makes
 # itself, and appimg sends it with its own requests to api.github.com.
 set -eu
@@ -43,28 +47,37 @@ mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$TMPDIR"
 
 from=1.38.0
 
+# The name ImHex gives the build for this machine, in its file names and in
+# those of their zsync files.
+case $(uname -m) in
+x86_64) arch=x86_64 ;;
+aarch64 | arm64) arch=arm64 ;;
+*) fail "ImHex ships no AppImage for $(uname -m)" ;;
+esac
+
 # ImHex's update information follows `latest`, so the update has to end at
 # its newest release that is neither a draft nor a pre-release and ships an
-# x86_64 AppImage. Whichever that is, the sha256 GitHub publishes for that
-# AppImage is what the result has to match, so nothing here goes stale.
+# AppImage for this machine. Whichever that is, the sha256 GitHub publishes
+# for that AppImage is what the result has to match, so nothing here goes
+# stale, and a zsync file for another architecture shows up as a mismatch.
 api "repos/WerWolv/ImHex/releases?per_page=30" >"$work/imhex-releases.json"
-x86_64='^imhex-.*-x86_64[.]AppImage$'
-# shellcheck disable=SC2016 # $x86_64 is a jq variable.
-newest='[.[] | select((.draft or .prerelease) | not) | select(any(.assets[]; .name | test($x86_64)))][0]'
-tag=$(jq -r --arg x86_64 "$x86_64" "$newest | .tag_name" "$work/imhex-releases.json")
-expected=$(jq -r --arg x86_64 "$x86_64" \
-	"$newest | first(.assets[] | select(.name | test(\$x86_64))) | .digest" "$work/imhex-releases.json")
-[ -n "$tag" ] && [ "$tag" != null ] || fail "ImHex has no release with an x86_64 AppImage"
+appimage="^imhex-.*-$arch[.]AppImage\$"
+# shellcheck disable=SC2016 # $appimage is a jq variable.
+newest='[.[] | select((.draft or .prerelease) | not) | select(any(.assets[]; .name | test($appimage)))][0]'
+tag=$(jq -r --arg appimage "$appimage" "$newest | .tag_name" "$work/imhex-releases.json")
+expected=$(jq -r --arg appimage "$appimage" \
+	"$newest | first(.assets[] | select(.name | test(\$appimage))) | .digest" "$work/imhex-releases.json")
+[ -n "$tag" ] && [ "$tag" != null ] || fail "ImHex has no release with an $arch AppImage"
 to=${tag#v}
 [ "$to" != "$from" ] || fail "ImHex's newest release is $from itself, there is nothing to update to"
 case $expected in
 sha256:*) expected=${expected#sha256:} ;;
-*) fail "GitHub publishes no sha256 for the x86_64 AppImage of ImHex $tag: $expected" ;;
+*) fail "GitHub publishes no sha256 for the $arch AppImage of ImHex $tag: $expected" ;;
 esac
-echo "ImHex $from, updated to its newest release, $to"
+echo "ImHex $from for $arch, updated to its newest release, $to"
 
 "$appimg" --yes --no-color install --name ImHex \
-	"https://github.com/WerWolv/ImHex/releases/download/v$from/imhex-$from-x86_64.AppImage"
+	"https://github.com/WerWolv/ImHex/releases/download/v$from/imhex-$from-$arch.AppImage"
 
 "$appimg" --no-color update imhex >"$work/update.log" 2>&1 || {
 	cat "$work/update.log"
@@ -118,6 +131,10 @@ cat "$work/check.json" "$work/check.err"
 [ "$status" -eq 0 ] || [ "$status" -eq 3 ] || fail "the check of github:$repository failed"
 ! grep -q 'has no AppImage' "$work/check.json" "$work/check.err" ||
 	fail "the check of github:$repository stopped at a release without an AppImage"
+# Obsidian names its arm64 build and leaves the x86_64 one unlabeled, so on
+# either machine exactly one AppImage of the release is the stand-in's.
+! grep -q 'of its AppImages match' "$work/check.json" "$work/check.err" ||
+	fail "the check of github:$repository could not tell which of its AppImages is the installed one"
 latest=$(jq -r '.[0].latest_version' "$work/check.json")
 [ -n "$latest" ] && [ "$latest" != null ] || fail "the check of github:$repository found no version"
 echo "github:$repository offers $latest"

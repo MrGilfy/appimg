@@ -2,7 +2,8 @@ name: Real AppImages
 
 # Runs appimg against real AppImages on GitHub once a week: a delta update of
 # ImHex from 1.38.0 to its newest release, and a github: source whose newest
-# release has no AppImage. See .github/scripts/real-appimages.sh.
+# release has no AppImage. Once on x86_64 and once on aarch64, each with
+# ImHex's AppImage for that machine. See .github/scripts/real-appimages.sh.
 on:
   schedule:
     - cron: '23 5 * * 1'
@@ -36,3 +37,33 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: .github/scripts/real-appimages.sh target/release/appimg
+
+  real-appimages-aarch64:
+    name: ImHex delta update, github source (aarch64)
+    # The static aarch64 binary, built the way the release builds it, on an
+    # ARM runner: the script installs and updates ImHex's arm64 AppImage.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      TARGET: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo build --release --locked --target "$TARGET"
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+
+      - name: Install, update and check against GitHub
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: .github/scripts/real-appimages.sh "target/$TARGET/release/appimg"
