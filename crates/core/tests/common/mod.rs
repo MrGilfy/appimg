@@ -83,6 +83,8 @@ pub struct FakeAppImage {
     pub marker: String,
     /// Whether the file starts with an ELF header instead of a shebang.
     pub elf: bool,
+    /// AppStream metainfo to put into `usr/share/metainfo`.
+    pub metainfo: Option<String>,
 }
 
 impl FakeAppImage {
@@ -98,6 +100,7 @@ impl FakeAppImage {
             failure: None,
             marker: String::new(),
             elf: false,
+            metainfo: None,
         }
     }
 
@@ -121,6 +124,16 @@ impl FakeAppImage {
     /// Makes `--appimage-extract` fail with this exit code and message.
     pub fn failing(mut self, code: i32, message: &str) -> Self {
         self.failure = Some((code, message.to_string()));
+        self
+    }
+
+    /// Ships AppStream metainfo with these `<url>` elements.
+    pub fn metainfo(mut self, urls: &str) -> Self {
+        self.metainfo = Some(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <component type=\"desktop-application\">\n  <id>org.example.FakeApp</id>\n  \
+             {urls}\n</component>\n"
+        ));
         self
     }
 
@@ -166,6 +179,11 @@ impl FakeAppImage {
                 .unwrap();
         }
         fs::write(payload.join(".DirIcon"), png_bytes(32, 32)).unwrap();
+        if let Some(metainfo) = &self.metainfo {
+            let dir = payload.join("usr/share/metainfo");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("org.example.FakeApp.metainfo.xml"), metainfo).unwrap();
+        }
 
         let extract = match &self.failure {
             Some((code, message)) => format!("echo '{message}' >&2\nexit {code}\n"),

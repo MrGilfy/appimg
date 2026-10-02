@@ -6,7 +6,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use appimg_core::desktop_entry::{self, DesktopEntry};
-use appimg_core::{caches, fs_util, list, Paths};
+use appimg_core::{caches, fs_util, list, update, Paths};
 
 use crate::cli::EditArgs;
 use crate::ui::Ui;
@@ -17,9 +17,10 @@ use crate::Outcome;
 const MANAGED_KEYS: &[&str] = &[
     desktop_entry::KEY_MANAGED,
     desktop_entry::KEY_SLUG,
-    desktop_entry::KEY_SOURCE,
+    desktop_entry::KEY_ORIGIN,
     desktop_entry::KEY_VERSION,
     desktop_entry::KEY_UPDATE_INFO,
+    desktop_entry::KEY_UPDATE_SOURCE,
     desktop_entry::KEY_INSTALLED_AT,
 ];
 
@@ -73,6 +74,11 @@ pub fn edit_entry(paths: &Paths, entry_path: &Path) -> Result<Edited> {
         }
     }
     desktop_entry::validate_categories(&edited.categories())?;
+    if let Some(value) = edited.get(desktop_entry::KEY_UPDATE_SOURCE) {
+        if value != update::MANUAL {
+            update::parse_update_source(value)?;
+        }
+    }
 
     edited.write(entry_path)?;
     let warnings = caches::validate_desktop_entry(entry_path);

@@ -549,6 +549,129 @@ fn install_from_a_url_records_it_and_updates_from_it() {
     assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
 }
 
+/// What the issue was about: an AppImage installed from a local file that
+/// has since been deleted. It used to show "none" and could not be updated.
+/// Given an update source, it updates from there, without a reinstall.
+#[test]
+fn an_app_installed_from_a_deleted_file_updates_from_the_source_it_is_given() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let local = FakeAppImage::new("Fake App")
+        .marker("v1")
+        .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
+    let info = metadata::inspect(&local, None).unwrap();
+    install::install(
+        &sandbox.paths,
+        &InstallRequest::from_info(&local, &local.to_string_lossy(), &info),
+    )
+    .unwrap();
+    std::fs::remove_file(&local).unwrap();
+
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(update::source_for(&app), update::UpdateSource::Manual);
+
+    let newer = FakeAppImage::new("Fake App")
+        .marker("v2")
+        .icon_sizes(&[64])
+        .elf()
+        .build(&sandbox.root, "build2.AppImage");
+    let server = Server::start(std::fs::read(&newer).unwrap());
+    let url = server.url("Fake_App-latest.AppImage");
+    assert!(update::set_update_source(&app, Some(&url)).unwrap());
+
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(update::source_for(&app), update::UpdateSource::DirectUrl { url: url.clone() });
+    // Where it came from is still recorded, as history.
+    assert_eq!(app.origin.as_deref(), Some(&*local.to_string_lossy()));
+
+    let result =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &app, None)).unwrap();
+    assert!(read(&result.appimage_path).contains("v2"));
+    assert!(read(result.backup_path.as_ref().unwrap()).contains("v1"));
+    update::confirm(&sandbox.paths, "fake-app").unwrap();
+}
+
+/// Installs a build from `server` the way `appimg install <url>` does,
+/// under a name of the user's choosing and with edits of the user's own.
+fn install_edited_from(sandbox: &Sandbox, server: &Server) -> InstalledApp {
+    let url = server.url("Fake_App.AppImage");
+    let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
+    download::to_file(&url, &downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None).unwrap();
+    let mut request = InstallRequest::from_info(&downloaded, &url, &info);
+    request.name = "My Renamed App".to_string();
+    request.categories = vec!["Graphics".to_string()];
+    request.extra_args = vec!["--enable-something".to_string()];
+    request.version = Some("1.0.0".to_string());
+    let outcome = install::install(&sandbox.paths, &request).unwrap();
+    assert_eq!(outcome.slug, "my-renamed-app");
+    list::find(&sandbox.paths, "my-renamed-app").unwrap()
+}
+
+#[test]
+fn an_update_keeps_manual_edits() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
+    let server = Server::start(std::fs::read(&built).unwrap());
+    let app = install_edited_from(&sandbox, &server);
+    assert!(matches!(update::source_for(&app), update::UpdateSource::DirectUrl { .. }));
+
+    let newer = FakeAppImage::new("Fake App")
+        .marker("v2")
+        .icon_sizes(&[128])
+        .elf()
+        .build(&sandbox.root, "build2.AppImage");
+    server.serve(std::fs::read(&newer).unwrap());
+
+    let result =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &app, None)).unwrap();
+    assert!(read(&result.appimage_path).contains("v2"));
+    let backup = result.backup_path.clone().unwrap();
+    assert!(backup.is_file());
+    assert!(read(&backup).contains("v1"));
+
+    let entry = DesktopEntry::read(&sandbox.paths.desktop_entry_path("my-renamed-app")).unwrap();
+    assert_eq!(entry.get("Name"), Some("My Renamed App"));
+    assert_eq!(entry.categories(), vec!["Graphics"]);
+    assert!(entry.get("Exec").unwrap().contains("--enable-something"));
+
+    // Icons come from the new version.
+    let icons = walk(&sandbox.paths.icons_root);
+    assert!(icons.contains(&"128x128/apps/my-renamed-app.png".into()), "{icons:?}");
+
+    // Whatever else the update left next to the AppImage goes with the
+    // backup: `appimageupdatetool` writes these, and never cleans them up.
+    let zs_old = sandbox.paths.appimage_dir.join("my-renamed-app.AppImage.zs-old");
+    std::fs::write(&zs_old, "the previous version, a second time").unwrap();
+
+    update::confirm(&sandbox.paths, "my-renamed-app").unwrap();
+    assert!(!backup.exists());
+    assert!(!zs_old.exists());
+    assert!(update::leftovers(&sandbox.paths, "my-renamed-app").is_empty());
+}
+
+#[test]
+fn a_rollback_puts_the_previous_version_back() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
+    let server = Server::start(std::fs::read(&built).unwrap());
+    let app = install_edited_from(&sandbox, &server);
+
+    let newer =
+        FakeAppImage::new("Fake App").marker("v2").elf().build(&sandbox.root, "b2.AppImage");
+    server.serve(std::fs::read(&newer).unwrap());
+    let result =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &app, None)).unwrap();
+    assert!(read(&result.appimage_path).contains("v2"));
+
+    update::rollback(&sandbox.paths, "my-renamed-app").unwrap();
+    assert!(read(&result.appimage_path).contains("v1"));
+    assert!(common::is_executable(&result.appimage_path));
+    assert!(!update::backup_path(&sandbox.paths, "my-renamed-app").exists());
+}
+
 #[test]
 fn a_failing_update_leaves_the_installed_version_alone() {
     let _serial = common::serial();

@@ -219,6 +219,15 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &super::form::InstallForm) {
             "The AppImage did not extract, these values are guesses."
         };
         lines.push(Line::from(Span::styled(source, theme::dim())));
+        let updates = if form.info.update_info.is_some() {
+            "The AppImage carries its own update information, which comes before Update from."
+        } else if form.suggested {
+            "Update from is what the AppStream metadata links. Empty updates manually."
+        } else {
+            "Update from takes a URL, github:owner/repo or github:owner/repo@tag. Empty updates \
+             manually."
+        };
+        lines.push(Line::from(Span::styled(updates, theme::dim())));
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -278,8 +287,8 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         field_line("Version", selected.version.as_deref().unwrap_or("-")),
         field_line("Comment", selected.comment.as_deref().unwrap_or("-")),
         field_line("Categories", &selected.categories.join(", ")),
-        field_line("Source", selected.origin.as_deref().unwrap_or("-")),
-        field_line("Update", &update::source_for(selected).describe()),
+        field_line("Origin", selected.origin.as_deref().unwrap_or("-")),
+        field_line("Update from", &update::source_for(selected).describe()),
         field_line("Installed", selected.installed_at.as_deref().unwrap_or("-")),
         field_line("Binary", &selected.appimage_path.to_string_lossy()),
         field_line("Entry", &selected.desktop_entry_path.to_string_lossy()),

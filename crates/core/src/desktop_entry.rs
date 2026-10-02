@@ -5,9 +5,17 @@ use crate::error::{Error, Result};
 
 pub const KEY_MANAGED: &str = "X-AppImg-Managed";
 pub const KEY_SLUG: &str = "X-AppImg-Slug";
-pub const KEY_SOURCE: &str = "X-AppImg-Source";
+/// Where the AppImage was installed from, a path or a URL. History only:
+/// what an update follows is [`KEY_UPDATE_SOURCE`].
+pub const KEY_ORIGIN: &str = "X-AppImg-Source";
 pub const KEY_VERSION: &str = "X-AppImg-Version";
+/// The update information embedded in the AppImage. It comes first whenever
+/// there is one.
 pub const KEY_UPDATE_INFO: &str = "X-AppImg-UpdateInfo";
+/// What an update follows when the AppImage embeds no update information:
+/// a URL, `github:owner/repo[@tag]`, or `manual`. Entries written by 0.2.x
+/// do not have it.
+pub const KEY_UPDATE_SOURCE: &str = "X-AppImg-UpdateSource";
 pub const KEY_INSTALLED_AT: &str = "X-AppImg-InstalledAt";
 
 /// The freedesktop main categories. A desktop entry needs at least one of

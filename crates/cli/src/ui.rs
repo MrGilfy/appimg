@@ -33,6 +33,11 @@ impl Ui {
         self.interactive
     }
 
+    /// Whether `--yes` answers every question.
+    pub fn assumes_yes(&self) -> bool {
+        self.assume_yes
+    }
+
     pub fn paint(&self, code: &str, text: &str) -> String {
         if self.color {
             format!("{code}{text}{RESET}")

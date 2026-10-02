@@ -13,43 +13,33 @@ use crate::{caches, date, icon, json, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
+/// The update source of an application that has none, as the desktop entry
+/// stores it and as a status shows it.
+pub const MANUAL: &str = "manual";
+
 /// How an application can be updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSource {
     /// `X-AppImg-UpdateInfo` pointing at a zsync file. The check reads that
     /// file's header directly, and appimg applies the delta itself;
     /// `appimageupdatetool` is the fallback when that fails.
-    Zsync {
-        update_info: String,
-    },
-    /// A GitHub release, queried through the API. `tag` is set only for a
-    /// tag that keeps moving, see [`tag_to_follow`]; without one the latest
-    /// release is asked for.
-    GitHubRelease {
-        owner: String,
-        repo: String,
-        tag: Option<String>,
-        asset: Option<String>,
-    },
+    Zsync { update_info: String },
+    /// A GitHub release, queried through the API. `tag` is the tag to
+    /// follow: one that keeps moving out of a download URL, see
+    /// [`tag_to_follow`], or the one an update source names; without one, the
+    /// newest release that has the installed AppImage in it, see
+    /// [`release_to_follow`]. `asset` is the name of the file that was
+    /// installed, which picks the matching file out of the release.
+    GitHubRelease { owner: String, repo: String, tag: Option<String>, asset: Option<String> },
     /// `gh-releases-zsync`: a GitHub release whose named asset is a zsync
     /// file. The release says which assets exist, the zsync file inside it
     /// says what the update is, and from there this is a zsync source like
     /// any other. `asset` is the pattern the update information names.
-    GitHubZsync {
-        owner: String,
-        repo: String,
-        tag: Option<String>,
-        asset: String,
-    },
+    GitHubZsync { owner: String, repo: String, tag: Option<String>, asset: String },
     /// Plain re-download of the stored URL.
-    DirectUrl {
-        url: String,
-    },
-    /// Re-copy from the local file it was installed from.
-    LocalFile {
-        path: PathBuf,
-    },
-    None,
+    DirectUrl { url: String },
+    /// Nothing to update from: no update information, no update source.
+    Manual,
 }
 
 impl UpdateSource {
@@ -61,8 +51,7 @@ impl UpdateSource {
             UpdateSource::GitHubZsync { .. } => "zsync".to_string(),
             UpdateSource::GitHubRelease { owner, repo, .. } => format!("github:{owner}/{repo}"),
             UpdateSource::DirectUrl { .. } => "url".to_string(),
-            UpdateSource::LocalFile { .. } => "file".to_string(),
-            UpdateSource::None => "none".to_string(),
+            UpdateSource::Manual => MANUAL.to_string(),
         }
     }
 }
@@ -103,8 +92,6 @@ pub enum UpdatePath {
     },
     /// The whole file was downloaded, because the source offers no delta.
     FullDownload { bytes: u64 },
-    /// Copied from the local file the application was installed from.
-    LocalCopy { bytes: u64 },
 }
 
 impl UpdatePath {
@@ -125,9 +112,6 @@ impl UpdatePath {
             }
             UpdatePath::FullDownload { bytes } => {
                 format!("no delta for this source, downloaded {}", human_size(*bytes))
-            }
-            UpdatePath::LocalCopy { bytes } => {
-                format!("copied {} from the file it was installed from", human_size(*bytes))
             }
         }
     }
@@ -161,25 +145,172 @@ pub struct UpdateOutcome {
 }
 
 /// Works out how an application would be updated, without changing anything.
+/// The update information embedded in the AppImage comes first, then the
+/// update source in the desktop entry.
 pub fn source_for(app: &InstalledApp) -> UpdateSource {
     if let Some(info) = app.update_info.as_deref() {
         if let Some(source) = source_from_update_info(info) {
             return source;
         }
     }
-    match app.origin.as_deref() {
-        Some(origin) if download::is_url(origin) => github_source_from_url(origin)
-            .unwrap_or_else(|| UpdateSource::DirectUrl { url: origin.to_string() }),
-        Some(origin) => {
-            let path = PathBuf::from(origin);
-            if path.is_file() {
-                UpdateSource::LocalFile { path }
-            } else {
-                UpdateSource::None
-            }
-        }
-        None => UpdateSource::None,
+    match app.update_source.as_deref() {
+        Some(value) => source_from_setting(value, app.origin.as_deref()),
+        // An entry written by 0.2.x has no update source of its own: what it
+        // was installed from was the update source then. A URL still is, a
+        // local file is history, whether it is still there or not.
+        None => match app.origin.as_deref() {
+            Some(origin) if download::is_url(origin) => source_from_url(origin),
+            _ => UpdateSource::Manual,
+        },
     }
+}
+
+/// Checks an update source as a user gives it, and returns it the way the
+/// desktop entry stores it. Accepted are an http(s) URL and
+/// `github:owner/repo`, optionally followed by `@tag`, a tag that is then
+/// followed exactly as written. A link to a repository or to its releases
+/// on github.com is stored as `github:owner/repo`, and one to a release
+/// follows its tag the way a download URL does, see [`tag_to_follow`].
+pub fn parse_update_source(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    let invalid = || Error::InvalidUpdateSource(value.to_string());
+
+    if let Some(spec) = trimmed.strip_prefix("github:") {
+        let (owner, repo, tag) = github_spec(spec).ok_or_else(invalid)?;
+        return Ok(github_setting(&owner, &repo, tag.as_deref()));
+    }
+    if !download::is_url(trimmed) {
+        return Err(invalid());
+    }
+    let host = trimmed.split_once("://").map_or("", |(_, rest)| rest);
+    let host = host.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || trimmed.contains(char::is_whitespace) {
+        return Err(invalid());
+    }
+    match github_page(trimmed) {
+        Some(GitHubPage::Repository { owner, repo, tag }) => {
+            Ok(github_setting(&owner, &repo, tag.as_deref()))
+        }
+        Some(GitHubPage::Download) => Ok(trimmed.to_string()),
+        Some(GitHubPage::Other) => Err(invalid()),
+        None => Ok(trimmed.to_string()),
+    }
+}
+
+/// The `owner/repo` an update source follows the releases of, if it is a
+/// GitHub one, whether written as `github:` or as a download URL.
+pub fn github_repository(value: &str) -> Option<String> {
+    match source_from_setting(value, None) {
+        UpdateSource::GitHubRelease { owner, repo, .. } => Some(format!("{owner}/{repo}")),
+        _ => None,
+    }
+}
+
+/// Sets the update source of an installed application, or makes it manual
+/// with `None`, and writes nothing else. Returns whether anything changed.
+pub fn set_update_source(app: &InstalledApp, value: Option<&str>) -> Result<bool> {
+    let value = match value {
+        Some(value) => parse_update_source(value)?,
+        None => MANUAL.to_string(),
+    };
+    let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
+    if entry.get(desktop_entry::KEY_UPDATE_SOURCE) == Some(value.as_str()) {
+        return Ok(false);
+    }
+    entry.set(desktop_entry::KEY_UPDATE_SOURCE, value);
+    entry.write(&app.desktop_entry_path)?;
+    Ok(true)
+}
+
+/// The source an `X-AppImg-UpdateSource` value stands for. `manual`, and
+/// anything that is not an update source, is no source at all.
+fn source_from_setting(value: &str, origin: Option<&str>) -> UpdateSource {
+    let Ok(value) = parse_update_source(value) else {
+        return UpdateSource::Manual;
+    };
+    match value.strip_prefix("github:").and_then(github_spec) {
+        // The file that was installed is what picks the file out of each
+        // release, whether it came from that release or from anywhere else.
+        Some((owner, repo, tag)) => UpdateSource::GitHubRelease {
+            owner,
+            repo,
+            tag,
+            asset: origin
+                .and_then(|origin| origin.rsplit('/').next())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string),
+        },
+        None => source_from_url(&value),
+    }
+}
+
+fn source_from_url(url: &str) -> UpdateSource {
+    github_source_from_url(url).unwrap_or_else(|| UpdateSource::DirectUrl { url: url.to_string() })
+}
+
+/// `owner/repo` or `owner/repo@tag`, as a `github:` update source names a
+/// repository.
+fn github_spec(spec: &str) -> Option<(String, String, Option<String>)> {
+    let (repository, tag) = match spec.split_once('@') {
+        Some((repository, tag)) => (repository, Some(tag)),
+        None => (spec, None),
+    };
+    let (owner, repo) = repository.split_once('/')?;
+    let owner_ok =
+        !owner.is_empty() && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let repo_ok = !repo.is_empty()
+        && repo != "."
+        && repo != ".."
+        && repo.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    // A tag goes into a URL as it is, so nothing that would end that URL.
+    let tag_ok = tag.is_none_or(|tag| {
+        !tag.is_empty()
+            && !tag.chars().any(|c| c.is_whitespace() || c.is_control() || "?#".contains(c))
+    });
+    (owner_ok && repo_ok && tag_ok)
+        .then(|| (owner.to_string(), repo.to_string(), tag.map(str::to_string)))
+}
+
+fn github_setting(owner: &str, repo: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!("github:{owner}/{repo}@{tag}"),
+        None => format!("github:{owner}/{repo}"),
+    }
+}
+
+/// What a link to github.com points at.
+enum GitHubPage {
+    /// The repository, its releases, or one release.
+    Repository { owner: String, repo: String, tag: Option<String> },
+    /// A file out of a release.
+    Download,
+    /// Anything else, which is nothing to update from.
+    Other,
+}
+
+fn github_page(url: &str) -> Option<GitHubPage> {
+    let rest = url.split_once("://")?.1;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    let path = rest.strip_prefix("github.com")?;
+    if !path.is_empty() && !path.starts_with('/') {
+        return None;
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let [owner, repo, rest @ ..] = parts.as_slice() else {
+        return Some(GitHubPage::Other);
+    };
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    let Some((owner, repo, _)) = github_spec(&format!("{owner}/{repo}")) else {
+        return Some(GitHubPage::Other);
+    };
+    let tag = match rest {
+        [] | ["releases"] | ["releases", "latest"] => None,
+        ["releases", "tag", tag] => tag_to_follow(tag),
+        ["releases", "download", ..] => return Some(GitHubPage::Download),
+        _ => return Some(GitHubPage::Other),
+    };
+    Some(GitHubPage::Repository { owner, repo, tag })
 }
 
 /// Reports whether an update is available. Never writes anything.
@@ -198,8 +329,8 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
     };
 
     match &source {
-        UpdateSource::None => {
-            status.note = Some("no update source recorded".to_string());
+        UpdateSource::Manual => {
+            status.note = Some(manual_note(app));
         }
         UpdateSource::Zsync { update_info } => {
             let url =
@@ -211,7 +342,8 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             status.note = note;
         }
         UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
-            let release = fetch_release(owner, repo, tag.as_deref())?;
+            let release =
+                release_to_follow(owner, repo, tag.as_deref(), |r| has_zsync_for(r, asset))?;
 
             match zsync_asset_url(&release, asset) {
                 // From here on this is a zsync source: the zsync file says
@@ -242,31 +374,41 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             }
         }
         UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
-            let release = fetch_release(owner, repo, tag.as_deref())?;
+            let release = release_to_follow(owner, repo, tag.as_deref(), |r| {
+                r.has_appimage(asset.as_deref())
+            })?;
             status.latest_version = release.version();
             let (installed, available, note) = compare_release(current.as_deref(), &release);
             status.current_version = installed;
             status.available = available;
             status.note = note;
-            if release.asset_url(asset.as_deref()).is_none() {
+            if let Err(reason) = release.appimage(asset.as_deref(), Arch::current()) {
                 status.available = false;
-                status.note = Some("the latest release has no matching AppImage asset".to_string());
+                status.note = Some(reason);
             }
         }
         UpdateSource::DirectUrl { .. } => {
             status.note =
                 Some("the source URL carries no version, updating re-downloads it".to_string());
         }
-        UpdateSource::LocalFile { path } => {
-            let latest = version::extract(&path.file_name().unwrap_or_default().to_string_lossy());
-            status.latest_version = latest.clone();
-            status.available = match (&current, &latest) {
-                (Some(current), Some(latest)) => version::is_newer(latest, current),
-                _ => false,
-            };
-        }
     }
     Ok(status)
+}
+
+/// What to say about an application that has nothing to update from.
+fn manual_note(app: &InstalledApp) -> String {
+    match app.update_source.as_deref() {
+        Some(value) if value != MANUAL && parse_update_source(value).is_err() => format!(
+            "{} holds {value:?}, which is no update source, set one with: appimg update-source {} \
+             <URL|github:owner/repo>",
+            desktop_entry::KEY_UPDATE_SOURCE,
+            app.slug
+        ),
+        _ => format!(
+            "no update source, set one with: appimg update-source {} <URL|github:owner/repo>",
+            app.slug
+        ),
+    }
 }
 
 /// Every name an update can leave next to `<slug>.AppImage`, whoever wrote
@@ -305,14 +447,15 @@ pub fn update(
     let target = paths.appimage_path(&app.slug);
 
     match &source {
-        UpdateSource::None => Err(Error::NoUpdateSource(app.slug.clone())),
+        UpdateSource::Manual => Err(Error::NoUpdateSource(app.slug.clone())),
         UpdateSource::Zsync { update_info } => {
             let url =
                 zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
             apply_zsync(paths, app, &target, &url, source, None, progress)
         }
         UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
-            let release = fetch_release(owner, repo, tag.as_deref())?;
+            let release =
+                release_to_follow(owner, repo, tag.as_deref(), |r| has_zsync_for(r, asset))?;
             let recorded = release.recorded_version();
 
             match zsync_asset_url(&release, asset) {
@@ -320,9 +463,8 @@ pub fn update(
                 // A release that ships no zsync file leaves nothing to apply
                 // a delta from, so the whole file it is.
                 None => {
-                    let url = release
-                        .asset_url(Some(asset))
-                        .ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+                    let hint = appimage_named_by(asset);
+                    let url = pick_appimage(&release, owner, repo, Some(&hint))?;
                     let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
                     let backup = swap_in(&staged, &target)?;
                     let path = UpdatePath::FullDownload { bytes };
@@ -331,10 +473,10 @@ pub fn update(
             }
         }
         UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
-            let release = fetch_release(owner, repo, tag.as_deref())?;
-            let url = release
-                .asset_url(asset.as_deref())
-                .ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
+            let release = release_to_follow(owner, repo, tag.as_deref(), |r| {
+                r.has_appimage(asset.as_deref())
+            })?;
+            let url = pick_appimage(&release, owner, repo, asset.as_deref())?;
             let recorded = release.recorded_version();
             let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
             let backup = swap_in(&staged, &target)?;
@@ -346,14 +488,6 @@ pub fn update(
             let backup = swap_in(&staged, &target)?;
             let path = UpdatePath::FullDownload { bytes };
             finish(paths, app, &target, Some(backup), source, None, path)
-        }
-        UpdateSource::LocalFile { path } => {
-            let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
-            fs_util::copy_atomic(path, &staged, MODE_EXEC)?;
-            let bytes = fs_util::file_size(&staged).unwrap_or(0);
-            let backup = swap_in(&staged, &target)?;
-            let taken = UpdatePath::LocalCopy { bytes };
-            finish(paths, app, &target, Some(backup), source, None, taken)
         }
     }
 }
@@ -483,7 +617,7 @@ fn download_staged(
 /// while swapping restores the previous state.
 ///
 /// Every update that installs a file appimg wrote ends here, whether it was
-/// downloaded whole, assembled from a delta or copied. The new file reaches
+/// downloaded whole or assembled from a delta. The new file reaches
 /// the disk before it gets the installed name: a power cut right after a
 /// rename of a file that is not on disk yet can leave an empty or partial
 /// AppImage under that name.
@@ -553,8 +687,9 @@ fn github_source_from_url(url: &str) -> Option<UpdateSource> {
 /// channel and is followed as it is written, because the newest build only
 /// ever appears under it. A tag that names a version was a snapshot, and
 /// following that would pin the application to the version it was installed
-/// at, so the latest release is asked for instead. `latest` is GitHub's own
-/// word for exactly that, and no tag of that name has to exist.
+/// at, so no tag is followed and the newest release is taken instead, see
+/// [`release_to_follow`]. `latest` is GitHub's own word for exactly that, and
+/// no tag of that name has to exist.
 fn tag_to_follow(tag: &str) -> Option<String> {
     let tag = tag.trim();
     (version::is_rolling(tag) && !tag.eq_ignore_ascii_case("latest")).then(|| tag.to_string())
@@ -596,28 +731,226 @@ impl Release {
         self.is_rolling().then(|| self.published.clone()).flatten()
     }
 
-    /// Picks the asset that looks most like the one that was installed.
-    fn asset_url(&self, hint: Option<&str>) -> Option<String> {
-        let appimages: Vec<&String> =
-            self.assets.iter().filter(|url| url.to_lowercase().ends_with(".appimage")).collect();
+    /// Whether an AppImage of this release fits `hint` on this machine.
+    fn has_appimage(&self, hint: Option<&str>) -> bool {
+        !self.fitting(hint, Arch::current()).is_empty()
+    }
 
+    fn appimages(&self) -> Vec<&String> {
+        self.assets.iter().filter(|url| url.to_lowercase().ends_with(".appimage")).collect()
+    }
+
+    /// The AppImages of this release that fit `hint`, the way
+    /// [`Release::appimage`] matches them.
+    fn fitting(&self, hint: Option<&str>, here: Option<Arch>) -> Vec<&String> {
+        let wanted = hint.map(AssetName::parse);
+        self.appimages()
+            .into_iter()
+            .filter(|url| {
+                let candidate = AssetName::parse(url);
+                match &wanted {
+                    Some(wanted) => {
+                        candidate.words == wanted.words
+                            && arch_fits(wanted.arch, candidate.arch, here)
+                    }
+                    None => arch_fits(None, candidate.arch, here),
+                }
+            })
+            .collect()
+    }
+
+    /// Picks the AppImage out of this release that is the one installed.
+    /// `hint` is the name of the installed file: whatever in it is part of a
+    /// version is ignored, the rest of the name and the architecture have to
+    /// match. Without a hint, the AppImage built for `here` is the one.
+    /// Anything but exactly one candidate is an error that lists the
+    /// AppImages there are, never a guess.
+    fn appimage(
+        &self,
+        hint: Option<&str>,
+        here: Option<Arch>,
+    ) -> std::result::Result<String, String> {
+        let appimages = self.appimages();
         if appimages.is_empty() {
-            return None;
+            return Err("the release has no AppImage".to_string());
         }
-        if let Some(hint) = hint {
-            let signature = asset_signature(hint);
-            if let Some(best) = appimages.iter().find(|url| asset_signature(url) == signature) {
-                return Some((*best).clone());
+        let fits = self.fitting(hint, here);
+
+        let what = match hint {
+            Some(hint) => last_segment(hint).to_string(),
+            None => format!("one built for {}", here.map_or("this machine", Arch::name)),
+        };
+        let advice = "set the update source to the download URL of the one to follow";
+        match fits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(format!(
+                "none of its AppImages matches {what}: {}; {advice}",
+                names(&appimages)
+            )),
+            several => Err(format!(
+                "{} of its AppImages match {what}: {}; {advice}",
+                several.len(),
+                names(several)
+            )),
+        }
+    }
+}
+
+/// The download URL of the AppImage to update to, out of a release.
+fn pick_appimage(release: &Release, owner: &str, repo: &str, hint: Option<&str>) -> Result<String> {
+    release.appimage(hint, Arch::current()).map_err(|reason| Error::NoMatchingAsset {
+        release: match &release.tag {
+            Some(tag) => format!("release {tag} of github:{owner}/{repo}"),
+            None => format!("the release of github:{owner}/{repo} it follows"),
+        },
+        reason,
+    })
+}
+
+/// The AppImage a `gh-releases-zsync` pattern names, for a release that
+/// ships no zsync file: the pattern without `.zsync`, and without its
+/// `{{...}}` placeholders, which stand for the architecture. A `*` is no
+/// word of a name, so it drops out on its own.
+fn appimage_named_by(pattern: &str) -> String {
+    let pattern = match pattern.len().checked_sub(".zsync".len()) {
+        Some(cut)
+            if pattern.is_char_boundary(cut) && pattern[cut..].eq_ignore_ascii_case(".zsync") =>
+        {
+            &pattern[..cut]
+        }
+        _ => pattern,
+    };
+    let mut out = String::with_capacity(pattern.len());
+    let mut rest = pattern;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        rest = rest[start..].find("}}").map_or("", |end| &rest[start + end + 2..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The architectures AppImages are built for, which release files spell in
+/// several ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arch {
+    X86_64,
+    I686,
+    Aarch64,
+    Armhf,
+}
+
+impl Arch {
+    /// The machine this runs on.
+    fn current() -> Option<Arch> {
+        match std::env::consts::ARCH {
+            "x86_64" => Some(Arch::X86_64),
+            "x86" => Some(Arch::I686),
+            "aarch64" => Some(Arch::Aarch64),
+            "arm" => Some(Arch::Armhf),
+            _ => None,
+        }
+    }
+
+    /// The architecture one word of an asset name stands for. `x86_64` and
+    /// `x86-64` arrive as two words, see [`AssetName::parse`].
+    fn named(word: &str) -> Option<Arch> {
+        match word {
+            "amd64" | "x64" => Some(Arch::X86_64),
+            "i386" | "i686" | "x86" => Some(Arch::I686),
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            "armhf" | "armv7" | "armv7l" | "armv7hl" => Some(Arch::Armhf),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64",
+            Arch::I686 => "i686",
+            Arch::Aarch64 => "aarch64",
+            Arch::Armhf => "armhf",
+        }
+    }
+}
+
+/// Whether a file built for `candidate` is one for `wanted`. A name that
+/// carries no architecture is taken to be built for the machine this runs
+/// on, which is what a project that ships one build usually means.
+fn arch_fits(wanted: Option<Arch>, candidate: Option<Arch>, here: Option<Arch>) -> bool {
+    wanted.or(here) == candidate.or(here)
+}
+
+/// An asset name as the matching sees it: the words of the name without
+/// those that change from one release to the next, and the architecture.
+/// `imhex-1.38.0-x86_64.AppImage` is `imhex` for x86_64, and so is
+/// `imhex-1.38.1-x86_64.AppImage`.
+#[derive(Debug, PartialEq, Eq)]
+struct AssetName {
+    words: Vec<String>,
+    arch: Option<Arch>,
+}
+
+impl AssetName {
+    fn parse(name: &str) -> Self {
+        let file = last_segment(name).to_lowercase();
+        let stem = file.strip_suffix(".appimage").unwrap_or(&file);
+        let tokens: Vec<&str> =
+            stem.split(|c: char| !c.is_alphanumeric()).filter(|token| !token.is_empty()).collect();
+
+        let mut words = Vec::new();
+        let mut arch = None;
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index];
+            index += 1;
+            if token == "x86" && tokens.get(index) == Some(&"64") {
+                arch = Some(Arch::X86_64);
+                index += 1;
+            } else if let Some(named) = Arch::named(token) {
+                arch = Some(named);
+            } else if !is_version_part(token) {
+                words.push(token.to_string());
             }
         }
-        // Prefer the architecture we are running on.
-        let arch = std::env::consts::ARCH;
-        appimages
-            .iter()
-            .find(|url| url.contains(arch))
-            .or_else(|| appimages.first())
-            .map(|url| (*url).clone())
+        Self { words, arch }
     }
+}
+
+/// Whether a word of an asset name is part of a version, which changes from
+/// one release to the next: anything that starts with a digit (`1`, `38`,
+/// `0rc1`), a letter followed by digits only (`v1`, `r1234`), a pre-release
+/// marker (`beta`, `rc2`), or a commit (`a211784`, `g1a2b3c4`).
+fn is_version_part(word: &str) -> bool {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let rest = chars.as_str();
+    if first.is_ascii_digit() {
+        return true;
+    }
+    if first.is_ascii_alphabetic() && !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if matches!(
+        word.trim_end_matches(|c: char| c.is_ascii_digit()),
+        "alpha" | "beta" | "rc" | "pre"
+    ) {
+        return true;
+    }
+    let commit = word.strip_prefix('g').unwrap_or(word);
+    commit.len() >= 7
+        && commit.bytes().all(|b| b.is_ascii_hexdigit())
+        && commit.bytes().any(|b| b.is_ascii_digit())
+}
+
+fn last_segment(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+fn names(urls: &[&String]) -> String {
+    urls.iter().map(|url| last_segment(url)).collect::<Vec<_>>().join(", ")
 }
 
 /// The zsync file of a release, out of the pattern a `gh-releases-zsync`
@@ -662,6 +995,18 @@ fn zsync_asset_url(release: &Release, pattern: &str) -> Option<String> {
         }
     }
     candidates.first().map(|url| (*url).clone())
+}
+
+/// Whether a release has a zsync file that `pattern` fits, its placeholders
+/// filled in or left open. That [`zsync_asset_url`] takes any zsync file at
+/// all when none fits is no reason to follow a release.
+fn has_zsync_for(release: &Release, pattern: &str) -> bool {
+    let loose = fill_placeholders(pattern, "*");
+    release
+        .assets
+        .iter()
+        .map(|url| asset_name(url))
+        .any(|name| name.ends_with(".zsync") && glob_matches(&loose, &name))
 }
 
 /// The file name at the end of an asset URL, lowercased.
@@ -736,48 +1081,73 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     true
 }
 
-/// An asset name with all digits stripped, so `App-1.2.3-x86_64.AppImage` and
-/// `App-1.3.0-x86_64.AppImage` match while an `arm64` build does not.
-fn asset_signature(name: &str) -> String {
-    let file = name.rsplit('/').next().unwrap_or(name).to_lowercase();
-    let mut out = String::with_capacity(file.len());
-    let mut in_separator = false;
-
-    for c in file.chars() {
-        if c.is_ascii_digit() {
-            continue;
-        }
-        if c.is_alphanumeric() {
-            out.push(c);
-            in_separator = false;
-        } else if !in_separator {
-            out.push('-');
-            in_separator = true;
-        }
-    }
-    out.trim_matches('-').to_string()
+/// Reads the release behind a tag.
+fn fetch_release(owner: &str, repo: &str, tag: &str) -> Result<Release> {
+    let url = format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}");
+    let body = download::to_string(&url)?;
+    Ok(parse_release(&body))
 }
 
-/// Reads a release: the one behind a moving tag, or the latest one when no
-/// tag is followed.
-fn fetch_release(owner: &str, repo: &str, tag: Option<&str>) -> Result<Release> {
-    let url = match tag {
-        Some(tag) => format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}"),
-        None => format!("{GITHUB_API}/repos/{owner}/{repo}/releases/latest"),
-    };
+/// How many releases the one request for a listing asks for.
+const RELEASES_PER_PAGE: usize = 30;
+
+/// The release an update from GitHub follows. A tag is followed exactly.
+/// Without one, the newest release that `holds` what the update needs: the
+/// installed AppImage, or a zsync file for it. Projects publish releases for
+/// some platforms only, and the latest one may hold nothing but an `.apk`.
+/// One request either way, the first page of the listing. When no release on
+/// it holds what is needed, the newest one is returned all the same, and
+/// what comes next says why it is no use.
+fn release_to_follow(
+    owner: &str,
+    repo: &str,
+    tag: Option<&str>,
+    holds: impl Fn(&Release) -> bool,
+) -> Result<Release> {
+    if let Some(tag) = tag {
+        return fetch_release(owner, repo, tag);
+    }
+    let url = format!("{GITHUB_API}/repos/{owner}/{repo}/releases?per_page={RELEASES_PER_PAGE}");
     let body = download::to_string(&url)?;
-    Ok(Release {
-        tag: json::string_field(&body, "tag_name"),
-        assets: json::string_fields(&body, "browser_download_url"),
-        published: json::string_field(&body, "published_at")
+    newest_where(published_releases(&body), holds).ok_or_else(|| Error::NoMatchingAsset {
+        release: format!("github:{owner}/{repo}"),
+        reason: "it has no release that is neither a draft nor a pre-release".to_string(),
+    })
+}
+
+/// The releases of a listing, newest first as GitHub lists them, without
+/// drafts and pre-releases: what `releases/latest` chooses from.
+fn published_releases(listing: &str) -> Vec<Release> {
+    json::array_objects(listing)
+        .into_iter()
+        .filter(|release| {
+            json::bool_field(release, "draft") != Some(true)
+                && json::bool_field(release, "prerelease") != Some(true)
+        })
+        .map(parse_release)
+        .collect()
+}
+
+/// The newest release that `holds` what is needed, or the newest release
+/// when none does.
+fn newest_where(releases: Vec<Release>, holds: impl Fn(&Release) -> bool) -> Option<Release> {
+    let index = releases.iter().position(holds).unwrap_or(0);
+    releases.into_iter().nth(index)
+}
+
+fn parse_release(body: &str) -> Release {
+    Release {
+        tag: json::string_field(body, "tag_name"),
+        assets: json::string_fields(body, "browser_download_url"),
+        published: json::string_field(body, "published_at")
             .as_deref()
             .and_then(date::from_timestamp),
         // A continuous release points its tag at the commit it was built
         // from, which is the same commit the builds themselves name.
-        commit: json::string_field(&body, "target_commitish")
+        commit: json::string_field(body, "target_commitish")
             .as_deref()
             .and_then(version::short_commit),
-    })
+    }
 }
 
 /// Whether `release` is newer than what is installed, and what to show as
@@ -1151,8 +1521,6 @@ mod tests {
         let full = UpdatePath::FullDownload { bytes: 190 * 1024 * 1024 };
         assert!(full.describe().contains("no delta"), "{}", full.describe());
         assert!(full.describe().contains("190.0 MB"), "{}", full.describe());
-        let local = UpdatePath::LocalCopy { bytes: 4096 };
-        assert!(local.describe().contains("copied"), "{}", local.describe());
     }
 
     #[test]
@@ -1342,35 +1710,539 @@ mod tests {
         );
     }
 
-    #[test]
-    fn picks_the_asset_that_matches_the_installed_one() {
-        let release = Release {
-            tag: Some("v2.0.0".to_string()),
-            assets: vec![
-                "https://example.com/App-2.0.0-arm64.AppImage".to_string(),
-                "https://example.com/App-2.0.0-x86_64.AppImage".to_string(),
-                "https://example.com/App-2.0.0.tar.gz".to_string(),
-            ],
-            published: Some("2025-10-18".to_string()),
-            commit: None,
-        };
+    /// The file names of a release, at a download URL as GitHub has them.
+    fn names_in(tag: &str, names: &[&str]) -> Release {
+        release_with(tag, names)
+    }
 
+    fn picked(release: &Release, hint: Option<&str>, here: Arch) -> Option<String> {
+        release.appimage(hint, Some(here)).ok().map(|url| last_segment(&url).to_string())
+    }
+
+    #[test]
+    fn a_release_says_its_version() {
+        let release = names_in("v2.0.0", &["App-2.0.0-x86_64.AppImage"]);
         assert_eq!(release.version().as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn the_next_release_of_imhex_is_found_for_each_architecture() {
+        let next = names_in(
+            "v1.38.1",
+            &[
+                "imhex-1.38.1-arm64.AppImage",
+                "imhex-1.38.1-arm64.AppImage.zsync",
+                "imhex-1.38.1-x86_64.AppImage",
+                "imhex-1.38.1-x86_64.AppImage.zsync",
+                "imhex-1.38.1-Windows-x86_64.msi",
+            ],
+        );
         assert_eq!(
-            release.asset_url(Some("App-1.0.0-x86_64.AppImage")).as_deref(),
-            Some("https://example.com/App-2.0.0-x86_64.AppImage")
+            picked(&next, Some("imhex-1.38.0-x86_64.AppImage"), Arch::X86_64).as_deref(),
+            Some("imhex-1.38.1-x86_64.AppImage")
+        );
+        assert_eq!(
+            picked(&next, Some("imhex-1.38.0-arm64.AppImage"), Arch::Aarch64).as_deref(),
+            Some("imhex-1.38.1-arm64.AppImage")
+        );
+        // The hint decides, not the machine: an arm64 build installed on
+        // this one stays an arm64 build.
+        assert_eq!(
+            picked(&next, Some("imhex-1.38.0-arm64.AppImage"), Arch::X86_64).as_deref(),
+            Some("imhex-1.38.1-arm64.AppImage")
         );
     }
 
     #[test]
+    fn the_next_release_of_lm_studio_is_found_through_a_build_number_and_a_new_spelling() {
+        let next = names_in(
+            "0.4.26",
+            &["LM-Studio-0.4.26-2-x64.AppImage", "LM-Studio-0.4.26-2-arm64.AppImage"],
+        );
+        let installed = Some("LM-Studio-0.4.25-1-x64.AppImage");
+        assert_eq!(
+            picked(&next, installed, Arch::X86_64).as_deref(),
+            Some("LM-Studio-0.4.26-2-x64.AppImage")
+        );
+
+        // `x64` and `x86_64` are the same architecture, whichever a release
+        // happens to use.
+        let renamed = names_in(
+            "0.5.0",
+            &["LM-Studio-0.5.0-1-x86_64.AppImage", "LM-Studio-0.5.0-1-aarch64.AppImage"],
+        );
+        assert_eq!(
+            picked(&renamed, installed, Arch::X86_64).as_deref(),
+            Some("LM-Studio-0.5.0-1-x86_64.AppImage")
+        );
+    }
+
+    #[test]
+    fn version_parts_of_every_kind_are_ignored() {
+        for (installed, next) in [
+            ("App-v1.2.3-x86_64.AppImage", "App-v1.3.0-x86_64.AppImage"),
+            ("App_r1234_amd64.AppImage", "App_r1301_amd64.AppImage"),
+            ("App-2.0.0-beta1-x86_64.AppImage", "App-2.0.0-x86_64.AppImage"),
+            ("App-2.0.0-rc2-x86-64.AppImage", "App-2.0.1-x86_64.AppImage"),
+            ("Neovim-nightly-a211784-x86_64.AppImage", "Neovim-nightly-g9f0c1d2e-x86_64.AppImage"),
+            ("App-20251018-x86_64.AppImage", "App-20251102-x86_64.AppImage"),
+        ] {
+            let release = names_in("next", &[next, "Other-1.0-x86_64.AppImage"]);
+            assert_eq!(
+                picked(&release, Some(installed), Arch::X86_64).as_deref(),
+                Some(next),
+                "{installed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_without_an_architecture_is_built_for_this_machine() {
+        let next =
+            names_in("v1.5.4", &["Obsidian-1.5.4.AppImage", "Obsidian-1.5.4-arm64.AppImage"]);
+        let installed = Some("Obsidian-1.5.3.AppImage");
+        assert_eq!(
+            picked(&next, installed, Arch::X86_64).as_deref(),
+            Some("Obsidian-1.5.4.AppImage")
+        );
+        // On an arm64 machine both fit, and nothing says which one it was.
+        let error = next.appimage(installed, Some(Arch::Aarch64)).unwrap_err();
+        assert!(error.contains("2 of its AppImages match Obsidian-1.5.3.AppImage"), "{error}");
+        assert!(
+            error.contains("Obsidian-1.5.4.AppImage, Obsidian-1.5.4-arm64.AppImage"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn several_fits_are_an_error_that_lists_them() {
+        let next = names_in(
+            "v2.1.0",
+            &[
+                "App-2.0.0-x86_64.AppImage",
+                "App-2.1.0-beta-x86_64.AppImage",
+                "App-2.1.0-arm64.AppImage",
+            ],
+        );
+        let error =
+            next.appimage(Some("App-1.0.0-x86_64.AppImage"), Some(Arch::X86_64)).unwrap_err();
+        assert!(error.contains("2 of its AppImages match App-1.0.0-x86_64.AppImage"), "{error}");
+        assert!(
+            error.contains("App-2.0.0-x86_64.AppImage, App-2.1.0-beta-x86_64.AppImage"),
+            "{error}"
+        );
+        assert!(!error.contains("arm64"), "{error}");
+        assert!(error.contains("download URL"), "{error}");
+    }
+
+    #[test]
+    fn another_variant_is_no_match_and_says_what_there_is() {
+        let next = names_in("v2.0", &["App-qt6-2.0-x86_64.AppImage", "App-qt6-2.0-arm64.AppImage"]);
+        let error =
+            next.appimage(Some("App-qt5-1.0-x86_64.AppImage"), Some(Arch::X86_64)).unwrap_err();
+        assert!(
+            error.contains("none of its AppImages matches App-qt5-1.0-x86_64.AppImage"),
+            "{error}"
+        );
+        assert!(
+            error.contains("App-qt6-2.0-x86_64.AppImage, App-qt6-2.0-arm64.AppImage"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn without_a_hint_the_build_for_this_machine_is_the_one() {
+        let release = names_in("v2", &["App-2-x86_64.AppImage", "App-2-aarch64.AppImage"]);
+        assert_eq!(picked(&release, None, Arch::X86_64).as_deref(), Some("App-2-x86_64.AppImage"));
+        assert_eq!(
+            picked(&release, None, Arch::Aarch64).as_deref(),
+            Some("App-2-aarch64.AppImage")
+        );
+        let error = release.appimage(None, Some(Arch::Armhf)).unwrap_err();
+        assert!(error.contains("none of its AppImages matches one built for armhf"), "{error}");
+
+        let variants = names_in("v2", &["App-2-x86_64.AppImage", "App-Lite-2-x86_64.AppImage"]);
+        let error = variants.appimage(None, Some(Arch::X86_64)).unwrap_err();
+        assert!(error.contains("2 of its AppImages match one built for x86_64"), "{error}");
+    }
+
+    #[test]
     fn a_release_without_appimages_offers_nothing() {
-        let release = Release {
-            tag: Some("v1".to_string()),
-            assets: vec!["https://x/App.tar.gz".to_string()],
-            published: None,
-            commit: None,
+        let release = names_in("v1", &["App.tar.gz", "App.AppImage.zsync"]);
+        assert_eq!(
+            release.appimage(Some("App.AppImage"), Some(Arch::X86_64)),
+            Err("the release has no AppImage".to_string())
+        );
+    }
+
+    #[test]
+    fn a_zsync_pattern_names_the_appimage_of_a_release_without_zsync_files() {
+        assert_eq!(
+            appimage_named_by("imhex-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync"),
+            "imhex-*-.AppImage"
+        );
+        let release =
+            names_in("v1.38.1", &["imhex-1.38.1-arm64.AppImage", "imhex-1.38.1-x86_64.AppImage"]);
+        let hint = appimage_named_by("imhex-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync");
+        assert_eq!(
+            picked(&release, Some(&hint), Arch::X86_64).as_deref(),
+            Some("imhex-1.38.1-x86_64.AppImage")
+        );
+        let hint = appimage_named_by("imhex-*-arm64.AppImage.ZSYNC");
+        assert_eq!(
+            picked(&release, Some(&hint), Arch::X86_64).as_deref(),
+            Some("imhex-1.38.1-arm64.AppImage")
+        );
+    }
+
+    /// One release of a listing: its tag, whether it is a draft or a
+    /// pre-release, and its file names.
+    type Listed<'a> = (&'a str, bool, bool, &'a [&'a str]);
+
+    /// A listing as `GET /repos/{owner}/{repo}/releases` returns it, newest
+    /// first, with the fields around the ones that are read: an author, an
+    /// uploader for every file, and release notes full of brackets.
+    fn listing(releases: &[Listed]) -> String {
+        let objects: Vec<String> = releases
+            .iter()
+            .enumerate()
+            .map(|(index, (tag, draft, prerelease, files))| {
+                let assets: Vec<String> = files
+                    .iter()
+                    .map(|name| {
+                        format!(
+                            "{{\"url\":\"https://api.github.com/assets/{index}\",\"name\":\"{name}\",\
+                             \"uploader\":{{\"login\":\"bot\",\"site_admin\":false}},\
+                             \"content_type\":\"application/octet-stream\",\"size\":1,\
+                             \"created_at\":\"2025-10-0{index}T10:00:00Z\",\
+                             \"browser_download_url\":\"https://github.com/obsidianmd/\
+                             obsidian-releases/releases/download/{tag}/{name}\"}}"
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{{\"url\":\"https://api.github.com/releases/{index}\",\
+                     \"author\":{{\"login\":\"someone\",\"type\":\"User\",\"site_admin\":false}},\
+                     \"tag_name\":\"{tag}\",\"target_commitish\":\"master\",\"name\":\"{tag}\",\
+                     \"draft\":{draft},\"prerelease\":{prerelease},\
+                     \"created_at\":\"2025-10-0{index}T09:00:00Z\",\
+                     \"published_at\":\"2025-10-0{index}T10:00:00Z\",\"assets\":[{}],\
+                     \"body\":\"Fixed: \\\"draft\\\": true }} ] {{ [ and \\\"tag_name\\\": \\\"v0\\\"\"}}",
+                    assets.join(",")
+                )
+            })
+            .collect();
+        format!("[{}]", objects.join(",\n"))
+    }
+
+    fn followed(releases: &[Listed], hint: Option<&str>) -> Option<Release> {
+        newest_where(published_releases(&listing(releases)), |release| {
+            !release.fitting(hint, Some(Arch::X86_64)).is_empty()
+        })
+    }
+
+    #[test]
+    fn the_newest_release_with_the_installed_appimage_is_followed() {
+        // What obsidianmd/obsidian-releases did: the latest release ships an
+        // Android build only, the one before it has the AppImage.
+        let releases: &[Listed] = &[
+            ("v1.13.8", false, false, &["app-release.apk"]),
+            (
+                "v1.13.7",
+                false,
+                false,
+                &[
+                    "Obsidian-1.13.7.AppImage",
+                    "Obsidian-1.13.7-arm64.AppImage",
+                    "Obsidian-1.13.7.dmg",
+                ],
+            ),
+            ("v1.13.6", false, false, &["Obsidian-1.13.6.AppImage"]),
+        ];
+
+        let release = followed(releases, Some("Obsidian-1.13.7.AppImage")).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.13.7"));
+        assert_eq!(release.version().as_deref(), Some("1.13.7"));
+        assert_eq!(release.published.as_deref(), Some("2025-10-01"));
+        // So the installed 1.13.7 is up to date.
+        assert_eq!(
+            compare_release(Some("1.13.7"), &release),
+            (Some("1.13.7".to_string()), false, None)
+        );
+        assert_eq!(
+            release.appimage(Some("Obsidian-1.13.7.AppImage"), Some(Arch::X86_64)).as_deref(),
+            Ok("https://github.com/obsidianmd/obsidian-releases/releases/download/v1.13.7/Obsidian-1.13.7.AppImage")
+        );
+
+        // An older installation finds the same release, and an update in it.
+        let release = followed(releases, Some("Obsidian-1.13.6.AppImage")).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.13.7"));
+        assert!(compare_release(Some("1.13.6"), &release).1);
+
+        // Without a hint, the newest release built for this machine.
+        let release = followed(releases, None).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.13.7"));
+    }
+
+    #[test]
+    fn a_pre_release_or_draft_newer_than_the_matching_release_is_passed_over() {
+        let releases: &[Listed] = &[
+            ("v1.14.0", true, false, &["Obsidian-1.14.0.AppImage"]),
+            ("v1.14.0-beta.2", false, true, &["Obsidian-1.14.0-beta.2.AppImage"]),
+            ("v1.13.8", false, false, &["app-release.apk"]),
+            ("v1.13.7", false, false, &["Obsidian-1.13.7.AppImage"]),
+        ];
+        let release = followed(releases, Some("Obsidian-1.13.7.AppImage")).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.13.7"));
+    }
+
+    #[test]
+    fn when_no_release_has_it_the_newest_says_why_as_before() {
+        let releases: &[Listed] = &[
+            ("v1.14.0-beta.2", false, true, &["Obsidian-1.14.0-beta.2.AppImage"]),
+            ("v1.13.8", false, false, &["app-release.apk"]),
+            ("v1.13.7", false, false, &["Obsidian-1.13.7.dmg", "Obsidian.Setup.1.13.7.exe"]),
+        ];
+        let release = followed(releases, Some("Obsidian-1.13.6.AppImage")).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.13.8"));
+        let error = pick_appimage(&release, "obsidianmd", "obsidian-releases", None).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "release v1.13.8 of github:obsidianmd/obsidian-releases: the release has no AppImage"
+        );
+
+        // AppImages that are all something else are no match either, and
+        // the newest release lists them.
+        let releases: &[Listed] = &[
+            ("v3", false, false, &["Other-3-x86_64.AppImage"]),
+            ("v2", false, false, &["Other-2-x86_64.AppImage"]),
+        ];
+        let release = followed(releases, Some("Obsidian-1.13.7.AppImage")).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v3"));
+        let error =
+            release.appimage(Some("Obsidian-1.13.7.AppImage"), Some(Arch::X86_64)).unwrap_err();
+        assert!(
+            error.starts_with("none of its AppImages matches Obsidian-1.13.7.AppImage"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_newest_release_with_a_zsync_file_for_the_pattern_is_followed() {
+        let pattern = "imhex-*-x86_64.AppImage.zsync";
+        let follows = |releases: &[Listed]| {
+            newest_where(published_releases(&listing(releases)), |r| has_zsync_for(r, pattern))
         };
-        assert_eq!(release.asset_url(None), None);
+
+        // The newest release ships Windows only, and the one before it a
+        // zsync file of another project; drafts and pre-releases do not
+        // count however much they ship.
+        let releases: &[Listed] = &[
+            ("v1.39.0", true, false, &["imhex-1.39.0-x86_64.AppImage.zsync"]),
+            ("v1.39.0-beta.1", false, true, &["imhex-1.39.0-beta.1-x86_64.AppImage.zsync"]),
+            ("v1.38.2", false, false, &["imhex-1.38.2-Windows-x86_64.msi"]),
+            ("v1.38.1", false, false, &["other-1.0-x86_64.AppImage.zsync"]),
+            (
+                "v1.38.0",
+                false,
+                false,
+                &[
+                    "imhex-1.38.0-arm64.AppImage",
+                    "imhex-1.38.0-arm64.AppImage.zsync",
+                    "imhex-1.38.0-x86_64.AppImage",
+                    "imhex-1.38.0-x86_64.AppImage.zsync",
+                ],
+            ),
+        ];
+        let release = follows(releases).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.38.0"));
+        assert_eq!(
+            zsync_asset_url(&release, pattern).map(|url| asset_name(&url)).as_deref(),
+            Some("imhex-1.38.0-x86_64.appimage.zsync")
+        );
+
+        // A placeholder fits whatever it stands for.
+        let placeholder = "imhex-*-{{ARCHITECTURE_FILE_NAME}}.AppImage.zsync";
+        let release =
+            newest_where(published_releases(&listing(releases)), |r| has_zsync_for(r, placeholder))
+                .unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.38.0"));
+
+        // When no release has one, the newest is taken all the same, and
+        // the update falls back to the whole file as it always did.
+        let releases: &[Listed] = &[
+            ("v1.38.2", false, false, &["imhex-1.38.2-Windows-x86_64.msi"]),
+            ("v1.38.1", false, false, &["imhex-1.38.1-x86_64.AppImage"]),
+        ];
+        let release = follows(releases).unwrap();
+        assert_eq!(release.tag.as_deref(), Some("v1.38.2"));
+        assert_eq!(zsync_asset_url(&release, pattern), None);
+    }
+
+    #[test]
+    fn nothing_but_drafts_and_pre_releases_is_no_release() {
+        let releases: &[Listed] = &[
+            ("v2", true, false, &["App-2-x86_64.AppImage"]),
+            ("v2-rc1", false, true, &["App-2-rc1-x86_64.AppImage"]),
+        ];
+        assert!(followed(releases, Some("App-1-x86_64.AppImage")).is_none());
+        assert!(followed(&[], None).is_none());
+    }
+
+    #[test]
+    fn update_sources_are_checked_and_stored_in_one_spelling() {
+        for (given, stored) in [
+            ("github:WerWolv/ImHex", "github:WerWolv/ImHex"),
+            ("  github:o/r.js  ", "github:o/r.js"),
+            ("github:o/r@continuous", "github:o/r@continuous"),
+            // A tag the user names is followed as written, version or not.
+            ("github:o/r@v1.2.0", "github:o/r@v1.2.0"),
+            ("https://github.com/o/r", "github:o/r"),
+            ("https://github.com/o/r/", "github:o/r"),
+            ("https://www.github.com/o/r.git", "github:o/r"),
+            ("https://github.com/o/r/releases", "github:o/r"),
+            ("https://github.com/o/r/releases/latest", "github:o/r"),
+            ("https://github.com/o/r/releases/tag/continuous", "github:o/r@continuous"),
+            ("https://github.com/o/r/releases/tag/v1.2.0", "github:o/r"),
+            (
+                "https://github.com/o/r/releases/download/v1/App-1-x86_64.AppImage",
+                "https://github.com/o/r/releases/download/v1/App-1-x86_64.AppImage",
+            ),
+            ("https://example.com/App.AppImage", "https://example.com/App.AppImage"),
+            ("http://example.com/get?app=1", "http://example.com/get?app=1"),
+        ] {
+            assert_eq!(parse_update_source(given).ok().as_deref(), Some(stored), "{given}");
+        }
+
+        for given in [
+            "",
+            "manual",
+            "owner/repo",
+            "github:owner",
+            "github:/repo",
+            "github:o/r/x",
+            "github:o/r@",
+            "github:o/r@a b",
+            "github:o/..",
+            "ftp://example.com/App.AppImage",
+            "https://",
+            "https://example.com/a b",
+            "https://github.com/o",
+            "https://github.com/o/r/issues",
+        ] {
+            assert!(
+                matches!(parse_update_source(given), Err(Error::InvalidUpdateSource(_))),
+                "{given}"
+            );
+        }
+    }
+
+    fn installed(
+        update_info: Option<&str>,
+        update_source: Option<&str>,
+        origin: Option<&str>,
+    ) -> InstalledApp {
+        InstalledApp {
+            slug: "app".to_string(),
+            name: "App".to_string(),
+            comment: None,
+            categories: Vec::new(),
+            version: None,
+            origin: origin.map(str::to_string),
+            update_info: update_info.map(str::to_string),
+            update_source: update_source.map(str::to_string),
+            installed_at: None,
+            appimage_path: PathBuf::from("/nowhere/app.AppImage"),
+            desktop_entry_path: PathBuf::from("/nowhere/app.desktop"),
+            size_bytes: None,
+            health: crate::list::Health::Ok,
+        }
+    }
+
+    fn github(owner: &str, repo: &str, tag: Option<&str>, asset: Option<&str>) -> UpdateSource {
+        UpdateSource::GitHubRelease {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            tag: tag.map(str::to_string),
+            asset: asset.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn embedded_update_information_comes_before_the_update_source() {
+        let app = installed(
+            Some("zsync|https://example.com/App.AppImage.zsync"),
+            Some("github:o/r"),
+            Some("https://example.com/App.AppImage"),
+        );
+        assert!(matches!(source_for(&app), UpdateSource::Zsync { .. }));
+    }
+
+    #[test]
+    fn the_update_source_comes_before_the_origin() {
+        let origin = Some("/home/me/Downloads/App-1.0-x86_64.AppImage");
+        assert_eq!(
+            source_for(&installed(None, Some("github:o/r@continuous"), origin)),
+            github("o", "r", Some("continuous"), Some("App-1.0-x86_64.AppImage"))
+        );
+        assert_eq!(
+            source_for(&installed(None, Some("github:o/r"), None)),
+            github("o", "r", None, None)
+        );
+        assert_eq!(
+            source_for(&installed(None, Some("https://example.com/App.AppImage"), origin)),
+            UpdateSource::DirectUrl { url: "https://example.com/App.AppImage".to_string() }
+        );
+        assert_eq!(
+            source_for(&installed(
+                None,
+                Some("https://github.com/o/r/releases/download/continuous/App-x86_64.AppImage"),
+                origin
+            )),
+            github("o", "r", Some("continuous"), Some("App-x86_64.AppImage"))
+        );
+
+        // Manual is manual, whatever the origin was, and so is a value that
+        // is no update source at all.
+        let url = Some("https://example.com/App.AppImage");
+        assert_eq!(source_for(&installed(None, Some(MANUAL), url)), UpdateSource::Manual);
+        assert_eq!(source_for(&installed(None, Some("nonsense"), url)), UpdateSource::Manual);
+    }
+
+    #[test]
+    fn an_entry_written_by_0_2_follows_a_url_origin_and_nothing_else() {
+        let url = "https://example.com/App.AppImage";
+        assert_eq!(
+            source_for(&installed(None, None, Some(url))),
+            UpdateSource::DirectUrl { url: url.to_string() }
+        );
+        let download = "https://github.com/o/r/releases/download/v1.0/App-1.0-x86_64.AppImage";
+        assert_eq!(
+            source_for(&installed(None, None, Some(download))),
+            github("o", "r", None, Some("App-1.0-x86_64.AppImage"))
+        );
+
+        // A local file is history, even while it is still there.
+        let dir = tempfile::tempdir().unwrap();
+        let still_there = dir.path().join("App.AppImage");
+        fs::write(&still_there, "old build").unwrap();
+        let local = still_there.to_string_lossy();
+        assert_eq!(source_for(&installed(None, None, Some(&local))), UpdateSource::Manual);
+        assert_eq!(source_for(&installed(None, None, None)), UpdateSource::Manual);
+        assert_eq!(UpdateSource::Manual.describe(), "manual");
+    }
+
+    #[test]
+    fn a_github_repository_is_recognised_however_it_is_written() {
+        assert_eq!(github_repository("github:o/r@continuous").as_deref(), Some("o/r"));
+        assert_eq!(github_repository("https://github.com/o/r").as_deref(), Some("o/r"));
+        assert_eq!(
+            github_repository("https://github.com/o/r/releases/download/v1/App.AppImage")
+                .as_deref(),
+            Some("o/r")
+        );
+        assert_eq!(github_repository("https://example.com/App.AppImage"), None);
+        assert_eq!(github_repository(MANUAL), None);
     }
 
     /// The AppImageUpdate continuous release as the API returns it, and the

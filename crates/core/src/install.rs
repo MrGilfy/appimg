@@ -7,7 +7,7 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
-use crate::{caches, slug};
+use crate::{caches, download, slug, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
 const DEFAULT_CATEGORY: &str = "Utility";
@@ -46,13 +46,20 @@ pub struct InstallRequest {
     pub extract_root: Option<PathBuf>,
     pub version: Option<String>,
     pub update_info: Option<String>,
+    /// What an update follows when the AppImage embeds no update
+    /// information, as [`update::parse_update_source`] returns it. `None`
+    /// updates manually.
+    pub update_source: Option<String>,
     /// Replace an existing installation with the same slug.
     pub overwrite: bool,
 }
 
 impl InstallRequest {
     /// Builds a request from what the AppImage itself declares. Callers
-    /// override the fields the user edited.
+    /// override the fields the user edited. An AppImage downloaded from a
+    /// URL updates from that URL; one installed from a local file updates
+    /// manually, and what its AppStream metadata suggests is for the caller
+    /// to ask about, see [`suggested_update_source`].
     pub fn from_info(source: &Path, origin: &str, info: &AppImageInfo) -> Self {
         Self {
             source: source.to_path_buf(),
@@ -70,9 +77,27 @@ impl InstallRequest {
             extract_root: info.extract_root().map(Path::to_path_buf),
             version: info.version.clone(),
             update_info: info.update_info.clone(),
+            update_source: download::is_url(origin)
+                .then(|| update::parse_update_source(origin).ok())
+                .flatten(),
             overwrite: false,
         }
     }
+}
+
+/// The update source the AppStream metadata inside the AppImage suggests,
+/// when it is worth asking about: the AppImage embeds no update
+/// information, which would come first, and the request does not follow
+/// that repository already. Never applied by itself.
+pub fn suggested_update_source(request: &InstallRequest, info: &AppImageInfo) -> Option<String> {
+    let suggested = info.suggested_update_source.clone()?;
+    if request.update_info.is_some() {
+        return None;
+    }
+    let following = request.update_source.as_deref().and_then(update::github_repository);
+    let offered = update::github_repository(&suggested);
+    let same = following.zip(offered).is_some_and(|(a, b)| a.eq_ignore_ascii_case(&b));
+    (!same).then_some(suggested)
 }
 
 #[derive(Debug, Clone)]
@@ -225,9 +250,14 @@ fn build_entry(
     entry.set("StartupNotify", "true");
     entry.set(desktop_entry::KEY_MANAGED, "true");
     entry.set(desktop_entry::KEY_SLUG, slug);
-    entry.set(desktop_entry::KEY_SOURCE, request.origin.clone());
+    entry.set(desktop_entry::KEY_ORIGIN, request.origin.clone());
     entry.set_optional(desktop_entry::KEY_VERSION, request.version.clone());
     entry.set_optional(desktop_entry::KEY_UPDATE_INFO, request.update_info.clone());
+    // Always written, so an entry without it is one written by 0.2.x.
+    entry.set(
+        desktop_entry::KEY_UPDATE_SOURCE,
+        request.update_source.clone().unwrap_or_else(|| update::MANUAL.to_string()),
+    );
     entry.set(desktop_entry::KEY_INSTALLED_AT, timestamp());
     entry
 }
@@ -262,6 +292,7 @@ mod tests {
             extract_root: None,
             version: Some("1.2.3".to_string()),
             update_info: None,
+            update_source: None,
             overwrite: false,
         }
     }

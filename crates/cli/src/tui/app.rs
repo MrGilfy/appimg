@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use appimg_core::list::InstalledApp;
-use appimg_core::{install, list, metadata, remove, update, Paths};
+use appimg_core::update::UpdateSource;
+use appimg_core::{install, list, metadata, remove, update, Error, Paths};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::browser::Browser;
@@ -369,6 +370,8 @@ impl App {
                     )
                 }
             }
+            // It names the application and says what to do already.
+            Err(error @ Error::NoUpdateSource(_)) => error.to_string(),
             Err(error) => format!("{}: {error}", app.name),
         };
 
@@ -382,8 +385,14 @@ impl App {
         let apps = list::list(&self.paths)?;
         let mut updated = 0;
         let mut failed = 0;
+        let mut manual = 0;
 
         for app in &apps {
+            // Nothing to update from is not a failure.
+            if update::source_for(app) == UpdateSource::Manual {
+                manual += 1;
+                continue;
+            }
             match update::check(app) {
                 Ok(status) if !status.available && status.note.is_none() => continue,
                 Ok(_) | Err(_) => {}
@@ -399,6 +408,7 @@ impl App {
 
         self.reload()?;
         self.status = Some(match (updated, failed) {
+            (0, 0) if manual > 0 => "Everything with an update source is up to date.".to_string(),
             (0, 0) => "Everything is up to date.".to_string(),
             (updated, 0) => format!("Updated {updated} applications."),
             (updated, failed) => format!("Updated {updated}, {failed} failed."),

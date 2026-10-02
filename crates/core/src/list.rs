@@ -24,8 +24,12 @@ pub struct InstalledApp {
     pub comment: Option<String>,
     pub categories: Vec<String>,
     pub version: Option<String>,
+    /// Where it was installed from. History only.
     pub origin: Option<String>,
     pub update_info: Option<String>,
+    /// `X-AppImg-UpdateSource` as the entry holds it. `None` for an entry
+    /// written by 0.2.x.
+    pub update_source: Option<String>,
     pub installed_at: Option<String>,
     pub appimage_path: PathBuf,
     pub desktop_entry_path: PathBuf,
@@ -116,8 +120,9 @@ fn build_app(paths: &Paths, entry: &DesktopEntry, desktop_entry_path: PathBuf) -
         // read, so an entry written before that rule existed shows the
         // same thing as one written after it.
         version: entry.get(desktop_entry::KEY_VERSION).map(version::display),
-        origin: entry.get(desktop_entry::KEY_SOURCE).map(str::to_string),
+        origin: entry.get(desktop_entry::KEY_ORIGIN).map(str::to_string),
         update_info: entry.get(desktop_entry::KEY_UPDATE_INFO).map(str::to_string),
+        update_source: entry.get(desktop_entry::KEY_UPDATE_SOURCE).map(str::to_string),
         installed_at: entry.get(desktop_entry::KEY_INSTALLED_AT).map(str::to_string),
         size_bytes: fs_util::file_size(&appimage_path),
         appimage_path,

@@ -4,6 +4,7 @@
 mod common;
 
 use std::fs;
+use std::path::Path;
 
 use appimg_core::desktop_entry::{self, DesktopEntry};
 use appimg_core::install::{IconChoice, InstallRequest};
@@ -321,78 +322,6 @@ fn remove_leaves_nothing_behind() {
     assert!(matches!(remove::remove(&sandbox.paths, "fake-app"), Err(Error::NotInstalled(_))));
 }
 
-#[test]
-fn updating_from_a_local_file_keeps_manual_edits() {
-    let _serial = common::serial();
-    let sandbox = Sandbox::new();
-    let origin = sandbox.downloads.join("Fake_App.AppImage");
-    FakeAppImage::new("Fake App").marker("v1").build(&sandbox.downloads, "Fake_App.AppImage");
-
-    let info = metadata::inspect(&origin, None).unwrap();
-    let mut request = InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info);
-    request.name = "My Renamed App".to_string();
-    request.categories = vec!["Graphics".to_string()];
-    request.extra_args = vec!["--enable-something".to_string()];
-    request.version = Some("1.0.0".to_string());
-    let outcome = install::install(&sandbox.paths, &request).unwrap();
-    assert_eq!(outcome.slug, "my-renamed-app");
-
-    // The origin file gets a new build, as a manual re-download would.
-    FakeAppImage::new("Fake App")
-        .marker("v2")
-        .icon_sizes(&[128])
-        .build(&sandbox.downloads, "Fake_App.AppImage");
-
-    let app = list::find(&sandbox.paths, "my-renamed-app").unwrap();
-    assert!(matches!(update::source_for(&app), update::UpdateSource::LocalFile { .. }));
-
-    let result = update::update(&sandbox.paths, &app, None).unwrap();
-    assert!(read(&result.appimage_path).contains("v2"));
-    let backup = result.backup_path.clone().unwrap();
-    assert!(backup.is_file());
-    assert!(read(&backup).contains("v1"));
-
-    let entry = DesktopEntry::read(&sandbox.paths.desktop_entry_path("my-renamed-app")).unwrap();
-    assert_eq!(entry.get("Name"), Some("My Renamed App"));
-    assert_eq!(entry.categories(), vec!["Graphics"]);
-    assert!(entry.get("Exec").unwrap().contains("--enable-something"));
-
-    // Icons come from the new version.
-    let icons = walk(&sandbox.paths.icons_root);
-    assert!(icons.contains(&"128x128/apps/my-renamed-app.png".into()), "{icons:?}");
-
-    // Whatever else the update left next to the AppImage goes with the
-    // backup: `appimageupdatetool` writes these, and never cleans them up.
-    let zs_old = sandbox.paths.appimage_dir.join("my-renamed-app.AppImage.zs-old");
-    fs::write(&zs_old, "the previous version, a second time").unwrap();
-
-    update::confirm(&sandbox.paths, "my-renamed-app").unwrap();
-    assert!(!backup.exists());
-    assert!(!zs_old.exists());
-    assert!(update::leftovers(&sandbox.paths, "my-renamed-app").is_empty());
-}
-
-#[test]
-fn a_rollback_puts_the_previous_version_back() {
-    let _serial = common::serial();
-    let sandbox = Sandbox::new();
-    let origin = sandbox.downloads.join("Fake_App.AppImage");
-    FakeAppImage::new("Fake App").marker("v1").build(&sandbox.downloads, "Fake_App.AppImage");
-    let info = metadata::inspect(&origin, None).unwrap();
-    let request = InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info);
-    install::install(&sandbox.paths, &request).unwrap();
-
-    FakeAppImage::new("Fake App").marker("v2").build(&sandbox.downloads, "Fake_App.AppImage");
-    let app = list::find(&sandbox.paths, "fake-app").unwrap();
-    let result = update::update(&sandbox.paths, &app, None).unwrap();
-    assert!(read(&result.appimage_path).contains("v2"));
-
-    update::rollback(&sandbox.paths, "fake-app").unwrap();
-    assert!(read(&result.appimage_path).contains("v1"));
-    assert!(is_executable(&result.appimage_path));
-    assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
-}
-
 /// The AppImages of a continuous release declare a build number and the
 /// commit they were built from, and two of them out of one release differ
 /// only in that build number. What is shown is the commit, so both name the
@@ -440,47 +369,217 @@ fn a_continuous_build_is_shown_as_the_commit_it_came_from() {
 fn check_reports_without_touching_anything() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
-    let origin = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
-    FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&origin, None).unwrap();
-    install::install(
-        &sandbox.paths,
-        &InstallRequest::from_info(&origin, &origin.to_string_lossy(), &info),
-    )
-    .unwrap();
+    install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
 
     let before = walk(&sandbox.paths.data_home);
     let app = list::find(&sandbox.paths, "fake-app").unwrap();
     let status = update::check(&app).unwrap();
     assert_eq!(status.current_version.as_deref(), Some("1.0.0"));
-    assert_eq!(status.latest_version.as_deref(), Some("1.0.0"));
     assert!(!status.available);
-    assert_eq!(walk(&sandbox.paths.data_home), before);
-
-    // A newer file at the recorded origin is an available update.
-    let newer = sandbox.downloads.join("Fake_App-2.0.0.AppImage");
-    FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-2.0.0.AppImage");
-    let mut app = list::find(&sandbox.paths, "fake-app").unwrap();
-    app.origin = Some(newer.to_string_lossy().into_owned());
-    let status = update::check(&app).unwrap();
-    assert!(status.available);
-    assert_eq!(status.latest_version.as_deref(), Some("2.0.0"));
     assert_eq!(walk(&sandbox.paths.data_home), before);
 }
 
 #[test]
-fn an_app_without_a_source_cannot_be_updated() {
+fn an_app_installed_from_a_local_file_is_updated_manually_and_says_what_to_do() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+
+    let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(entry.get(desktop_entry::KEY_UPDATE_SOURCE), Some("manual"));
+    let origin = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
+    assert_eq!(entry.get(desktop_entry::KEY_ORIGIN), Some(&*origin.to_string_lossy()));
+
+    // The file it came from is still there, and still not an update source.
+    assert!(origin.is_file());
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(update::source_for(&app), update::UpdateSource::Manual);
+    assert_eq!(update::source_for(&app).describe(), "manual");
+
+    let note = update::check(&app).unwrap().note.unwrap();
+    assert!(note.contains("appimg update-source fake-app"), "{note}");
+    let error = update::update(&sandbox.paths, &app, None).unwrap_err();
+    assert!(matches!(error, Error::NoUpdateSource(_)));
+    let message = error.to_string();
+    assert!(message.contains("fake-app is updated manually"), "{message}");
+    assert!(message.contains("appimg update-source fake-app <URL|github:owner/repo>"), "{message}");
+
+    // A value that is no update source is manual too, and the check says
+    // what is wrong with it.
     let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
-    entry.remove(desktop_entry::KEY_SOURCE);
+    entry.set(desktop_entry::KEY_UPDATE_SOURCE, "somewhere");
     entry.write(&outcome.desktop_entry_path).unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(update::source_for(&app), update::UpdateSource::Manual);
+    let note = update::check(&app).unwrap().note.unwrap();
+    assert!(note.contains("\"somewhere\", which is no update source"), "{note}");
+}
+
+/// What 0.2.2 wrote for an installation, key for key and in its order. It
+/// knew no `X-AppImg-UpdateSource`.
+fn entry_as_0_2_2_wrote_it(appimage: &Path, origin: &str) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Fake App\nComment=A fake application\n\
+         Exec=\"{}\" %U\nIcon=fake-app\nTerminal=false\nCategories=Utility;\n\
+         StartupNotify=true\nX-AppImg-Managed=true\nX-AppImg-Slug=fake-app\n\
+         X-AppImg-Source={origin}\nX-AppImg-Version=1.0.0\nX-AppImg-InstalledAt=1759300000\n",
+        appimage.display()
+    )
+}
+
+#[test]
+fn an_entry_written_by_0_2_is_read_as_it_was_and_left_alone() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+    let local = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
+    assert!(local.is_file());
+
+    // Installed from a URL: that URL is still where it updates from.
+    let url = "https://example.com/Fake_App-1.0.0.AppImage";
+    fs::write(&outcome.desktop_entry_path, entry_as_0_2_2_wrote_it(&outcome.appimage_path, url))
+        .unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(app.origin.as_deref(), Some(url));
+    assert_eq!(app.update_source, None);
+    assert_eq!(update::source_for(&app), update::UpdateSource::DirectUrl { url: url.to_string() });
+
+    // Installed from a local file that is still there: history now.
+    let origin = local.to_string_lossy();
+    let written = entry_as_0_2_2_wrote_it(&outcome.appimage_path, &origin);
+    fs::write(&outcome.desktop_entry_path, &written).unwrap();
+    let before = walk(&sandbox.root);
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(update::source_for(&app), update::UpdateSource::Manual);
+    assert!(update::check(&app).unwrap().note.unwrap().contains("appimg update-source"));
+
+    // Reading it changed nothing: not the entry, not anything else.
+    assert_eq!(walk(&sandbox.root), before);
+    assert_eq!(read(&outcome.desktop_entry_path), written);
+}
+
+#[test]
+fn an_update_source_given_at_install_is_written_and_followed() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source =
+        FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0-x86_64.AppImage");
+    let info = metadata::inspect(&source, None).unwrap();
+    let mut request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
+    request.update_source = Some(update::parse_update_source("https://github.com/o/r").unwrap());
+    let outcome = install::install(&sandbox.paths, &request).unwrap();
+
+    let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(entry.get(desktop_entry::KEY_UPDATE_SOURCE), Some("github:o/r"));
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(app.update_source.as_deref(), Some("github:o/r"));
+    // The name of the file it was installed from picks the file out of each
+    // release.
+    assert_eq!(
+        update::source_for(&app),
+        update::UpdateSource::GitHubRelease {
+            owner: "o".to_string(),
+            repo: "r".to_string(),
+            tag: None,
+            asset: Some("Fake_App-1.0.0-x86_64.AppImage".to_string()),
+        }
+    );
+}
+
+#[test]
+fn setting_the_update_source_changes_that_line_and_nothing_else() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+
+    // An entry edited by hand stays as it was edited.
+    let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    entry.set("Name", "Hand Edited");
+    entry.set("X-Something-Else", "kept");
+    entry.write(&outcome.desktop_entry_path).unwrap();
+    let edited = read(&outcome.desktop_entry_path);
+    let others = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.starts_with("X-AppImg-UpdateSource="))
+            .map(str::to_string)
+            .collect()
+    };
+    let binaries = walk(&sandbox.paths.appimage_dir);
 
     let app = list::find(&sandbox.paths, "fake-app").unwrap();
-    assert_eq!(update::source_for(&app), update::UpdateSource::None);
-    assert!(update::check(&app).unwrap().note.is_some());
-    assert!(matches!(update::update(&sandbox.paths, &app, None), Err(Error::NoUpdateSource(_))));
+    assert!(update::set_update_source(&app, Some("github:o/r@continuous")).unwrap());
+    let after = read(&outcome.desktop_entry_path);
+    assert_eq!(others(&after), others(&edited));
+    assert!(after.contains("X-AppImg-UpdateSource=github:o/r@continuous\n"), "{after}");
+    assert_eq!(walk(&sandbox.paths.appimage_dir), binaries);
+
+    // The same again changes nothing.
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert!(!update::set_update_source(&app, Some("github:o/r@continuous")).unwrap());
+
+    // Something that is no update source is refused and written nowhere.
+    assert!(matches!(
+        update::set_update_source(&app, Some("o/r")),
+        Err(Error::InvalidUpdateSource(_))
+    ));
+    assert_eq!(read(&outcome.desktop_entry_path), after);
+
+    // Clearing makes it manual, explicitly, so a URL it came from does not
+    // come back as the update source.
+    let mut entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    entry.set(desktop_entry::KEY_ORIGIN, "https://example.com/Fake_App.AppImage");
+    entry.write(&outcome.desktop_entry_path).unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert!(update::set_update_source(&app, None).unwrap());
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert_eq!(app.update_source.as_deref(), Some("manual"));
+    assert_eq!(update::source_for(&app), update::UpdateSource::Manual);
+}
+
+#[test]
+fn the_appstream_metadata_suggests_an_update_source_and_sets_none() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source = FakeAppImage::new("Fake App")
+        .metainfo(
+            "<url type=\"homepage\">https://fake.example.org</url>\n  \
+             <url type=\"vcs-browser\">https://github.com/fake/app</url>",
+        )
+        .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
+    let info = metadata::inspect(&source, None).unwrap();
+    assert_eq!(info.suggested_update_source.as_deref(), Some("github:fake/app"));
+
+    // A request built from it does not follow it, it only suggests it.
+    let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
+    assert_eq!(request.update_source, None);
+    assert_eq!(
+        install::suggested_update_source(&request, &info).as_deref(),
+        Some("github:fake/app")
+    );
+    let outcome = install::install(&sandbox.paths, &request).unwrap();
+    let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(entry.get(desktop_entry::KEY_UPDATE_SOURCE), Some("manual"));
+
+    // Embedded update information comes first, so there is nothing to ask.
+    let mut embedded = request.clone();
+    embedded.update_info = Some("zsync|https://example.com/Fake_App.AppImage.zsync".to_string());
+    assert_eq!(install::suggested_update_source(&embedded, &info), None);
+
+    // Nor when the request follows that repository already, however written.
+    let mut following = request.clone();
+    following.update_source = Some(
+        "https://github.com/fake/app/releases/download/v1/Fake_App-1.0.0.AppImage".to_string(),
+    );
+    assert_eq!(install::suggested_update_source(&following, &info), None);
+    following.update_source = Some("github:Fake/App@continuous".to_string());
+    assert_eq!(install::suggested_update_source(&following, &info), None);
+
+    // Another repository is worth asking about.
+    following.update_source = Some("github:someone/else".to_string());
+    assert_eq!(
+        install::suggested_update_source(&following, &info).as_deref(),
+        Some("github:fake/app")
+    );
 }
 
 #[test]

@@ -54,8 +54,21 @@ pub enum Error {
     #[error("no update information stored for {0:?}")]
     NoUpdateInfo(String),
 
-    #[error("no update source could be determined for {0:?}")]
+    #[error(
+        "{0} is updated manually: it carries no update information and has no update source. \
+         Set one with `appimg update-source {0} <URL|github:owner/repo>`, or install a newer \
+         version over it"
+    )]
     NoUpdateSource(String),
+
+    #[error(
+        "{0:?} is not an update source: expected an http(s) URL or github:owner/repo, optionally \
+         followed by @tag"
+    )]
+    InvalidUpdateSource(String),
+
+    #[error("{release}: {reason}")]
+    NoMatchingAsset { release: String, reason: String },
 
     #[error("{url}: {reason}")]
     Zsync { url: String, reason: String },

@@ -9,7 +9,7 @@ use crate::desktop_entry::{self, DesktopEntry};
 use crate::elf::SQUASHFS_MAGIC;
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
-use crate::{elf, slug, version};
+use crate::{appstream, elf, slug, version};
 
 /// A temporary directory holding an extracted AppImage. Dropping it removes
 /// the extracted tree.
@@ -50,6 +50,10 @@ pub struct AppImageInfo {
     pub terminal: bool,
     pub version: Option<String>,
     pub update_info: Option<String>,
+    /// `github:owner/repo` when the AppStream metadata inside links a GitHub
+    /// repository: a suggestion for the update source, never applied by
+    /// itself.
+    pub suggested_update_source: Option<String>,
     pub extraction: Option<Extraction>,
     /// Why the AppImage did not extract, when it did not.
     pub extract_problems: Vec<String>,
@@ -83,6 +87,7 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
         if let Some(entry) = read_embedded_entry(extraction.root()) {
             apply_entry(&mut info, &entry, locale);
         }
+        info.suggested_update_source = appstream::github_repository(extraction.root());
         info.extraction = Some(extraction);
     }
 

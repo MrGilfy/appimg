@@ -36,6 +36,8 @@ pub enum Command {
     List(ListArgs),
     /// Update installed AppImages.
     Update(UpdateArgs),
+    /// Show, set or clear where an installed AppImage updates from.
+    UpdateSource(UpdateSourceArgs),
     /// Remove an installed AppImage.
     Remove(RemoveArgs),
     /// Change the desktop entry of an installed AppImage in $EDITOR.
@@ -75,6 +77,13 @@ pub struct InstallArgs {
     #[arg(long)]
     pub icon: Option<PathBuf>,
 
+    /// Where updates come from when the AppImage carries no update
+    /// information of its own: a URL to download, github:owner/repo to
+    /// follow the newest of its releases that has the AppImage, or
+    /// github:owner/repo@tag to follow that tag.
+    #[arg(long, value_name = "URL|github:owner/repo")]
+    pub update_source: Option<String>,
+
     /// Show what would happen and write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -106,6 +115,23 @@ pub struct UpdateArgs {
     /// between versions without notice.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateSourceArgs {
+    /// Name or slug of the application.
+    pub name: String,
+
+    /// The update source to set: a URL to download, github:owner/repo to
+    /// follow the newest of its releases that has the AppImage, or
+    /// github:owner/repo@tag to follow that tag. Without it and without
+    /// --clear, the current one is shown.
+    #[arg(value_name = "URL|github:owner/repo")]
+    pub source: Option<String>,
+
+    /// Update manually from now on, from no source at all.
+    #[arg(long, conflicts_with = "source")]
+    pub clear: bool,
 }
 
 #[derive(Debug, Args)]

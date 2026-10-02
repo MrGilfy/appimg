@@ -50,6 +50,27 @@ update says which it was and what it cost:
 
       reused 19054 of 46308 blocks, fetched 107.0 MB in 22 requests
 
+The update information embedded in an AppImage comes first. An AppImage
+without any updates from its update source, which an AppImage downloaded
+from a URL starts out with. One installed from a local file is updated
+manually until it gets one:
+
+    appimg install ./App.AppImage --update-source github:owner/repo
+    appimg update-source app github:owner/repo@continuous
+    appimg update-source app https://example.com/App.AppImage
+    appimg update-source app --clear
+    appimg update-source app       show where it updates from
+
+`github:owner/repo` follows the newest release that has the installed
+AppImage in it, passing over drafts, pre-releases and releases that ship
+other platforms only. `@tag` follows that tag instead, for projects that
+publish under a moving tag such as `continuous`. Update information of the
+form `gh-releases-zsync|owner|repo|latest|...` is followed the same way, to
+the newest release with a zsync file its pattern fits.
+The file to download is the one whose name matches the installed file,
+versions aside. When the AppStream metadata inside an AppImage links a
+GitHub repository, the install suggests it as the update source.
+
 ## Where things go
 
     $XDG_DATA_HOME/appimages/<name>.AppImage      the binary

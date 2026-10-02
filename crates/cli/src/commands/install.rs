@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use appimg_core::install::{IconChoice, InstallRequest};
-use appimg_core::{download, install, metadata, Paths};
+use appimg_core::metadata::AppImageInfo;
+use appimg_core::update::{self, UpdateSource};
+use appimg_core::{download, install, list, metadata, Paths};
 use tempfile::TempDir;
 
 use crate::cli::InstallArgs;
@@ -10,6 +12,11 @@ use crate::ui::{human_size, Ui};
 use crate::Outcome;
 
 pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
+    // Something that is no update source is refused before anything is
+    // downloaded.
+    if let Some(source) = &args.update_source {
+        update::parse_update_source(source)?;
+    }
     // The temporary directory has to outlive the installation, a downloaded
     // AppImage lives in it until it has been copied into place.
     let (source, origin, _scratch) = resolve_source(ui, &args.source)?;
@@ -28,6 +35,9 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     apply_overrides(&mut request, args)?;
     if request.name.trim().is_empty() {
         bail!("no name could be determined, pass --name");
+    }
+    if args.update_source.is_none() {
+        offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
 
     let plan = install::plan(paths, &request)?;
@@ -60,11 +70,52 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
         0 => ui.info(&format!("  icon    {} (no icon found)", install::FALLBACK_ICON)),
         count => ui.info(&format!("  icons   {count} installed into the hicolor theme")),
     }
+    let installed = list::find(paths, &outcome.slug)?;
+    match update::source_for(&installed) {
+        UpdateSource::Manual => ui.info(&format!(
+            "  updates manually, set a source with: appimg update-source {} \
+             <URL|github:owner/repo>",
+            outcome.slug
+        )),
+        source => ui.info(&format!("  updates from {}", source.describe())),
+    }
     for warning in &outcome.validation_warnings {
         ui.warn(warning);
     }
 
     Ok(Outcome::Done)
+}
+
+/// Asks about the update source the AppStream metadata inside the AppImage
+/// suggests, yes by default, the way the TUI prefills it. `--yes` takes it
+/// and says so. With nobody to ask, on a pipe, it is left out and the flag
+/// that sets it is named, since nobody confirmed it.
+fn offer_suggested_source(
+    ui: &Ui,
+    request: &mut InstallRequest,
+    info: &AppImageInfo,
+    dry_run: bool,
+) -> Result<()> {
+    let Some(suggested) = install::suggested_update_source(request, info) else {
+        return Ok(());
+    };
+    let found = format!("The AppStream metadata links {suggested}");
+
+    let take = if ui.assumes_yes() || dry_run {
+        ui.info(&format!(
+            "{found}, so updates come from its releases. --update-source sets another source."
+        ));
+        true
+    } else if ui.is_interactive() {
+        ui.confirm(&format!("{found}. Update from its releases?"), true)?
+    } else {
+        ui.info(&format!("{found}. Pass --update-source {suggested} to update from its releases."));
+        false
+    };
+    if take {
+        request.update_source = Some(suggested);
+    }
+    Ok(())
 }
 
 /// Turns the argument into a local file. URLs are downloaded into a
@@ -142,6 +193,9 @@ fn apply_overrides(request: &mut InstallRequest, args: &InstallArgs) -> Result<(
             bail!("{} is not a file", icon.display());
         }
         request.icon = IconChoice::File(icon.clone());
+    }
+    if let Some(source) = &args.update_source {
+        request.update_source = Some(update::parse_update_source(source)?);
     }
     Ok(())
 }

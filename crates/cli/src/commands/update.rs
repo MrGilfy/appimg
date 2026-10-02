@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use appimg_core::json::escape;
 use appimg_core::list::InstalledApp;
-use appimg_core::update::{UpdateOutcome, UpdateStatus};
+use appimg_core::update::{UpdateOutcome, UpdateSource, UpdateStatus};
 use appimg_core::{list, metadata, update, Error, Paths};
 
 use crate::cli::UpdateArgs;
@@ -21,8 +21,22 @@ pub fn run(paths: &Paths, ui: &Ui, args: &UpdateArgs) -> Result<Outcome> {
 
     let mut updated = Vec::new();
     let mut failed = 0;
+    let mut manual = 0;
 
     for app in &targets {
+        if update::source_for(app) == UpdateSource::Manual {
+            // Asked for by name, nothing to update from is the answer.
+            if !args.all {
+                return Err(Error::NoUpdateSource(app.slug.clone()).into());
+            }
+            ui.info(&format!(
+                "{} is updated manually, skipped. Set an update source with: appimg \
+                 update-source {} <URL|github:owner/repo>",
+                app.name, app.slug
+            ));
+            manual += 1;
+            continue;
+        }
         match update_one(paths, ui, app) {
             Ok(Some(outcome)) => updated.push(outcome),
             Ok(None) => {}
@@ -37,7 +51,11 @@ pub fn run(paths: &Paths, ui: &Ui, args: &UpdateArgs) -> Result<Outcome> {
         bail!("{failed} of {} updates failed", targets.len());
     }
     if updated.is_empty() {
-        ui.info("Everything is up to date.");
+        if manual > 0 {
+            ui.info("Everything with an update source is up to date.");
+        } else {
+            ui.info("Everything is up to date.");
+        }
         return Ok(Outcome::NothingToDo);
     }
     Ok(Outcome::Done)
@@ -104,14 +122,7 @@ fn update_one(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<Option<Updat
     ui.info(&format!("Updating {}...", ui.bold(&app.name)));
     let mut progress = ui.progress();
     let outcome =
-        match update::update(paths, app, Some(&mut |done, total| progress.update(done, total))) {
-            Ok(outcome) => outcome,
-            Err(Error::NoUpdateSource(_)) => {
-                ui.info(&format!("{}: no update source recorded, skipped.", app.name));
-                return Ok(None);
-            }
-            Err(error) => return Err(error.into()),
-        };
+        update::update(paths, app, Some(&mut |done, total| progress.update(done, total)))?;
     progress.finish();
 
     // The new binary has to run once before the backup goes away.

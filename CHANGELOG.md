@@ -6,6 +6,58 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Every installed AppImage has an update source of its own, separate from
+  where it was installed from, stored as `X-AppImg-UpdateSource`. It is a
+  URL to download, `github:owner/repo` to follow the newest release that
+  has the installed AppImage in it, or `github:owner/repo@tag` to follow
+  that tag exactly as written. A release that is a draft, a pre-release or
+  ships other platforms only, such as an Android build alone, is passed
+  over, out of the first page of releases, in the one request a check
+  makes. A link to
+  a repository or to its releases on github.com is stored as
+  `github:owner/repo`. The update information embedded in an AppImage still
+  comes first whenever it has some.
+- `appimg install --update-source <URL|github:owner/repo>` sets it at
+  install time, and the install form in the TUI has an "Update from" field
+  for it.
+- `appimg update-source <name>` shows where an installed AppImage updates
+  from, `appimg update-source <name> <URL|github:owner/repo>` sets it and
+  `--clear` makes it manual, without a reinstall.
+- When the AppStream metadata inside an AppImage links a GitHub repository,
+  an install suggests it as the update source. The TUI prefills the field
+  with it. `appimg install` asks, yes by default, takes it with `--yes` and
+  says so, and on a pipe leaves it out and names the flag that sets it.
+
+### Changed
+
+- Where an AppImage was installed from is history only. It stays in
+  `X-AppImg-Source` and shows as "Origin" in the TUI. An AppImage installed
+  from a local file no longer updates from that file, whether the file is
+  still there or not: it is updated manually until it gets an update
+  source. An entry written by 0.2.x is read as it is: one installed from a
+  URL still updates from that URL.
+- An AppImage with nothing to update from shows as `manual` instead of
+  `none`, in `list`, in the TUI, and in the output of both `--json` options.
+  `appimg update <name>` on one fails with a message that says why and
+  names `appimg update-source`. `update --all` skips it and does not count
+  it as a failure, and neither does updating everything in the TUI.
+- Update information of the form `gh-releases-zsync` that follows `latest`
+  takes the newest release with a zsync file its pattern fits, passing over
+  drafts, pre-releases and releases that ship other platforms only. It used
+  to take the latest release, which may hold nothing for Linux at all. A
+  version tag in it has always meant the latest release and does the same;
+  a tag that keeps moving, such as `continuous`, is still followed exactly.
+  A check still makes one request.
+- An update from a GitHub release picks its file by name. The parts of the
+  installed file's name that are versions are ignored, and the rest of the
+  name and the architecture have to match: `imhex-1.38.0-x86_64.AppImage`
+  finds `imhex-1.38.1-x86_64.AppImage`, and `x64`, `amd64` and `x86_64` are
+  the same architecture. When no file or more than one fits, the update
+  fails and lists the AppImages of the release, where it used to take the
+  first one that looked close.
+
 ### Fixed
 
 - A download that was cut off is no longer installed, and no longer

@@ -39,6 +39,70 @@ pub fn string_field(json: &str, key: &str) -> Option<String> {
     string_fields(json, key).into_iter().next()
 }
 
+/// The first `"key": true` or `"key": false` in the document.
+pub fn bool_field(json: &str, key: &str) -> Option<bool> {
+    let needle = format!("\"{key}\"");
+    let mut position = 0;
+
+    while let Some(found) = json[position..].find(&needle) {
+        position += found + needle.len();
+        let Some(value) = json[position..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let value = value.trim_start();
+        if value.starts_with("true") {
+            return Some(true);
+        }
+        if value.starts_with("false") {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// The objects of a top-level array, each as the part of the document it
+/// spans, so the fields of one can be read without those of the next.
+/// Brackets inside strings do not count.
+pub fn array_objects(json: &str) -> Vec<&str> {
+    let bytes = json.as_bytes();
+    let mut objects = Vec::new();
+    let Some(open) = json.find(|c: char| !c.is_whitespace()).filter(|&i| bytes[i] == b'[') else {
+        return objects;
+    };
+
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut in_string = false;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            _ if in_string => {}
+            b'{' | b'[' => {
+                if depth == 0 && bytes[i] == b'{' {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' | b']' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = start.take() {
+                        objects.push(&json[start..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    objects
+}
+
 /// Escapes a string for JSON output.
 pub fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -135,6 +199,27 @@ mod tests {
         let json = r#"{"size": 12345, "name": "real"}"#;
         assert_eq!(string_field(json, "size"), None);
         assert_eq!(string_field(json, "name").as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn reads_booleans() {
+        let json = r#"{"draft" : false, "prerelease":true, "name": "true"}"#;
+        assert_eq!(bool_field(json, "draft"), Some(false));
+        assert_eq!(bool_field(json, "prerelease"), Some(true));
+        assert_eq!(bool_field(json, "name"), None);
+        assert_eq!(bool_field(json, "missing"), None);
+    }
+
+    #[test]
+    fn splits_an_array_into_its_objects() {
+        let json = r#" [ {"a": {"b": [1, {"c": 2}]}, "s": "} ] { \" ["},
+                        {"a": 2}, {} ] "#;
+        assert_eq!(
+            array_objects(json),
+            vec![r#"{"a": {"b": [1, {"c": 2}]}, "s": "} ] { \" ["}"#, r#"{"a": 2}"#, "{}"]
+        );
+        assert!(array_objects(r#"{"not": "an array"}"#).is_empty());
+        assert!(array_objects("[]").is_empty());
     }
 
     #[test]
