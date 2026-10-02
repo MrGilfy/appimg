@@ -360,8 +360,9 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 }
                 None => {
                     status.latest_version = release.version();
+                    let recorded = recorded_tag(app, owner, repo);
                     let (installed, available, note) =
-                        compare_release(current.as_deref(), &release);
+                        compare_release(current.as_deref(), recorded.as_deref(), &release);
                     status.current_version = installed;
                     status.available = available;
                     status.note = note.or_else(|| {
@@ -378,7 +379,9 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 r.has_appimage(asset.as_deref())
             })?;
             status.latest_version = release.version();
-            let (installed, available, note) = compare_release(current.as_deref(), &release);
+            let recorded = recorded_tag(app, owner, repo);
+            let (installed, available, note) =
+                compare_release(current.as_deref(), recorded.as_deref(), &release);
             status.current_version = installed;
             status.available = available;
             status.note = note;
@@ -451,15 +454,15 @@ pub fn update(
         UpdateSource::Zsync { update_info } => {
             let url =
                 zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
-            apply_zsync(paths, app, &target, &url, source, None, progress)
+            apply_zsync(paths, app, &target, &url, source, Provenance::default(), progress)
         }
         UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
             let release =
                 release_to_follow(owner, repo, tag.as_deref(), |r| has_zsync_for(r, asset))?;
-            let recorded = release.recorded_version();
+            let from = Provenance::of(owner, repo, &release);
 
             match zsync_asset_url(&release, asset) {
-                Some(url) => apply_zsync(paths, app, &target, &url, source, recorded, progress),
+                Some(url) => apply_zsync(paths, app, &target, &url, source, from, progress),
                 // A release that ships no zsync file leaves nothing to apply
                 // a delta from, so the whole file it is.
                 None => {
@@ -468,7 +471,7 @@ pub fn update(
                     let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
                     let backup = swap_in(&staged, &target)?;
                     let path = UpdatePath::FullDownload { bytes };
-                    finish(paths, app, &target, Some(backup), source, recorded, path)
+                    finish(paths, app, &target, Some(backup), source, from, path)
                 }
             }
         }
@@ -477,17 +480,17 @@ pub fn update(
                 r.has_appimage(asset.as_deref())
             })?;
             let url = pick_appimage(&release, owner, repo, asset.as_deref())?;
-            let recorded = release.recorded_version();
+            let from = Provenance::of(owner, repo, &release);
             let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
             let backup = swap_in(&staged, &target)?;
             let path = UpdatePath::FullDownload { bytes };
-            finish(paths, app, &target, Some(backup), source, recorded, path)
+            finish(paths, app, &target, Some(backup), source, from, path)
         }
         UpdateSource::DirectUrl { url } => {
             let (staged, bytes) = download_staged(paths, &app.slug, url, progress)?;
             let backup = swap_in(&staged, &target)?;
             let path = UpdatePath::FullDownload { bytes };
-            finish(paths, app, &target, Some(backup), source, None, path)
+            finish(paths, app, &target, Some(backup), source, Provenance::default(), path)
         }
     }
 }
@@ -541,18 +544,19 @@ fn claim_zsync_backup(paths: &Paths, slug: &str) -> Option<PathBuf> {
 /// technical keys. Name, categories and launch arguments stay as they are,
 /// they may well have been edited by hand.
 ///
-/// `from_release` is the version the source knows and the file does not: a
-/// rolling build declares a build number and a commit, while the release it
-/// came out of knows the day it was published.
+/// `from` is what the GitHub release the file came out of knows and the file
+/// does not, see [`Provenance`]. An update that came out of no release
+/// leaves no release recorded either.
 fn finish(
     paths: &Paths,
     app: &InstalledApp,
     target: &Path,
     backup: Option<PathBuf>,
     source: UpdateSource,
-    from_release: Option<String>,
+    from: Provenance,
     path: UpdatePath,
 ) -> Result<UpdateOutcome> {
+    let from_release = from.version;
     let info = metadata::inspect(target, None).ok();
 
     let icons = match info.as_ref().and_then(|info| info.extract_root().map(Path::to_path_buf)) {
@@ -585,6 +589,7 @@ fn finish(
     if !icons.is_empty() {
         entry.set("Icon", app.slug.clone());
     }
+    entry.set_optional(desktop_entry::KEY_RELEASE, from.release);
     entry.write(&app.desktop_entry_path)?;
 
     caches::refresh(paths);
@@ -1158,13 +1163,39 @@ fn parse_release(body: &str) -> Release {
 /// the same commit is the same build, and a different one supersedes it. An
 /// installed file that already carries a date is compared as a date, which
 /// orders, so it says whether the file is the older one and not merely a
-/// different one. Anything that names a version is compared exactly as it
-/// was before.
+/// different one.
+///
+/// A cut release is compared by its tag when the tag the installed file came
+/// out of is `recorded`: the version a file declares need not be spelled
+/// the way a version is read out of its release tag: osu! calls itself
+/// `2026.921.0-lazer`, and so is its tag, yet the version that tag names is
+/// `2026.921.0`. Without a recorded tag, from a file or from
+/// 0.2.x, versions are compared, and two that differ only in a trailing
+/// label count as the same, see [`version::same_but_label`].
 fn compare_release(
     current: Option<&str>,
+    recorded: Option<&str>,
     release: &Release,
 ) -> (Option<String>, bool, Option<String>) {
     let latest = release.version();
+
+    if let (Some(recorded), Some(offered), false) =
+        (recorded, release.tag.as_deref(), release.is_rolling())
+    {
+        let installed = current.map(str::to_string).or_else(|| version::extract(recorded));
+        if same_tag(recorded, offered) {
+            return (installed, false, None);
+        }
+        // Another tag is another release, though not a newer one when the
+        // installed file came out of a later one, a pre-release perhaps.
+        let older = match (version::extract(recorded), latest.as_deref()) {
+            (Some(recorded), Some(latest)) if version::comparable(&recorded, latest) => {
+                !version::is_newer(latest, &recorded)
+            }
+            _ => false,
+        };
+        return (installed, !older, None);
+    }
 
     if release.is_rolling() {
         let installed = current.and_then(version::short_commit);
@@ -1179,9 +1210,11 @@ fn compare_release(
     }
 
     match (current, latest.as_deref()) {
-        (Some(current), Some(latest)) if version::comparable(current, latest) => {
-            (Some(current.to_string()), version::is_newer(latest, current), None)
-        }
+        (Some(current), Some(latest)) if version::comparable(current, latest) => (
+            Some(current.to_string()),
+            version::is_newer(latest, current) && !version::same_but_label(latest, current),
+            None,
+        ),
         (Some(current), Some(_)) => (
             Some(current.to_string()),
             false,
@@ -1192,6 +1225,67 @@ fn compare_release(
         ),
         (None, Some(_)) => (None, true, None),
         (current, None) => (current.map(str::to_string), false, None),
+    }
+}
+
+/// Whether two tags name the same release. `v2.0.0` and `2.0.0` do: a tag
+/// recorded from a download URL and one out of the API can differ in that
+/// alone.
+fn same_tag(a: &str, b: &str) -> bool {
+    fn without_v(tag: &str) -> &str {
+        tag.strip_prefix(['v', 'V'])
+            .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            .unwrap_or(tag)
+    }
+    without_v(a.trim()) == without_v(b.trim())
+}
+
+/// The tag `X-AppImg-Release` records for this repository, if it records
+/// one. A release of another repository says nothing about this one.
+fn recorded_tag(app: &InstalledApp, owner: &str, repo: &str) -> Option<String> {
+    let (recorded_owner, recorded_repo, tag) =
+        github_spec(app.release.as_deref()?.strip_prefix("github:")?)?;
+    (recorded_owner.eq_ignore_ascii_case(owner) && recorded_repo.eq_ignore_ascii_case(repo))
+        .then_some(tag)
+        .flatten()
+}
+
+/// `github:owner/repo@tag` for a file downloaded out of a GitHub release,
+/// by its download URL, for [`desktop_entry::KEY_RELEASE`].
+pub fn release_of_download(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))?;
+    let path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let parts: Vec<&str> = path.split('/').collect();
+    let [owner, repo, "releases", "download", tag, asset] = parts.as_slice() else {
+        return None;
+    };
+    if asset.is_empty() {
+        return None;
+    }
+    let (owner, repo, tag) = github_spec(&format!("{owner}/{repo}@{tag}"))?;
+    Some(github_setting(&owner, &repo, tag.as_deref()))
+}
+
+/// What an update knows from the GitHub release it came out of, and the
+/// file it installs does not.
+#[derive(Debug, Default)]
+struct Provenance {
+    /// The version to record when the file carries none worth keeping: a
+    /// rolling build declares a build number and a commit, while the
+    /// release knows the day it was published.
+    version: Option<String>,
+    /// `github:owner/repo@tag`, for [`desktop_entry::KEY_RELEASE`].
+    release: Option<String>,
+}
+
+impl Provenance {
+    fn of(owner: &str, repo: &str, release: &Release) -> Self {
+        Self {
+            version: release.recorded_version(),
+            release: release.tag.as_deref().map(|tag| github_setting(owner, repo, Some(tag))),
+        }
     }
 }
 
@@ -1255,14 +1349,14 @@ fn apply_zsync(
     target: &Path,
     zsync_url: &str,
     source: UpdateSource,
-    from_release: Option<String>,
+    from: Provenance,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<UpdateOutcome> {
     match apply_delta(paths, &app.slug, zsync_url, target, progress) {
         Ok((staged, applied)) => {
             let backup = swap_in(&staged, target)?;
             let path = UpdatePath::from(applied);
-            finish(paths, app, target, Some(backup), source, from_release, path)
+            finish(paths, app, target, Some(backup), source, from, path)
         }
         Err(native) => {
             if let Err(tool) = zsync_update(target) {
@@ -1272,7 +1366,7 @@ fn apply_zsync(
             }
             let backup = claim_zsync_backup(paths, &app.slug);
             let path = UpdatePath::ExternalTool { reason: native.to_string() };
-            finish(paths, app, target, backup, source, from_release, path)
+            finish(paths, app, target, backup, source, from, path)
         }
     }
 }
@@ -1966,7 +2060,7 @@ mod tests {
         assert_eq!(release.published.as_deref(), Some("2025-10-01"));
         // So the installed 1.13.7 is up to date.
         assert_eq!(
-            compare_release(Some("1.13.7"), &release),
+            compare_release(Some("1.13.7"), None, &release),
             (Some("1.13.7".to_string()), false, None)
         );
         assert_eq!(
@@ -1977,7 +2071,7 @@ mod tests {
         // An older installation finds the same release, and an update in it.
         let release = followed(releases, Some("Obsidian-1.13.6.AppImage")).unwrap();
         assert_eq!(release.tag.as_deref(), Some("v1.13.7"));
-        assert!(compare_release(Some("1.13.6"), &release).1);
+        assert!(compare_release(Some("1.13.6"), None, &release).1);
 
         // Without a hint, the newest release built for this machine.
         let release = followed(releases, None).unwrap();
@@ -2089,6 +2183,117 @@ mod tests {
         assert!(followed(&[], None).is_none());
     }
 
+    /// osu! as it is installed through `github:ppy/osu`: the file calls
+    /// itself `2026.921.0-lazer`, and so is the release it came out of
+    /// tagged, but the version read out of that tag is `2026.921.0`.
+    fn osu(recorded: Option<&str>) -> InstalledApp {
+        InstalledApp {
+            version: Some("2026.921.0-lazer".to_string()),
+            release: recorded.map(str::to_string),
+            ..installed(None, Some("github:ppy/osu"), Some("/home/me/Downloads/osu.AppImage"))
+        }
+    }
+
+    fn osu_release(tag: &str) -> Release {
+        release_with(tag, &["osu.AppImage", "osu.AppImage.zsync"])
+    }
+
+    fn compared(app: &InstalledApp, release: &Release) -> (Option<String>, bool, Option<String>) {
+        let recorded = recorded_tag(app, "ppy", "osu");
+        compare_release(app.version.as_deref(), recorded.as_deref(), release)
+    }
+
+    #[test]
+    fn osu_is_up_to_date_once_the_tag_it_came_out_of_is_recorded() {
+        // What the check said right after an update: an update to the very
+        // release just installed, forever.
+        let release = osu_release("2026.921.0-lazer");
+        assert_eq!(release.version().as_deref(), Some("2026.921.0"));
+        let app = osu(Some("github:ppy/osu@2026.921.0-lazer"));
+        assert_eq!(compared(&app, &release), (Some("2026.921.0-lazer".to_string()), false, None));
+        // The next release is one.
+        let (current, available, _) = compared(&app, &osu_release("2026.1002.0-lazer"));
+        assert_eq!(current.as_deref(), Some("2026.921.0-lazer"));
+        assert!(available);
+
+        // A release recorded for another repository says nothing about this
+        // one, and the versions decide.
+        let elsewhere = osu(Some("github:someone/osu-fork@2026.1002.0-lazer"));
+        assert_eq!(recorded_tag(&elsewhere, "ppy", "osu"), None);
+        assert!(compared(&elsewhere, &osu_release("2026.1002.0-lazer")).1);
+    }
+
+    #[test]
+    fn without_a_recorded_tag_a_trailing_label_is_no_difference() {
+        // Installed from a file, or by 0.2.x: no tag to go on, so the
+        // versions are compared, `-lazer` and all.
+        // This is the check that said "update available" forever.
+        let app = osu(None);
+        assert_eq!(
+            compared(&app, &osu_release("2026.921.0-lazer")),
+            (Some("2026.921.0-lazer".to_string()), false, None)
+        );
+        // However the release happens to be tagged.
+        assert!(!compared(&app, &osu_release("2026.921.0")).1);
+        assert!(compared(&app, &osu_release("2026.1002.0-lazer")).1);
+        assert!(!compared(&app, &osu_release("2026.920.0-lazer")).1);
+        // A pre-release is still older than the release it leads up to.
+        let (_, available, _) = compare_release(Some("1.2.0-beta"), None, &osu_release("v1.2.0"));
+        assert!(available);
+    }
+
+    #[test]
+    fn a_tag_that_differs_only_by_a_leading_v_is_the_same_release() {
+        let tagged = |recorded: &str, offered: &str| {
+            let app = InstalledApp {
+                version: Some("1.2.0".to_string()),
+                release: Some(format!("github:ppy/osu@{recorded}")),
+                ..osu(None)
+            };
+            compared(&app, &osu_release(offered)).1
+        };
+        assert!(!tagged("v1.2.0", "1.2.0"));
+        assert!(!tagged("1.2.0", "v1.2.0"));
+        assert!(!tagged("V1.2.0", "v1.2.0"));
+        assert!(tagged("v1.2.0", "v1.2.1"));
+        // A tag that merely starts with a v is not a version with one.
+        assert!(tagged("vintage", "intage"));
+        // Another tag is no update when the installed file came out of a
+        // later release, a pre-release for instance.
+        assert!(!tagged("v2.0.0-beta.1", "v1.9.0"));
+    }
+
+    #[test]
+    fn the_release_a_file_came_out_of_is_recorded_as_one_source() {
+        assert_eq!(
+            release_of_download(
+                "https://github.com/ppy/osu/releases/download/2026.921.0-lazer/osu.AppImage"
+            )
+            .as_deref(),
+            Some("github:ppy/osu@2026.921.0-lazer")
+        );
+        assert_eq!(
+            release_of_download("https://github.com/o/r/releases/download/v1/App.AppImage?x=1")
+                .as_deref(),
+            Some("github:o/r@v1")
+        );
+        for url in [
+            "https://example.com/o/r/releases/download/v1/App.AppImage",
+            "https://github.com/o/r/releases/download/v1/",
+            "https://github.com/o/r/releases/tag/v1",
+            "https://github.com/o/r",
+        ] {
+            assert_eq!(release_of_download(url), None, "{url}");
+        }
+
+        let from = Provenance::of("ppy", "osu", &osu_release("2026.921.0-lazer"));
+        assert_eq!(from.release.as_deref(), Some("github:ppy/osu@2026.921.0-lazer"));
+        assert_eq!(
+            Provenance::of("ppy", "osu", &Release { tag: None, ..osu_release("x") }).release,
+            None
+        );
+    }
+
     #[test]
     fn update_sources_are_checked_and_stored_in_one_spelling() {
         for (given, stored) in [
@@ -2151,6 +2356,7 @@ mod tests {
             origin: origin.map(str::to_string),
             update_info: update_info.map(str::to_string),
             update_source: update_source.map(str::to_string),
+            release: None,
             installed_at: None,
             appimage_path: PathBuf::from("/nowhere/app.AppImage"),
             desktop_entry_path: PathBuf::from("/nowhere/app.desktop"),
@@ -2281,7 +2487,7 @@ mod tests {
         // day the release was published.
         for installed in ["255-a211784", "254-a211784", "a211784"] {
             let (current, available, note) =
-                compare_release(Some(installed), &continuous_release());
+                compare_release(Some(installed), None, &continuous_release());
             assert_eq!(current.as_deref(), Some("2025-10-18"), "{installed}");
             assert!(!available, "{installed}");
             assert_eq!(note, None);
@@ -2290,7 +2496,8 @@ mod tests {
 
     #[test]
     fn another_commit_on_the_channel_is_an_update() {
-        let (current, available, _) = compare_release(Some("255-b0b0b0b"), &continuous_release());
+        let (current, available, _) =
+            compare_release(Some("255-b0b0b0b"), None, &continuous_release());
         assert_eq!(current.as_deref(), Some("b0b0b0b"));
         assert!(available);
     }
@@ -2299,16 +2506,17 @@ mod tests {
     fn two_dates_say_which_build_is_older() {
         // What the file was recorded as after its last update, against what
         // the channel offers now.
-        let (current, available, note) = compare_release(Some("2025-09-01"), &continuous_release());
+        let (current, available, note) =
+            compare_release(Some("2025-09-01"), None, &continuous_release());
         assert_eq!(current.as_deref(), Some("2025-09-01"));
         assert!(available, "an older date is an update");
         assert_eq!(note, None);
 
         let newer = Release { published: Some("2025-09-01".to_string()), ..continuous_release() };
-        let (_, available, _) = compare_release(Some("2025-10-18"), &newer);
+        let (_, available, _) = compare_release(Some("2025-10-18"), None, &newer);
         assert!(!available, "a newer date is not an update");
 
-        let (_, available, _) = compare_release(Some("2025-10-18"), &continuous_release());
+        let (_, available, _) = compare_release(Some("2025-10-18"), None, &continuous_release());
         assert!(!available, "the same date is not an update");
     }
 
@@ -2320,16 +2528,16 @@ mod tests {
             published: Some("2025-10-18".to_string()),
             commit: Some("a211784".to_string()),
         };
-        let (current, available, note) = compare_release(Some("1.9.0"), &release);
+        let (current, available, note) = compare_release(Some("1.9.0"), None, &release);
         assert_eq!(current.as_deref(), Some("1.9.0"));
         assert!(available);
         assert_eq!(note, None);
 
-        let (_, available, _) = compare_release(Some("2.0.0"), &release);
+        let (_, available, _) = compare_release(Some("2.0.0"), None, &release);
         assert!(!available);
 
         // Nothing installed is an update, as it always was.
-        assert!(compare_release(None, &release).1);
+        assert!(compare_release(None, None, &release).1);
     }
 
     #[test]
@@ -2343,7 +2551,7 @@ mod tests {
             published: Some("2025-10-18".to_string()),
             commit: None,
         };
-        let (current, available, note) = compare_release(Some("a211784"), &release);
+        let (current, available, note) = compare_release(Some("a211784"), None, &release);
         assert_eq!(current.as_deref(), Some("a211784"));
         assert!(!available);
         assert!(note.unwrap().contains("no version"));

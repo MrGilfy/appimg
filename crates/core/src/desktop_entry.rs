@@ -16,6 +16,11 @@ pub const KEY_UPDATE_INFO: &str = "X-AppImg-UpdateInfo";
 /// a URL, `github:owner/repo[@tag]`, or `manual`. Entries written by 0.2.x
 /// do not have it.
 pub const KEY_UPDATE_SOURCE: &str = "X-AppImg-UpdateSource";
+/// The GitHub release the installed file came out of, as
+/// `github:owner/repo@tag`, written by an install or an update from one. A
+/// check compares its tag with the tag of the release it would follow: the
+/// version a file declares need not be the one read out of its release tag.
+pub const KEY_RELEASE: &str = "X-AppImg-Release";
 pub const KEY_INSTALLED_AT: &str = "X-AppImg-InstalledAt";
 
 /// The freedesktop main categories. A desktop entry needs at least one of

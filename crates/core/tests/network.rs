@@ -10,7 +10,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use appimg_core::desktop_entry::{DesktopEntry, KEY_UPDATE_INFO};
+use appimg_core::desktop_entry::{DesktopEntry, KEY_RELEASE, KEY_UPDATE_INFO};
 use appimg_core::install::InstallRequest;
 use appimg_core::list::InstalledApp;
 use appimg_core::{download, install, list, metadata, update, zsync};
@@ -624,9 +624,17 @@ fn an_update_keeps_manual_edits() {
         .build(&sandbox.root, "build2.AppImage");
     server.serve(std::fs::read(&newer).unwrap());
 
+    // A release recorded from before goes once an update comes from
+    // somewhere else: it no longer says what the file is.
+    let entry_path = sandbox.paths.desktop_entry_path("my-renamed-app");
+    let mut entry = DesktopEntry::read(&entry_path).unwrap();
+    entry.set(KEY_RELEASE, "github:someone/else@v1.0.0");
+    entry.write(&entry_path).unwrap();
+
     let result =
         with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &app, None)).unwrap();
     assert!(read(&result.appimage_path).contains("v2"));
+    assert_eq!(DesktopEntry::read(&entry_path).unwrap().get(KEY_RELEASE), None);
     let backup = result.backup_path.clone().unwrap();
     assert!(backup.is_file());
     assert!(read(&backup).contains("v1"));

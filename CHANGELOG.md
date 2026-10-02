@@ -29,6 +29,15 @@ project adheres to [Semantic Versioning](https://semver.org/).
   an install suggests it as the update source. The TUI prefills the field
   with it. `appimg install` asks, yes by default, takes it with `--yes` and
   says so, and on a pipe leaves it out and names the flag that sets it.
+- With `GH_TOKEN` or `GITHUB_TOKEN` set, appimg sends the token to the
+  GitHub API, which then allows 5000 requests an hour instead of 60. It goes
+  to `api.github.com` over https and nowhere else: never with a download,
+  never to another host, and never along a redirect. `GH_TOKEN` comes first,
+  as with `gh`, and a token GitHub refuses is an error that names the
+  variable it came from.
+- A static aarch64 binary is released next to the x86_64 one, as
+  `appimg-<version>-aarch64-linux-musl.tar.gz`, and `appimg-bin` on the AUR
+  installs on aarch64 too.
 
 ### Changed
 
@@ -60,6 +69,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- An AppImage that names its version differently from the version read
+  out of its release tag no longer shows an update forever. osu! calls
+  itself `2026.921.0-lazer` in the release of that tag, and the check
+  offered `2026.921.0` as newer right after updating to it. An install or
+  an update out of a GitHub release now records that release in the
+  desktop entry as `X-AppImg-Release=github:owner/repo@tag`, and a check
+  compares that tag with the tag of the release it would follow; a leading
+  `v` makes no difference. Without a recorded tag, for an AppImage
+  installed from a file or by 0.2.x, the versions are compared as before,
+  except that two whose numbers are the same and that differ only in a
+  trailing label without digits count as the same. A pre-release marker
+  such as `-beta` is not such a label. The first update records the tag.
 - A download that was cut off is no longer installed, and no longer
   replaces the installed version in an update. A server that sends neither
   a Content-Length nor a chunked body and hangs up early leaves a file that

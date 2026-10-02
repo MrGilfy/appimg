@@ -30,6 +30,9 @@ pub struct InstalledApp {
     /// `X-AppImg-UpdateSource` as the entry holds it. `None` for an entry
     /// written by 0.2.x.
     pub update_source: Option<String>,
+    /// `X-AppImg-Release`: the GitHub release the installed file came out
+    /// of, when it came out of one.
+    pub release: Option<String>,
     pub installed_at: Option<String>,
     pub appimage_path: PathBuf,
     pub desktop_entry_path: PathBuf,
@@ -123,6 +126,7 @@ fn build_app(paths: &Paths, entry: &DesktopEntry, desktop_entry_path: PathBuf) -
         origin: entry.get(desktop_entry::KEY_ORIGIN).map(str::to_string),
         update_info: entry.get(desktop_entry::KEY_UPDATE_INFO).map(str::to_string),
         update_source: entry.get(desktop_entry::KEY_UPDATE_SOURCE).map(str::to_string),
+        release: entry.get(desktop_entry::KEY_RELEASE).map(str::to_string),
         installed_at: entry.get(desktop_entry::KEY_INSTALLED_AT).map(str::to_string),
         size_bytes: fs_util::file_size(&appimage_path),
         appimage_path,

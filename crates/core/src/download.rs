@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
+use ureq::config::RedirectAuthHeaders;
 use ureq::ResponseExt;
 
 use crate::elf;
@@ -313,20 +314,77 @@ fn first_byte_of_content_range(value: &str) -> Option<u64> {
     first.trim().parse().ok()
 }
 
-/// Fetches a URL as text, used for the GitHub release API.
+/// Fetches a URL as text, used for the GitHub release API. A GitHub token
+/// in the environment goes along, to api.github.com and nowhere else, see
+/// [`Credentials`].
 pub fn to_string(url: &str) -> Result<String> {
-    let response = agent()
+    fetch_text(url, Credentials::from_env().as_ref())
+}
+
+fn fetch_text(url: &str, credentials: Option<&Credentials>) -> Result<String> {
+    let mut request = agent()
         .get(url)
         .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/vnd.github+json")
-        .call();
+        .header("Accept", "application/vnd.github+json");
+    let credentials = credentials.filter(|credentials| credentials.belongs_to(url));
+    if let Some(credentials) = credentials {
+        request = request.header("Authorization", format!("Bearer {}", credentials.token));
+    }
 
-    match response {
+    match request.call() {
         Ok(response) => {
             response.into_body().read_to_string().map_err(|e| Error::Network(format!("{url}: {e}")))
         }
+        Err(ureq::Error::StatusCode(401)) if credentials.is_some() => Err(Error::Network(format!(
+            "{url}: GitHub refused the token in {}",
+            credentials.map_or("", |credentials| credentials.variable)
+        ))),
         Err(ureq::Error::StatusCode(403 | 429)) => Err(Error::RateLimited),
         Err(e) => Err(Error::Network(format!("{url}: {e}"))),
+    }
+}
+
+/// A GitHub token, and the one origin it is ever sent to. Only the request
+/// for API text carries it: a download never does, and nor does a redirect,
+/// see [`agent`].
+struct Credentials {
+    scheme: &'static str,
+    authority: String,
+    token: String,
+    /// The environment variable the token came from, for an error to name.
+    variable: &'static str,
+}
+
+impl Credentials {
+    /// `GH_TOKEN`, then `GITHUB_TOKEN`, the order `gh` reads them in, for
+    /// api.github.com. With a token, the API allows 5000 requests an hour
+    /// instead of 60.
+    fn from_env() -> Option<Self> {
+        Self::github(std::env::var("GH_TOKEN").ok(), std::env::var("GITHUB_TOKEN").ok())
+    }
+
+    fn github(gh_token: Option<String>, github_token: Option<String>) -> Option<Self> {
+        [("GH_TOKEN", gh_token), ("GITHUB_TOKEN", github_token)].into_iter().find_map(
+            |(variable, token)| {
+                let token = token?.trim().to_string();
+                (!token.is_empty()).then(|| Self {
+                    scheme: "https",
+                    authority: "api.github.com".to_string(),
+                    token,
+                    variable,
+                })
+            },
+        )
+    }
+
+    /// Whether `url` is on the origin the token belongs to: the same scheme
+    /// and exactly the same host and port, with no user name in front.
+    fn belongs_to(&self, url: &str) -> bool {
+        let Ok(uri) = url.parse::<ureq::http::Uri>() else {
+            return false;
+        };
+        uri.scheme_str() == Some(self.scheme)
+            && uri.authority().map(|authority| authority.as_str()) == Some(self.authority.as_str())
     }
 }
 
@@ -334,6 +392,9 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(READ_TIMEOUT))
+        // ureq's default, written down because a token depends on it: an
+        // `Authorization` header never follows a redirect, wherever it goes.
+        .redirect_auth_headers(RedirectAuthHeaders::Never)
         .build()
         .into()
 }
@@ -367,6 +428,134 @@ mod tests {
         assert!(is_url("http://example.com/a.AppImage"));
         assert!(!is_url("/home/u/a.AppImage"));
         assert!(!is_url("./a.AppImage"));
+    }
+
+    #[test]
+    fn a_token_belongs_to_api_github_com_and_nowhere_else() {
+        let credentials = Credentials::github(None, Some("secret".to_string())).unwrap();
+        assert!(credentials.belongs_to("https://api.github.com/repos/o/r/releases?per_page=30"));
+        for url in [
+            "http://api.github.com/repos/o/r/releases",
+            "https://api.github.com:8443/repos/o/r/releases",
+            "https://api.github.com.example.org/repos/o/r/releases",
+            "https://user@api.github.com/repos/o/r/releases",
+            "https://example.org/https://api.github.com/repos",
+            "https://github.com/o/r/releases/download/v1/App-1-x86_64.AppImage",
+            "https://objects.githubusercontent.com/github-production-release-asset/1/2",
+            "not a url",
+        ] {
+            assert!(!credentials.belongs_to(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn the_token_comes_from_gh_token_then_github_token() {
+        let token = |gh: Option<&str>, github: Option<&str>| {
+            Credentials::github(gh.map(str::to_string), github.map(str::to_string))
+                .map(|credentials| (credentials.variable, credentials.token))
+        };
+        assert_eq!(token(Some("a"), Some("b")), Some(("GH_TOKEN", "a".to_string())));
+        assert_eq!(token(None, Some(" b\n")), Some(("GITHUB_TOKEN", "b".to_string())));
+        assert_eq!(token(Some("  "), Some("b")), Some(("GITHUB_TOKEN", "b".to_string())));
+        assert_eq!(token(Some(""), None), None);
+        assert_eq!(token(None, None), None);
+    }
+
+    /// The path of a request, and the `Authorization` header it came with.
+    type Seen = (String, Option<String>);
+
+    /// A server that answers every request with `answer(path)`, and keeps
+    /// what each request came with.
+    struct Recorder {
+        base: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Seen>>>,
+    }
+
+    impl Recorder {
+        fn start(
+            answer: impl Fn(&str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> + Send + 'static,
+        ) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", server.server_addr().to_ip().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = std::sync::Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    let authorization = request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Authorization"))
+                        .map(|header| header.value.as_str().to_string());
+                    let path = request.url().to_string();
+                    recorded.lock().unwrap().push((path.clone(), authorization));
+                    let _ = request.respond(answer(&path));
+                }
+            });
+            Self { base, seen }
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[test]
+    fn the_token_goes_to_the_api_host_and_never_to_a_download_host() {
+        let download = Recorder::start(|_| tiny_http::Response::from_string("the file"));
+        let target = format!("{}/file", download.base);
+        let api = Recorder::start(move |path| {
+            if path == "/moved" {
+                // What an API answer pointing at a download looks like.
+                let location = tiny_http::Header::from_bytes(&b"Location"[..], target.as_bytes());
+                tiny_http::Response::from_string("")
+                    .with_status_code(302)
+                    .with_header(location.unwrap())
+            } else {
+                tiny_http::Response::from_string("[]")
+            }
+        });
+        // The local server stands in for api.github.com, nothing else changes.
+        let authority = api.base.trim_start_matches("http://").to_string();
+        let credentials = Credentials {
+            scheme: "http",
+            authority: authority.clone(),
+            token: "secret".to_string(),
+            variable: "GITHUB_TOKEN",
+        };
+
+        assert_eq!(fetch_text(&format!("{}/repos", api.base), Some(&credentials)).unwrap(), "[]");
+        assert_eq!(
+            fetch_text(&format!("{}/file", download.base), Some(&credentials)).unwrap(),
+            "the file"
+        );
+        // A redirect that leaves the API host leaves the token behind.
+        assert_eq!(
+            fetch_text(&format!("{}/moved", api.base), Some(&credentials)).unwrap(),
+            "the file"
+        );
+        // The same server under another name is another host.
+        let port = authority.rsplit(':').next().unwrap();
+        fetch_text(&format!("http://localhost:{port}/other"), Some(&credentials)).unwrap();
+
+        let bearer = Some("Bearer secret".to_string());
+        assert_eq!(
+            api.seen(),
+            vec![
+                ("/repos".to_string(), bearer.clone()),
+                ("/moved".to_string(), bearer),
+                ("/other".to_string(), None),
+            ]
+        );
+        assert_eq!(download.seen(), vec![("/file".to_string(), None), ("/file".to_string(), None)]);
+
+        // A download is never given the token in the first place.
+        to_file(
+            &format!("{}/file", download.base),
+            &tempfile::tempdir().unwrap().path().join("f"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(download.seen().last(), Some(&("/file".to_string(), None)));
     }
 
     #[test]

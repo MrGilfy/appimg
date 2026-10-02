@@ -50,6 +50,9 @@ pub struct InstallRequest {
     /// information, as [`update::parse_update_source`] returns it. `None`
     /// updates manually.
     pub update_source: Option<String>,
+    /// The GitHub release the file came out of, as `github:owner/repo@tag`,
+    /// when it was downloaded from one.
+    pub release: Option<String>,
     /// Replace an existing installation with the same slug.
     pub overwrite: bool,
 }
@@ -80,6 +83,7 @@ impl InstallRequest {
             update_source: download::is_url(origin)
                 .then(|| update::parse_update_source(origin).ok())
                 .flatten(),
+            release: update::release_of_download(origin),
             overwrite: false,
         }
     }
@@ -258,6 +262,7 @@ fn build_entry(
         desktop_entry::KEY_UPDATE_SOURCE,
         request.update_source.clone().unwrap_or_else(|| update::MANUAL.to_string()),
     );
+    entry.set_optional(desktop_entry::KEY_RELEASE, request.release.clone());
     entry.set(desktop_entry::KEY_INSTALLED_AT, timestamp());
     entry
 }
@@ -293,6 +298,7 @@ mod tests {
             version: Some("1.2.3".to_string()),
             update_info: None,
             update_source: None,
+            release: None,
             overwrite: false,
         }
     }

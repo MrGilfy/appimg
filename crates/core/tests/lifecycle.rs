@@ -487,6 +487,27 @@ fn an_update_source_given_at_install_is_written_and_followed() {
 }
 
 #[test]
+fn an_install_out_of_a_github_release_records_the_release() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source = FakeAppImage::new("osu!").build(&sandbox.downloads, "osu.AppImage");
+    let info = metadata::inspect(&source, None).unwrap();
+    let url = "https://github.com/ppy/osu/releases/download/2026.921.0-lazer/osu.AppImage";
+    let outcome =
+        install::install(&sandbox.paths, &InstallRequest::from_info(&source, url, &info)).unwrap();
+
+    let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(entry.get(desktop_entry::KEY_RELEASE), Some("github:ppy/osu@2026.921.0-lazer"));
+    let app = list::find(&sandbox.paths, &outcome.slug).unwrap();
+    assert_eq!(app.release.as_deref(), Some("github:ppy/osu@2026.921.0-lazer"));
+
+    // A file from anywhere else came out of no release.
+    let outcome = install_fake(&sandbox, "Fake_App-1.0.0.AppImage");
+    let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
+    assert_eq!(entry.get(desktop_entry::KEY_RELEASE), None);
+}
+
+#[test]
 fn setting_the_update_source_changes_that_line_and_nothing_else() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();

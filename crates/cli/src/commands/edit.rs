@@ -21,6 +21,7 @@ const MANAGED_KEYS: &[&str] = &[
     desktop_entry::KEY_VERSION,
     desktop_entry::KEY_UPDATE_INFO,
     desktop_entry::KEY_UPDATE_SOURCE,
+    desktop_entry::KEY_RELEASE,
     desktop_entry::KEY_INSTALLED_AT,
 ];
 

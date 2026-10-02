@@ -71,6 +71,12 @@ The file to download is the one whose name matches the installed file,
 versions aside. When the AppStream metadata inside an AppImage links a
 GitHub repository, the install suggests it as the update source.
 
+GitHub's API answers 60 requests an hour without a token, which checking a
+few applications more than once can use up. With `GH_TOKEN` or `GITHUB_TOKEN`
+set, appimg sends it as a bearer token to `api.github.com` over https, and to
+no other host: never with a download, and never along a redirect, wherever it
+leads. `GH_TOKEN` comes first, as with `gh`.
+
 ## Where things go
 
     $XDG_DATA_HOME/appimages/<name>.AppImage      the binary

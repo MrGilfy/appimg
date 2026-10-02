@@ -39,6 +39,56 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     compare(candidate, current) == Ordering::Greater
 }
 
+/// Whether two versions name the same numbers and differ only in a
+/// trailing label that carries none: `2026.921.0-lazer` and `2026.921.0`
+/// are one release, spelled by the file and by the tag. A leading `v` and
+/// trailing zeros are no difference either, as in [`compare`]. A pre-release
+/// marker is no such label, `1.2.0-beta` is not `1.2.0`.
+pub fn same_but_label(a: &str, b: &str) -> bool {
+    let (numbers, label) = numbers_and_label(a);
+    let (other_numbers, other_label) = numbers_and_label(b);
+    !numbers.is_empty()
+        && numbers == other_numbers
+        && label != other_label
+        && is_plain_label(label)
+        && is_plain_label(other_label)
+}
+
+/// The dotted numbers a version starts with, and whatever follows them.
+fn numbers_and_label(version: &str) -> (Vec<u64>, &str) {
+    let version = version.trim();
+    let mut rest = version
+        .strip_prefix(['v', 'V'])
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(version);
+    let mut numbers = Vec::new();
+    loop {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 {
+            break;
+        }
+        numbers.push(rest[..digits].parse().unwrap_or(u64::MAX));
+        rest = &rest[digits..];
+        match rest.strip_prefix('.') {
+            Some(after) if after.starts_with(|c: char| c.is_ascii_digit()) => rest = after,
+            _ => break,
+        }
+    }
+    while numbers.len() > 1 && numbers.last() == Some(&0) {
+        numbers.pop();
+    }
+    (numbers, rest)
+}
+
+/// Pre-release markers, which a label that is only a name must not carry.
+const PRERELEASE_WORDS: &[&str] = &["alpha", "beta", "rc", "pre", "preview"];
+
+fn is_plain_label(label: &str) -> bool {
+    !label.bytes().any(|b| b.is_ascii_digit())
+        && !tokens(label)
+            .any(|token| PRERELEASE_WORDS.iter().any(|w| token.eq_ignore_ascii_case(w)))
+}
+
 /// Words a project uses for a release that keeps moving instead of one that
 /// was cut once. A tag out of this list is a pointer, not a version.
 const ROLLING_WORDS: &[&str] = &[
@@ -218,6 +268,24 @@ fn segments(version: &str) -> Vec<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trailing_label_without_digits_is_the_same_version() {
+        assert!(same_but_label("2026.921.0-lazer", "2026.921.0"));
+        assert!(same_but_label("2026.921.0", "2026.921.0-lazer"));
+        assert!(same_but_label("v1.2.0", "1.2.0_linux"));
+        assert!(same_but_label("1.2.0-linux", "1.2.0-lazer"));
+
+        assert!(!same_but_label("2026.921.1-lazer", "2026.921.0"));
+        assert!(same_but_label("1.2-lazer", "1.2.0"));
+        assert!(!same_but_label("1.2-lazer", "1.2.1"));
+        assert!(!same_but_label("1.2.0", "1.2.0"));
+        // A label with digits, or a pre-release marker, is more than a name.
+        assert!(!same_but_label("1.2.0-r2", "1.2.0"));
+        assert!(!same_but_label("1.2.0-beta", "1.2.0"));
+        assert!(!same_but_label("1.2.0-RC", "1.2.0"));
+        assert!(!same_but_label("lazer", "osu"));
+    }
 
     #[test]
     fn orders_numeric_versions() {
