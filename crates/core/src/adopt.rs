@@ -769,6 +769,7 @@ mod tests {
             applications_dir: root.join("applications"),
             icons_root: root.join("icons"),
             config_home: root.join("config"),
+            state_home: root.join("state"),
             data_home: root.to_path_buf(),
         };
         paths.ensure_dirs().unwrap();

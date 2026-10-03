@@ -11,13 +11,13 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use appimg_core::desktop_entry::{DesktopEntry, KEY_RELEASE, KEY_UPDATE_INFO};
+use appimg_core::desktop_entry::{DesktopEntry, KEY_RELEASE, KEY_SHA1, KEY_UPDATE_INFO};
 use appimg_core::digest::Verified;
 use appimg_core::install::InstallRequest;
 use appimg_core::list::InstalledApp;
 use appimg_core::{download, install, list, metadata, update, zsync};
 
-use common::{read, walk, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
+use common::{assert_stamped, read, walk, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
 
 /// The path a request was made to, and the `Range` header it carried.
 type Asked = (String, Option<String>);
@@ -795,7 +795,8 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
     assert_eq!(status.note, None);
     assert_eq!(status.latest_version.as_deref(), Some("1.0.0"));
     assert_eq!(status.current_version.as_deref(), Some("1.0.0"));
-    // A check reads, it never writes.
+    // A check reads, it never writes: the install stored the checksum it
+    // compares, for the file as it still is.
     assert_eq!(walk(&sandbox.paths.data_home), before);
 
     // A bigger file is an update, and the sizes are reported as they are.
@@ -819,6 +820,66 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
     let served = server.served();
     assert_eq!(served.len(), 3);
     assert!(served.iter().all(|bytes| *bytes <= 8 * 1024), "{served:?}");
+}
+
+/// The checksum of the installed file comes out of its entry for as long as
+/// the file has the size and time it had when it was hashed, so a check of
+/// a file that did not change reads nothing of it. A file that changed, and
+/// an entry without a checksum, are read once and the result is stored.
+#[test]
+fn a_zsync_check_reads_the_installed_file_only_when_it_changed() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
+    let info = metadata::inspect(&source, None).unwrap();
+    let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
+    let installed = install::install(&sandbox.paths, &request).unwrap();
+    let (file, entry_path) = (&installed.appimage_path, &installed.desktop_entry_path);
+    let stored = || DesktopEntry::read(entry_path).unwrap().get(KEY_SHA1).map(str::to_string);
+    let set_time = |time| {
+        std::fs::File::options().write(true).open(file).unwrap().set_modified(time).unwrap();
+    };
+
+    // The install stamped the file it wrote.
+    assert_stamped(entry_path, file);
+    let original = std::fs::read(file).unwrap();
+    let sha1 = zsync::sha1_file(file).unwrap();
+    let stamped = stored().unwrap();
+
+    let server = Server::start(zsync_file("Fake_App-1.0.0.AppImage", original.len() as u64, &sha1));
+    let mut entry = DesktopEntry::read(entry_path).unwrap();
+    entry.set(KEY_UPDATE_INFO, format!("zsync|{}", server.url("Fake_App.AppImage.zsync")));
+    entry.write(entry_path).unwrap();
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    assert!(!update::check(&app).unwrap().available);
+
+    // Other bytes of the same length under the same time: the stored
+    // checksum still stands for the file, so it was not read.
+    let time = std::fs::metadata(file).unwrap().modified().unwrap();
+    let mut other = original.clone();
+    *other.last_mut().unwrap() ^= 0xff;
+    std::fs::write(file, &other).unwrap();
+    set_time(time);
+    let status = update::check(&app).unwrap();
+    assert!(!status.available, "{status:?}");
+    assert_eq!(stored().as_ref(), Some(&stamped));
+
+    // Another time is another file: read again, found to differ, and its
+    // checksum stored for the next check.
+    set_time(time + std::time::Duration::from_secs(1));
+    let status = update::check(&app).unwrap();
+    assert!(status.available);
+    assert!(status.note.unwrap().contains("checksum"));
+    assert_stamped(entry_path, file);
+    assert_ne!(stored().as_ref(), Some(&stamped));
+
+    // An entry from before there were checksums gets one the first time.
+    std::fs::write(file, &original).unwrap();
+    let mut entry = DesktopEntry::read(entry_path).unwrap();
+    entry.remove(KEY_SHA1);
+    entry.write(entry_path).unwrap();
+    assert!(!update::check(&app).unwrap().available);
+    assert_stamped(entry_path, file);
 }
 
 #[test]
@@ -1219,6 +1280,7 @@ fn a_zsync_update_applies_the_delta_itself_and_reports_what_it_did() {
 
     let described = outcome.path.describe();
     assert!(described.contains("reused 128 of 129 blocks"), "{described}");
+    assert_stamped(&delta.app.desktop_entry_path, &outcome.appimage_path);
 
     // And the server sent that one block and nothing else.
     assert_eq!(delta.payload_server.served(), vec![2048]);
@@ -1457,6 +1519,8 @@ fn an_update_out_of_a_github_release_is_checked_against_its_digest() {
     assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), fixture.v2);
     assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), fixture.v1);
     assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    // The entry has the checksum of the new file, not of the one before.
+    assert_stamped(&fixture.app.desktop_entry_path, &outcome.appimage_path);
 }
 
 /// What the check is for: the release says one thing, the file that

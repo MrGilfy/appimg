@@ -45,6 +45,7 @@ interface: its field set may change between versions without notice.
 
     appimg update --all --check    check without changing anything
     appimg update --all            download and replace
+    appimg notify enable           check daily, notify when updates are available
 
 No extra tool is needed. An application whose update information names a zsync
 file, either `zsync|<url>` or `gh-releases-zsync|...`, fetches only the parts

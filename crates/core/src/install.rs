@@ -8,7 +8,7 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
-use crate::{caches, download, elf, slug, update};
+use crate::{caches, download, elf, slug, stamp, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
 const DEFAULT_CATEGORY: &str = "Utility";
@@ -223,11 +223,13 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
 }
 
 /// Writes the planned desktop entry, with the icon the installed icons
-/// make it, or the generic one without any.
+/// make it, or the generic one without any, and the checksum of the
+/// AppImage that is in place by now.
 pub(crate) fn write_entry(plan: &InstallPlan, icons: &[PathBuf]) -> Result<()> {
     let icon_field = if icons.is_empty() { FALLBACK_ICON.to_string() } else { plan.slug.clone() };
     let mut entry = plan.desktop_entry.clone();
     entry.set("Icon", icon_field);
+    stamp::record(&mut entry, &plan.appimage_path, None);
     entry.write(&plan.desktop_entry_path)
 }
 
@@ -350,6 +352,7 @@ mod tests {
         Paths {
             data_home: dir.to_path_buf(),
             config_home: dir.join("config"),
+            state_home: dir.join("state"),
             appimage_dir: dir.join("appimages"),
             applications_dir: dir.join("applications"),
             icons_root: dir.join("icons/hicolor"),

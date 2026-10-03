@@ -59,9 +59,44 @@ project adheres to [Semantic Versioning](https://semver.org/).
   version it was installed from, and the output says only the update
   failed. The exit code is 1 if anything failed. A format version it does
   not know is refused, and `--dry-run` shows the plan and changes nothing.
+- `appimg notify enable` turns on update notifications. It writes a
+  systemd user service and timer to `$XDG_CONFIG_HOME/systemd/user` and
+  starts the timer through `systemctl --user`: nothing system-wide, no
+  root. Once a day, a missed day caught up after the next boot, and up to
+  an hour later at random so that not every machine asks GitHub in the
+  same minute, the timer runs the appimg that enabled it, by its absolute
+  path. That checks every application the way `update --all --check` does
+  and shows one notification naming the updates no notification named
+  before, through `notify-send` or, without it, `gdbus` calling
+  `org.freedesktop.Notifications`. Each version is announced once: the
+  ones announced are remembered in `$XDG_STATE_HOME/appimg/announced`, and
+  an update that is still pending stays quiet until a newer version
+  appears. When everything is current, or nothing is new, it shows
+  nothing. A check that fails is logged to the journal and fails the run,
+  shows no notification, and forgets nothing that was announced for that
+  application. The service keeps `XDG_DATA_HOME`, `APPIMG_DIR` and
+  `XDG_STATE_HOME` as they were when `enable` ran, so the timer checks the
+  same applications and keeps one record of what it announced. An appimg
+  in a cargo target directory or a temporary one gets a warning.
+  `appimg notify status` shows whether the timer is on, the next check,
+  the last one and how it went, and whether the appimg it runs still
+  exists, and exits with 1 when it does not. `appimg notify disable` stops
+  and removes both units and that record, and `appimg notify test` shows a
+  sample notification right away. Without `notify-send` and `gdbus`,
+  `enable` and `test` say so and change nothing.
 
 ### Changed
 
+- A zsync check whose offered file is as large as the installed one no
+  longer reads all of the installed file to compare checksums. Install,
+  update and adopt store the SHA-1 of every AppImage they write in its
+  desktop entry, as `X-AppImg-SHA1`, together with the file's size and
+  modification time. A check takes the stored checksum while size and
+  time still match, and hashes the file again only when either changed,
+  storing the result. An entry written before there was a checksum in it
+  is hashed once, the first time a check needs it. A zsync update stores
+  the checksum it already verified the new file against, without reading
+  the file again.
 - A local install, from the command line or the TUI, gets the checks a
   download gets before anything runs the file: it has to start with an ELF
   header and be at least as long as its squashfs says.

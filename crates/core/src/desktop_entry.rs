@@ -22,6 +22,11 @@ pub const KEY_UPDATE_SOURCE: &str = "X-AppImg-UpdateSource";
 /// version a file declares need not be the one read out of its release tag.
 pub const KEY_RELEASE: &str = "X-AppImg-Release";
 pub const KEY_INSTALLED_AT: &str = "X-AppImg-InstalledAt";
+/// The SHA-1 of the installed AppImage with the size and modification time
+/// the file had when it was hashed, `<sha1> <size> <seconds>.<nanoseconds>`,
+/// written whenever appimg writes the file. A zsync check takes the
+/// checksum from here while size and time still match, see [`crate::stamp`].
+pub const KEY_SHA1: &str = "X-AppImg-SHA1";
 
 /// The freedesktop main categories. A desktop entry needs at least one of
 /// them, everything else is an additional category we do not offer.

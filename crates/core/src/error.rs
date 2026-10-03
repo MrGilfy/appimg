@@ -102,6 +102,24 @@ pub enum Error {
          version {supported}"
     )]
     UnknownExportVersion { found: u64, supported: u64 },
+
+    #[error(
+        "neither notify-send nor gdbus is installed, so there is no way to show a notification: \
+         install notify-send (libnotify) or gdbus (GLib)"
+    )]
+    NoNotifier,
+
+    #[error("{tool} could not show the notification: {message}")]
+    Notification { tool: &'static str, message: String },
+
+    #[error("systemctl is not installed: update notifications need a systemd user session")]
+    NoSystemctl,
+
+    #[error("`systemctl --user {command}` failed: {message}")]
+    Systemctl { command: String, message: String },
+
+    #[error("{path:?} cannot go into a systemd unit: {reason}")]
+    NotForUnit { path: PathBuf, reason: &'static str },
 }
 
 impl Error {

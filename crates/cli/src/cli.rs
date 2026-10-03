@@ -49,6 +49,9 @@ pub enum Command {
     Export(ExportArgs),
     /// Install the AppImages an export lists, downloading each again.
     Import(ImportArgs),
+    /// Show a notification when updates are available, checked once a day by
+    /// a systemd user timer.
+    Notify(NotifyArgs),
     /// Check the environment and look for leftovers.
     Doctor,
     /// Print a shell completion script.
@@ -210,6 +213,31 @@ pub struct ImportArgs {
     /// Show what would be installed and from where, and change nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct NotifyArgs {
+    #[command(subcommand)]
+    pub action: NotifyAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotifyAction {
+    /// Write a systemd user service and timer to
+    /// $XDG_CONFIG_HOME/systemd/user and start the timer. It runs this appimg
+    /// once a day, against the applications it manages now.
+    Enable,
+    /// Stop the timer and remove both units.
+    Disable,
+    /// Show whether the timer is on, when it runs next, how the last check
+    /// went, and whether the appimg it runs is still there.
+    Status,
+    /// Show a sample notification right away.
+    Test,
+    /// Check every application and show one notification naming those with
+    /// an update, if any. This is what the timer runs.
+    #[command(hide = true)]
+    Check,
 }
 
 #[derive(Debug, Args)]

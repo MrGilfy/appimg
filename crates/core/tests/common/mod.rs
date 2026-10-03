@@ -9,7 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use appimg_core::desktop_entry::{DesktopEntry, KEY_SHA1};
 use appimg_core::paths::Paths;
+use appimg_core::stamp::Stamp;
+use appimg_core::zsync;
 use tempfile::TempDir;
 
 /// Executing a file while any process still holds it open for writing fails
@@ -22,6 +25,16 @@ pub fn serial() -> MutexGuard<'static, ()> {
     let lock = LOCK.get_or_init(|| Mutex::new(()));
     // A failing test must not take the rest of the suite down with it.
     lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Asserts that the entry at `entry` holds the checksum of `file`, stamped
+/// with the size and time the file has now.
+pub fn assert_stamped(entry: &Path, file: &Path) {
+    let entry = DesktopEntry::read(entry).unwrap();
+    let value = entry.get(KEY_SHA1).expect("the entry holds no checksum");
+    let stamp = Stamp::parse(value).unwrap_or_else(|| panic!("not a stamp: {value}"));
+    assert_eq!(stamp.sha1, zsync::sha1_file(file).unwrap(), "{value}");
+    assert!(stamp.matches(file), "{value}");
 }
 
 /// A throwaway XDG home with the directories `appimg` writes to.
@@ -45,6 +58,7 @@ impl Sandbox {
             applications_dir: data_home.join("applications"),
             icons_root: data_home.join("icons").join("hicolor"),
             config_home: root.join("config"),
+            state_home: root.join("state"),
             data_home,
         };
         paths.ensure_dirs().unwrap();

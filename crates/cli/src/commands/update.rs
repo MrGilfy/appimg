@@ -70,14 +70,25 @@ fn targets(paths: &Paths, args: &UpdateArgs) -> Result<Vec<InstalledApp>> {
     }
 }
 
-fn check(ui: &Ui, apps: &[InstalledApp], json: bool) -> Result<Outcome> {
+/// Checks every application, with a warning for each check that fails.
+/// Returns what the others found, and how many failed.
+pub(crate) fn statuses(ui: &Ui, apps: &[InstalledApp]) -> (Vec<UpdateStatus>, usize) {
     let mut statuses = Vec::new();
+    let mut failed = 0;
     for app in apps {
         match update::check(app) {
             Ok(status) => statuses.push(status),
-            Err(error) => ui.warn(&format!("{}: {error:#}", app.name)),
+            Err(error) => {
+                failed += 1;
+                ui.warn(&format!("{}: {error:#}", app.name));
+            }
         }
     }
+    (statuses, failed)
+}
+
+fn check(ui: &Ui, apps: &[InstalledApp], json: bool) -> Result<Outcome> {
+    let (statuses, _) = statuses(ui, apps);
 
     if json {
         ui.info(&statuses_to_json(&statuses));

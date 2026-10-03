@@ -53,6 +53,7 @@ fn run(args: &Cli, ui: &Ui) -> anyhow::Result<Outcome> {
         Some(Command::Edit(edit_args)) => commands::edit::run(&paths, ui, edit_args),
         Some(Command::Export(export_args)) => commands::export::run(&paths, ui, export_args),
         Some(Command::Import(import_args)) => commands::import::run(&paths, ui, import_args),
+        Some(Command::Notify(notify_args)) => commands::notify::run(&paths, ui, notify_args),
         Some(Command::Doctor) => commands::doctor::run(&paths, ui),
         Some(Command::Completions(completion_args)) => {
             commands::completions::run(ui, completion_args)

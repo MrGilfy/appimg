@@ -11,6 +11,9 @@ use crate::error::{Error, Result};
 pub struct Paths {
     pub data_home: PathBuf,
     pub config_home: PathBuf,
+    /// `$XDG_STATE_HOME`: what appimg remembers between runs that is no
+    /// one's data, such as which updates a notification named already.
+    pub state_home: PathBuf,
     pub appimage_dir: PathBuf,
     pub applications_dir: PathBuf,
     pub icons_root: PathBuf,
@@ -23,6 +26,8 @@ impl Paths {
             xdg_dir("XDG_DATA_HOME", home.as_deref(), ".local/share", "the data directory")?;
         let config_home =
             xdg_dir("XDG_CONFIG_HOME", home.as_deref(), ".config", "the config directory")?;
+        let state_home =
+            xdg_dir("XDG_STATE_HOME", home.as_deref(), ".local/state", "the state directory")?;
         let appimage_dir = non_empty_var("APPIMG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| data_home.join("appimages"));
@@ -32,6 +37,7 @@ impl Paths {
             icons_root: data_home.join("icons").join("hicolor"),
             appimage_dir,
             config_home,
+            state_home,
             data_home,
         })
     }

@@ -9,7 +9,7 @@ use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, date, icon, json, version, zsync};
+use crate::{caches, date, icon, json, stamp, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -329,7 +329,9 @@ fn github_page(url: &str) -> Option<GitHubPage> {
     Some(GitHubPage::Repository { owner, repo, tag })
 }
 
-/// Reports whether an update is available. Never writes anything.
+/// Reports whether an update is available. Writes nothing but the checksum
+/// of the installed file into its entry, when a zsync check had to read the
+/// file because the entry held none that still fits, see [`stamp::sha1`].
 pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
     let source = source_for(app);
     let current = app.version.clone();
@@ -353,7 +355,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 zsync_url(update_info).ok_or_else(|| Error::NoUpdateInfo(app.slug.clone()))?;
             let header = zsync::fetch_header(&url)?;
             status.latest_version = offered_by_zsync(&header).or_else(|| current.clone());
-            let (available, note) = zsync_compare(&header, &app.appimage_path)?;
+            let (available, note) = zsync_compare(&header, app)?;
             status.available = available;
             status.note = note;
         }
@@ -370,7 +372,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                     status.latest_version = offered_by_zsync(&header)
                         .or_else(|| release.version())
                         .or_else(|| current.clone());
-                    let (available, note) = zsync_compare(&header, &app.appimage_path)?;
+                    let (available, note) = zsync_compare(&header, app)?;
                     status.available = available;
                     status.note = note;
                 }
@@ -515,7 +517,7 @@ fn full_download(
     let verified = verify_staged(&staged, url, &from)?;
     let backup = swap_in(&staged, target)?;
     let path = UpdatePath::FullDownload { bytes };
-    let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
+    let outcome = finish(paths, app, Some(backup), source, from, path, None)?;
     Ok(UpdateOutcome { digest: verified, ..outcome })
 }
 
@@ -613,16 +615,18 @@ pub fn backup_path(paths: &Paths, slug: &str) -> PathBuf {
 ///
 /// `from` is what the GitHub release the file came out of knows and the file
 /// does not, see [`Provenance`]. An update that came out of no release
-/// leaves no release recorded either.
+/// leaves no release recorded either. `sha1` is the checksum of the new
+/// file when the update knows it already; otherwise the file is hashed.
 fn finish(
     paths: &Paths,
     app: &InstalledApp,
-    target: &Path,
     backup: Option<PathBuf>,
     source: UpdateSource,
     from: Provenance,
     path: UpdatePath,
+    sha1: Option<&str>,
 ) -> Result<UpdateOutcome> {
+    let target = &paths.appimage_path(&app.slug);
     let from_release = from.version;
     let info = metadata::inspect(target, None).ok();
 
@@ -652,6 +656,7 @@ fn finish(
         entry.set("Icon", app.slug.clone());
     }
     entry.set_optional(desktop_entry::KEY_RELEASE, from.release);
+    stamp::record(&mut entry, target, sha1);
     entry.write(&app.desktop_entry_path)?;
 
     caches::refresh(paths);
@@ -1500,8 +1505,10 @@ fn zsync_url(update_info: &str) -> Option<String> {
 
 /// Whether the local file still is the one a zsync header describes, and what
 /// to say about it. The length settles most cases on its own; the checksum
-/// only has to be computed when the two files are the same size.
-fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Option<String>)> {
+/// only counts when the two files are the same size, and comes out of the
+/// entry while the file is still the one it was taken of.
+fn zsync_compare(header: &zsync::Header, app: &InstalledApp) -> Result<(bool, Option<String>)> {
+    let appimage = &app.appimage_path;
     let local = fs_util::file_size(appimage).ok_or_else(|| Error::NotFound(appimage.into()))?;
 
     if local != header.length {
@@ -1520,7 +1527,7 @@ fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Optio
             Some("the zsync file has no checksum, only the sizes match".to_string()),
         ));
     };
-    if zsync::sha1_file(appimage)? == remote {
+    if stamp::sha1(app)? == remote {
         Ok((false, None))
     } else {
         Ok((true, Some("same size as the installed file, different checksum".to_string())))
@@ -1581,7 +1588,10 @@ fn apply_zsync(
     // the digest that it is the one the release holds.
     let verified = verify_staged(&staged, &url, &from)?;
     let backup = swap_in(&staged, target)?;
-    let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
+    // Either way the file was held to the checksum in the header, when
+    // there is one, so it need not be read again to know it.
+    let sha1 = control.header.sha1.as_deref();
+    let outcome = finish(paths, app, Some(backup), source, from, path, sha1)?;
     Ok(UpdateOutcome { digest: verified, ..outcome })
 }
 
@@ -1880,10 +1890,35 @@ mod tests {
         assert_eq!(zsync_url("zsync"), None);
     }
 
+    /// An installed application whose AppImage holds `bytes`, with an entry
+    /// that holds no checksum yet.
+    fn installed_with(dir: &Path, bytes: &[u8]) -> InstalledApp {
+        let appimage_path = dir.join("app.AppImage");
+        fs::write(&appimage_path, bytes).unwrap();
+        let desktop_entry_path = dir.join("app.desktop");
+        fs::write(&desktop_entry_path, "[Desktop Entry]\nType=Application\nName=App\n").unwrap();
+        InstalledApp {
+            slug: "app".to_string(),
+            name: "App".to_string(),
+            comment: None,
+            categories: Vec::new(),
+            version: None,
+            origin: None,
+            update_info: None,
+            update_source: None,
+            release: None,
+            installed_at: None,
+            appimage_path,
+            desktop_entry_path,
+            size_bytes: None,
+            health: crate::list::Health::Ok,
+        }
+    }
+
     #[test]
     fn a_different_length_is_an_update_and_names_both_sizes() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), vec![0u8; 2048]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = installed_with(dir.path(), &[0u8; 2048]);
         let header = zsync::Header {
             filename: Some("App-2.0.0.AppImage".to_string()),
             length: 4096,
@@ -1894,17 +1929,22 @@ mod tests {
             hash_lengths: zsync::HashLengths::DEFAULT,
         };
 
-        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        let (available, note) = zsync_compare(&header, &app).unwrap();
         assert!(available);
         let note = note.unwrap();
         assert!(note.contains("4.0 KB"), "{note}");
         assert!(note.contains("2.0 KB"), "{note}");
+        // The sizes settled it, so the file was not read.
+        assert_eq!(
+            DesktopEntry::read(&app.desktop_entry_path).unwrap().get(desktop_entry::KEY_SHA1),
+            None
+        );
     }
 
     #[test]
     fn the_same_length_is_decided_by_the_checksum() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), b"abc").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = installed_with(dir.path(), b"abc");
         let mut header = zsync::Header {
             filename: None,
             length: 3,
@@ -1915,16 +1955,20 @@ mod tests {
             hash_lengths: zsync::HashLengths::DEFAULT,
         };
 
-        assert_eq!(zsync_compare(&header, file.path()).unwrap(), (false, None));
+        assert_eq!(zsync_compare(&header, &app).unwrap(), (false, None));
+        // An entry without a checksum gets one, the first time it is needed.
+        let stored = DesktopEntry::read(&app.desktop_entry_path).unwrap();
+        let stored = stored.get(desktop_entry::KEY_SHA1).unwrap();
+        assert!(stored.starts_with("a9993e364706816aba3e25717850c26c9cd0d89d 3 "), "{stored}");
 
         header.sha1 = Some("0".repeat(40));
-        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        let (available, note) = zsync_compare(&header, &app).unwrap();
         assert!(available);
         assert!(note.unwrap().contains("checksum"));
 
         // Without a checksum the sizes are all there is, and the check says so.
         header.sha1 = None;
-        let (available, note) = zsync_compare(&header, file.path()).unwrap();
+        let (available, note) = zsync_compare(&header, &app).unwrap();
         assert!(!available);
         assert!(note.is_some());
     }
@@ -1937,6 +1981,7 @@ mod tests {
             applications_dir: dir.join("applications"),
             icons_root: dir.join("icons"),
             config_home: dir.join("config"),
+            state_home: dir.join("state"),
             data_home: dir.to_path_buf(),
         }
     }

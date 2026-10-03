@@ -6,6 +6,7 @@ pub mod export;
 pub mod import;
 pub mod install;
 pub mod list;
+pub mod notify;
 pub mod remove;
 pub mod update;
 pub mod update_source;

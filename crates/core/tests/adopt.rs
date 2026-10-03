@@ -14,7 +14,7 @@ use appimg_core::elf::Unfit;
 use appimg_core::install::{self, InstallRequest};
 use appimg_core::{list, metadata, AppImageInfo, Error};
 
-use common::{changes, snapshot, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
+use common::{assert_stamped, changes, snapshot, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
 
 /// An ELF fake AppImage at `dir/file_name`, named "Fake App", the request
 /// an install would make of it, and what was read out of it, which holds
@@ -55,6 +55,8 @@ fn adopting_moves_the_file_and_gives_it_what_an_install_does() {
     let entry = DesktopEntry::read(&outcome.desktop_entry_path).unwrap();
     assert_eq!(entry.get(KEY_ORIGIN), Some(source.to_str().unwrap()));
     assert!(entry.get("Exec").unwrap().contains(&*outcome.appimage_path.to_string_lossy()));
+    // And the checksum a zsync check compares, of the file where it is now.
+    assert_stamped(&outcome.desktop_entry_path, &outcome.appimage_path);
 }
 
 #[test]
