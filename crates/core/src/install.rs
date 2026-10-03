@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::desktop_entry::{self, DesktopEntry};
+use crate::digest::{self, Verified};
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
@@ -85,6 +86,25 @@ impl InstallRequest {
                 .flatten(),
             release: update::release_of_download(origin),
             overwrite: false,
+        }
+    }
+}
+
+/// Checks an AppImage downloaded from `url` against the digest its GitHub
+/// release publishes, when it came out of one: one request for that
+/// release. This has to happen right after the download, before anything
+/// reads the metadata out of the file, which runs it. A file that does not
+/// match is removed before the error comes back. `None` for a URL that is
+/// no GitHub release download, which has nothing to check against.
+pub fn verify_download(file: &Path, url: &str) -> Result<Option<Verified>> {
+    let Some(published) = update::published_for_download(url) else {
+        return Ok(None);
+    };
+    match digest::verify(file, url, &published) {
+        Ok(verified) => Ok(Some(verified)),
+        Err(error) => {
+            let _ = std::fs::remove_file(file);
+            Err(error)
         }
     }
 }

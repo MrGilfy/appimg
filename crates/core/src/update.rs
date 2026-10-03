@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::desktop_entry::{self, DesktopEntry};
+use crate::digest::{self, Published, Verified};
 use crate::download::{self, ProgressFn};
 use crate::error::{Error, Result};
 use crate::fs_util::{self, human_size, MODE_EXEC};
@@ -12,6 +13,16 @@ use crate::paths::Paths;
 use crate::{caches, date, icon, json, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
+
+/// Where the GitHub API is asked. `APPIMG_GITHUB_API` exists for the tests,
+/// which serve release JSON from a local server; a token never goes there,
+/// see [`download::to_string`].
+fn github_api() -> String {
+    std::env::var("APPIMG_GITHUB_API")
+        .ok()
+        .filter(|base| !base.is_empty())
+        .unwrap_or_else(|| GITHUB_API.to_string())
+}
 
 /// The update source of an application that has none, as the desktop entry
 /// stores it and as a status shows it.
@@ -142,6 +153,9 @@ pub struct UpdateOutcome {
     pub source: UpdateSource,
     /// Which path the update took, and what it cost.
     pub path: UpdatePath,
+    /// What checking the new file against the digest its GitHub release
+    /// publishes found. `None` for an update that came out of no release.
+    pub digest: Option<Verified>,
 }
 
 /// Works out how an application would be updated, without changing anything.
@@ -468,10 +482,7 @@ pub fn update(
                 None => {
                     let hint = appimage_named_by(asset);
                     let url = pick_appimage(&release, owner, repo, Some(&hint))?;
-                    let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
-                    let backup = swap_in(&staged, &target)?;
-                    let path = UpdatePath::FullDownload { bytes };
-                    finish(paths, app, &target, Some(backup), source, from, path)
+                    full_download(paths, app, &target, &url, source, from, progress)
                 }
             }
         }
@@ -481,18 +492,32 @@ pub fn update(
             })?;
             let url = pick_appimage(&release, owner, repo, asset.as_deref())?;
             let from = Provenance::of(owner, repo, &release);
-            let (staged, bytes) = download_staged(paths, &app.slug, &url, progress)?;
-            let backup = swap_in(&staged, &target)?;
-            let path = UpdatePath::FullDownload { bytes };
-            finish(paths, app, &target, Some(backup), source, from, path)
+            full_download(paths, app, &target, &url, source, from, progress)
         }
         UpdateSource::DirectUrl { url } => {
-            let (staged, bytes) = download_staged(paths, &app.slug, url, progress)?;
-            let backup = swap_in(&staged, &target)?;
-            let path = UpdatePath::FullDownload { bytes };
-            finish(paths, app, &target, Some(backup), source, Provenance::default(), path)
+            let url = url.clone();
+            full_download(paths, app, &target, &url, source, Provenance::default(), progress)
         }
     }
+}
+
+/// An update that downloads the whole new file, checks it against the
+/// digest its release publishes when it came out of one, and swaps it in.
+fn full_download(
+    paths: &Paths,
+    app: &InstalledApp,
+    target: &Path,
+    url: &str,
+    source: UpdateSource,
+    from: Provenance,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<UpdateOutcome> {
+    let (staged, bytes) = download_staged(paths, &app.slug, url, progress)?;
+    let verified = verify_staged(&staged, url, &from)?;
+    let backup = swap_in(&staged, target)?;
+    let path = UpdatePath::FullDownload { bytes };
+    let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
+    Ok(UpdateOutcome { digest: verified, ..outcome })
 }
 
 /// Drops the backup of a successful update, and with it anything else the
@@ -603,6 +628,7 @@ fn finish(
         icons,
         source,
         path,
+        digest: None,
     })
 }
 
@@ -700,9 +726,13 @@ fn tag_to_follow(tag: &str) -> Option<String> {
     (version::is_rolling(tag) && !tag.eq_ignore_ascii_case("latest")).then(|| tag.to_string())
 }
 
+#[derive(Debug, Clone)]
 struct Release {
     tag: Option<String>,
     assets: Vec<String>,
+    /// The download URL of every asset with the SHA-256 GitHub publishes
+    /// for it, `None` for an asset older than the digests.
+    digests: Vec<(String, Option<String>)>,
     /// The day it was published, `2025-10-18`.
     published: Option<String>,
     /// The commit it was built from, abbreviated.
@@ -710,6 +740,21 @@ struct Release {
 }
 
 impl Release {
+    /// What this release publishes for the asset at `url`.
+    fn published_for(&self, url: &str) -> Published {
+        match self.digests.iter().find(|(asset, _)| asset == url) {
+            Some((_, Some(sha256))) => Published::Sha256(sha256.clone()),
+            Some((_, None)) => Published::Nothing(digest::NONE_PUBLISHED.to_string()),
+            None => Published::Nothing("the file is not an asset of the release".to_string()),
+        }
+    }
+
+    /// The asset `name` of this release, by the last part of its download
+    /// URL, as a download URL spells it.
+    fn asset_named(&self, name: &str) -> Option<&String> {
+        self.assets.iter().find(|url| last_segment(url) == name)
+    }
+
     /// Whether this release is a moving one rather than a cut version.
     fn is_rolling(&self) -> bool {
         self.tag.as_deref().is_some_and(version::is_rolling)
@@ -1103,7 +1148,15 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 
 /// Reads the release behind a tag.
 fn fetch_release(owner: &str, repo: &str, tag: &str) -> Result<Release> {
-    let url = format!("{GITHUB_API}/repos/{owner}/{repo}/releases/tags/{tag}");
+    let url = format!("{}/repos/{owner}/{repo}/releases/tags/{tag}", github_api());
+    let body = download::to_string(&url)?;
+    Ok(parse_release(&body))
+}
+
+/// Reads the release GitHub calls the latest: the newest that is neither a
+/// draft nor a pre-release, the one a `releases/latest/download` URL leads to.
+fn fetch_latest_release(owner: &str, repo: &str) -> Result<Release> {
+    let url = format!("{}/repos/{owner}/{repo}/releases/latest", github_api());
     let body = download::to_string(&url)?;
     Ok(parse_release(&body))
 }
@@ -1127,7 +1180,8 @@ fn release_to_follow(
     if let Some(tag) = tag {
         return fetch_release(owner, repo, tag);
     }
-    let url = format!("{GITHUB_API}/repos/{owner}/{repo}/releases?per_page={RELEASES_PER_PAGE}");
+    let url =
+        format!("{}/repos/{owner}/{repo}/releases?per_page={RELEASES_PER_PAGE}", github_api());
     let body = download::to_string(&url)?;
     newest_where(published_releases(&body), holds).ok_or_else(|| Error::NoMatchingAsset {
         release: format!("github:{owner}/{repo}"),
@@ -1159,6 +1213,14 @@ fn parse_release(body: &str) -> Release {
     Release {
         tag: json::string_field(body, "tag_name"),
         assets: json::string_fields(body, "browser_download_url"),
+        digests: json::array_field_objects(body, "assets")
+            .into_iter()
+            .filter_map(|asset| {
+                let url = json::string_field(asset, "browser_download_url")?;
+                let sha256 = json::string_field(asset, "digest").as_deref().and_then(digest::parse);
+                Some((url, sha256))
+            })
+            .collect(),
         published: json::string_field(body, "published_at")
             .as_deref()
             .and_then(date::from_timestamp),
@@ -1268,19 +1330,66 @@ fn recorded_tag(app: &InstalledApp, owner: &str, repo: &str) -> Option<String> {
 /// `github:owner/repo@tag` for a file downloaded out of a GitHub release,
 /// by its download URL, for [`desktop_entry::KEY_RELEASE`].
 pub fn release_of_download(url: &str) -> Option<String> {
-    let rest = url
-        .strip_prefix("https://github.com/")
-        .or_else(|| url.strip_prefix("http://github.com/"))?;
-    let path = rest.split(['?', '#']).next().unwrap_or(rest);
-    let parts: Vec<&str> = path.split('/').collect();
-    let [owner, repo, "releases", "download", tag, asset] = parts.as_slice() else {
-        return None;
+    let download = ReleaseDownload::parse(url)?;
+    Some(github_setting(&download.owner, &download.repo, Some(download.tag.as_deref()?)))
+}
+
+/// What GitHub publishes for the file behind a release download URL, at the
+/// cost of one request for that release. `None` for a URL that is no
+/// release download, which has nothing published to check against. A
+/// release that cannot be read, or that lists no such asset, is no reason
+/// to refuse the file either, only nothing to check it against, and the
+/// reason says so.
+pub fn published_for_download(url: &str) -> Option<Published> {
+    let download = ReleaseDownload::parse(url)?;
+    let (owner, repo) = (&download.owner, &download.repo);
+    let (release, which) = match &download.tag {
+        Some(tag) => (fetch_release(owner, repo, tag), format!("release {tag}")),
+        None => (fetch_latest_release(owner, repo), "the latest release".to_string()),
     };
-    if asset.is_empty() {
-        return None;
+    let published = match release {
+        Ok(release) => match release.asset_named(&download.asset) {
+            Some(asset) => release.published_for(asset),
+            None => Published::Nothing(format!("{which} lists no asset {}", download.asset)),
+        },
+        Err(error) => Published::Nothing(format!("{which} could not be read: {error}")),
+    };
+    Some(published)
+}
+
+/// A download URL out of a GitHub release taken apart:
+/// `https://github.com/owner/repo/releases/download/<tag>/<asset>`, or
+/// `.../releases/latest/download/<asset>`, which has no tag. Tag and asset
+/// stay spelled the way the URL spells them.
+struct ReleaseDownload {
+    owner: String,
+    repo: String,
+    tag: Option<String>,
+    asset: String,
+}
+
+impl ReleaseDownload {
+    fn parse(url: &str) -> Option<Self> {
+        let rest = url
+            .strip_prefix("https://github.com/")
+            .or_else(|| url.strip_prefix("http://github.com/"))?;
+        let path = rest.split(['?', '#']).next().unwrap_or(rest);
+        let parts: Vec<&str> = path.split('/').collect();
+        let (owner, repo, tag, asset) = match parts.as_slice() {
+            [owner, repo, "releases", "download", tag, asset] => (owner, repo, Some(tag), asset),
+            [owner, repo, "releases", "latest", "download", asset] => (owner, repo, None, asset),
+            _ => return None,
+        };
+        if asset.is_empty() {
+            return None;
+        }
+        let spec = match tag {
+            Some(tag) => format!("{owner}/{repo}@{tag}"),
+            None => format!("{owner}/{repo}"),
+        };
+        let (owner, repo, tag) = github_spec(&spec)?;
+        Some(Self { owner, repo, tag, asset: asset.to_string() })
     }
-    let (owner, repo, tag) = github_spec(&format!("{owner}/{repo}@{tag}"))?;
-    Some(github_setting(&owner, &repo, tag.as_deref()))
 }
 
 /// What an update knows from the GitHub release it came out of, and the
@@ -1293,6 +1402,10 @@ struct Provenance {
     version: Option<String>,
     /// `github:owner/repo@tag`, for [`desktop_entry::KEY_RELEASE`].
     release: Option<String>,
+    /// The release itself, for the digests it publishes. `None` for an
+    /// update that came out of no release, which has nothing to check a
+    /// file against and nothing to say about it.
+    out_of: Option<Release>,
 }
 
 impl Provenance {
@@ -1300,6 +1413,30 @@ impl Provenance {
         Self {
             version: release.recorded_version(),
             release: release.tag.as_deref().map(|tag| github_setting(owner, repo, Some(tag))),
+            out_of: Some(release.clone()),
+        }
+    }
+
+    /// What the release publishes for the asset at `url`, `None` for an
+    /// update that came out of no release.
+    fn published_for(&self, url: &str) -> Option<Published> {
+        self.out_of.as_ref().map(|release| release.published_for(url))
+    }
+}
+
+/// Checks a file an update staged against what the release it came out of
+/// publishes for the asset at `url`, before anything replaces the installed
+/// AppImage. A file that does not match is removed, the installed one stays
+/// as it is. `None` for an update that came out of no release.
+fn verify_staged(staged: &Path, url: &str, from: &Provenance) -> Result<Option<Verified>> {
+    let Some(published) = from.published_for(url) else {
+        return Ok(None);
+    };
+    match digest::verify(staged, url, &published) {
+        Ok(verified) => Ok(Some(verified)),
+        Err(error) => {
+            let _ = fs::remove_file(staged);
+            Err(error)
         }
     }
 }
@@ -1368,10 +1505,14 @@ fn apply_zsync(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<UpdateOutcome> {
     match apply_delta(paths, &app.slug, zsync_url, target, progress) {
-        Ok((staged, applied)) => {
+        Ok((staged, applied, payload)) => {
+            // The zsync checksum says the file is the one the zsync file
+            // describes, the digest that it is the one the release holds.
+            let verified = verify_staged(&staged, &payload, &from)?;
             let backup = swap_in(&staged, target)?;
             let path = UpdatePath::from(applied);
-            finish(paths, app, target, Some(backup), source, from, path)
+            let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
+            Ok(UpdateOutcome { digest: verified, ..outcome })
         }
         Err(native) => {
             if let Err(tool) = zsync_update(target) {
@@ -1380,8 +1521,47 @@ fn apply_zsync(
                 )));
             }
             let backup = claim_zsync_backup(paths, &app.slug);
+            let backed_up = backup.is_some();
+            let verified = verify_replaced(paths, &app.slug, target, zsync_url, &from, backed_up)?;
             let path = UpdatePath::ExternalTool { reason: native.to_string() };
-            finish(paths, app, target, backup, source, from, path)
+            let outcome = finish(paths, app, target, backup, source, from, path)?;
+            Ok(UpdateOutcome { digest: verified, ..outcome })
+        }
+    }
+}
+
+/// Checks what `appimageupdatetool` installed, which replaces the file
+/// itself and so leaves nothing staged to check first. The asset it is
+/// checked against is the AppImage the zsync file is named after, the way
+/// `zsyncmake` names it, since appimg never got to read the zsync file. A
+/// file that is not that asset goes back out, and the previous version
+/// back in, when the tool kept one.
+fn verify_replaced(
+    paths: &Paths,
+    slug: &str,
+    target: &Path,
+    zsync_url: &str,
+    from: &Provenance,
+    backed_up: bool,
+) -> Result<Option<Verified>> {
+    let cut = zsync_url.len().saturating_sub(".zsync".len());
+    let Some(asset) = zsync_url
+        .get(cut..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".zsync"))
+        .map(|_| &zsync_url[..cut])
+    else {
+        return Ok(None);
+    };
+    let Some(published) = from.published_for(asset) else {
+        return Ok(None);
+    };
+    match digest::verify(target, asset, &published) {
+        Ok(verified) => Ok(Some(verified)),
+        Err(error) => {
+            if backed_up {
+                rollback(paths, slug)?;
+            }
+            Err(error)
         }
     }
 }
@@ -1390,14 +1570,14 @@ fn apply_zsync(
 /// out which blocks the installed AppImage already holds, fetches the rest
 /// and assembles `<slug>.AppImage.new`. The file is verified against the
 /// checksum in the zsync header before it is handed back, and removed if it
-/// does not match.
+/// does not match. Handed back with it is the URL it was assembled from.
 fn apply_delta(
     paths: &Paths,
     slug: &str,
     zsync_url: &str,
     appimage: &Path,
     progress: Option<ProgressFn<'_>>,
-) -> Result<(PathBuf, zsync::Applied)> {
+) -> Result<(PathBuf, zsync::Applied, String)> {
     if !appimage.is_file() {
         return Err(Error::NotFound(appimage.to_path_buf()));
     }
@@ -1410,7 +1590,7 @@ fn apply_delta(
 
     let staged = paths.appimage_dir.join(format!("{slug}.AppImage.new"));
     let applied = zsync::apply(&control, &url, appimage, &staged, progress)?;
-    Ok((staged, applied))
+    Ok((staged, applied, url))
 }
 
 /// Where the complete file lives, as the zsync header names it. A relative
@@ -1507,6 +1687,7 @@ mod tests {
                     format!("https://github.com/WerWolv/ImHex/releases/download/{tag}/{name}")
                 })
                 .collect(),
+            digests: Vec::new(),
             published: None,
             commit: None,
         }
@@ -2342,6 +2523,78 @@ mod tests {
             Provenance::of("ppy", "osu", &Release { tag: None, ..osu_release("x") }).release,
             None
         );
+
+        // A link to the latest release names no release to record.
+        assert_eq!(
+            release_of_download("https://github.com/o/r/releases/latest/download/App.AppImage"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_asset_keeps_the_digest_its_release_publishes_for_it() {
+        let sha256 = "ab".repeat(32);
+        let url = |name: &str| format!("https://github.com/o/r/releases/download/v2/{name}");
+        let body = format!(
+            "{{\"assets_url\":\"https://api.github.com/x\",\"tag_name\":\"v2\",\"assets\":[\
+             {{\"name\":\"App-2.AppImage\",\"uploader\":{{\"login\":\"bot\"}},\
+             \"digest\":\"sha256:{sha256}\",\"browser_download_url\":\"{}\"}},\
+             {{\"name\":\"App-2.AppImage.zsync\",\"digest\":null,\"browser_download_url\":\"{}\"}}],\
+             \"body\":\"\\\"digest\\\": \\\"sha256:{}\\\"\"}}",
+            url("App-2.AppImage"),
+            url("App-2.AppImage.zsync"),
+            "cd".repeat(32),
+        );
+        let release = parse_release(&body);
+
+        assert_eq!(release.published_for(&url("App-2.AppImage")), Published::Sha256(sha256));
+        assert_eq!(
+            release.published_for(&url("App-2.AppImage.zsync")),
+            Published::Nothing(digest::NONE_PUBLISHED.to_string())
+        );
+        assert!(matches!(
+            release.published_for(&url("Other.AppImage")),
+            Published::Nothing(reason) if reason.contains("not an asset")
+        ));
+
+        // A release from before GitHub published digests has no field at
+        // all, which is the same as `null`.
+        let old = published_releases(&listing(&[("v1", false, false, &["App-1.AppImage"])]));
+        let asset = "https://github.com/obsidianmd/obsidian-releases/releases/download/v1/\
+                     App-1.AppImage";
+        assert_eq!(old[0].published_for(asset), Published::Nothing(digest::NONE_PUBLISHED.into()));
+
+        // An update out of no release has nothing to check against and
+        // nothing to say about it.
+        assert_eq!(Provenance::default().published_for(asset), None);
+        assert!(Provenance::of("o", "r", &old[0]).published_for(asset).is_some());
+    }
+
+    #[test]
+    fn only_a_release_download_url_is_looked_up_at_all() {
+        // None of these is asked about, they come out of no release.
+        for url in [
+            "https://example.com/o/r/releases/download/v1/App.AppImage",
+            "https://github.com/o/r/releases/download/v1/",
+            "https://github.com/o/r/releases/tag/v1",
+            "https://github.com/o/r/archive/refs/tags/v1.tar.gz",
+        ] {
+            assert_eq!(published_for_download(url), None, "{url}");
+        }
+
+        let tagged = ReleaseDownload::parse(
+            "https://github.com/o/r/releases/download/%40app%2Fv1/App%20One.AppImage?x=1",
+        )
+        .unwrap();
+        assert_eq!((tagged.owner.as_str(), tagged.repo.as_str()), ("o", "r"));
+        assert_eq!(tagged.tag.as_deref(), Some("%40app%2Fv1"));
+        assert_eq!(tagged.asset, "App%20One.AppImage");
+
+        let latest =
+            ReleaseDownload::parse("https://github.com/o/r/releases/latest/download/App.AppImage")
+                .unwrap();
+        assert_eq!(latest.tag, None);
+        assert_eq!(latest.asset, "App.AppImage");
     }
 
     #[test]
@@ -2507,6 +2760,7 @@ mod tests {
         Release {
             tag: Some("continuous".to_string()),
             assets: vec!["https://x/AppImageUpdate-x86_64.AppImage".to_string()],
+            digests: Vec::new(),
             published: Some("2025-10-18".to_string()),
             commit: Some("a211784".to_string()),
         }
@@ -2575,6 +2829,7 @@ mod tests {
         let release = Release {
             tag: Some("v2.0.0".to_string()),
             assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
+            digests: Vec::new(),
             published: Some("2025-10-18".to_string()),
             commit: Some("a211784".to_string()),
         };
@@ -2598,6 +2853,7 @@ mod tests {
         let release = Release {
             tag: Some("v2.0.0".to_string()),
             assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
+            digests: Vec::new(),
             published: Some("2025-10-18".to_string()),
             commit: None,
         };

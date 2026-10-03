@@ -6,7 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
+### Added
+
+- Every AppImage that comes out of a GitHub release is checked against
+  the SHA-256 digest GitHub publishes for it before it replaces anything:
+  updates from a `github:` or `gh-releases-zsync` source, whether
+  downloaded whole or assembled from a zsync delta, and installs from a
+  release download URL, which costs one request for that release. An
+  install checks the file before reading its metadata, which runs it. A
+  file that does not match is deleted and refused with an error that names
+  both digests, the way a failed zsync checksum is, and the installed
+  version stays as it was. What `appimageupdatetool` installs in its
+  fallback is checked afterwards and rolled back on a mismatch. An asset
+  without a digest, as on releases from before GitHub published them, is
+  installed as before. Either way, the install and update output says what
+  the check found in one line.
 
 - A `github:` source on an aarch64 machine finds the arm64 AppImage of a
   release that names its x86_64 build without an architecture, the way

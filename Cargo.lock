@@ -88,6 +88,7 @@ name = "appimg-core"
 version = "0.3.0"
 dependencies = [
  "imagesize",
+ "ring",
  "tempfile",
  "thiserror",
  "tiny_http",

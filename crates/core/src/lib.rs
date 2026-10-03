@@ -7,6 +7,7 @@ pub mod appstream;
 pub mod caches;
 pub mod date;
 pub mod desktop_entry;
+pub mod digest;
 pub mod doctor;
 pub mod download;
 pub mod elf;

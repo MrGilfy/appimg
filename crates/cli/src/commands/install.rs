@@ -146,6 +146,10 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
     )?;
     progress.finish();
     ui.info(&format!("  {} downloaded", human_size(bytes)));
+    // Before anything reads the metadata, which runs the file.
+    if let Some(verified) = install::verify_download(&dest, source)? {
+        ui.info(&format!("  {}", ui.dim(&verified.describe())));
+    }
 
     Ok((dest, source.to_string(), Some(scratch)))
 }

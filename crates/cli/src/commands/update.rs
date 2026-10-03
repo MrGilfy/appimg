@@ -140,6 +140,10 @@ fn update_one(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<Option<Updat
     // Which path the update took, and what it cost. Every source reports
     // one, so this line is always there.
     ui.info(&format!("  {}", ui.dim(&outcome.path.describe())));
+    // An update out of a GitHub release also says what its digest said.
+    if let Some(verified) = &outcome.digest {
+        ui.info(&format!("  {}", ui.dim(&verified.describe())));
+    }
     Ok(Some(outcome))
 }
 

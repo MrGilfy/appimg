@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 imagesize = "0.15.0"
+ring = "0.17.14"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 ureq = "3.2.1"

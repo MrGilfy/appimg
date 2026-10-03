@@ -3,6 +3,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use appimg_core::desktop_entry::{DesktopEntry, KEY_RELEASE, KEY_UPDATE_INFO};
+use appimg_core::digest::Verified;
 use appimg_core::install::InstallRequest;
 use appimg_core::list::InstalledApp;
 use appimg_core::{download, install, list, metadata, update, zsync};
@@ -23,10 +25,13 @@ type Asked = (String, Option<String>);
 /// A one-file HTTP server on a random port. The body can be swapped between
 /// requests, which is how the update tests offer a newer version. Ranged
 /// requests are answered with the range that was asked for, so a client that
-/// only wants the first few kilobytes gets no more than that.
+/// only wants the first few kilobytes gets no more than that. A path given a
+/// body of its own with [`Server::route`] is answered with that one instead,
+/// which is how a test serves a GitHub release and its files side by side.
 struct Server {
     address: SocketAddr,
     body: Arc<Mutex<Vec<u8>>>,
+    routes: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     /// How many bytes every request so far was answered with.
     served: Arc<Mutex<Vec<usize>>>,
     /// The path and `Range` header of every request so far.
@@ -46,6 +51,8 @@ impl Server {
         let server = tiny_http::Server::http(address).unwrap();
         let body = Arc::new(Mutex::new(body));
         let offered = Arc::clone(&body);
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let routed: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::clone(&routes);
         let served = Arc::new(Mutex::new(Vec::new()));
         let counted = Arc::clone(&served);
         let (stop, stopped) = channel();
@@ -59,8 +66,12 @@ impl Server {
         let handle = thread::spawn(move || loop {
             match server.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(Some(request)) => {
-                    let whole = offered.lock().unwrap().clone();
                     let path = request.url().to_string();
+                    let route = path.split('?').next().unwrap_or(&path);
+                    let whole = match routed.lock().unwrap().get(route) {
+                        Some(body) => body.clone(),
+                        None => offered.lock().unwrap().clone(),
+                    };
                     let header = request
                         .headers()
                         .iter()
@@ -140,7 +151,7 @@ impl Server {
             }
         });
 
-        Self { address, body, served, asked, from, stop, handle: Some(handle) }
+        Self { address, body, routes, served, asked, from, stop, handle: Some(handle) }
     }
 
     /// The size of every response so far.
@@ -167,6 +178,16 @@ impl Server {
 
     fn serve(&self, body: Vec<u8>) {
         *self.body.lock().unwrap() = body;
+    }
+
+    /// Answers requests for `path`, whatever their query, with `body`.
+    fn route(&self, path: &str, body: Vec<u8>) {
+        self.routes.lock().unwrap().insert(format!("/{path}"), body);
+    }
+
+    /// Where the server is, without a path: what `APPIMG_GITHUB_API` takes.
+    fn base(&self) -> String {
+        format!("http://{}", self.address)
     }
 }
 
@@ -1370,4 +1391,402 @@ fn with_tools_on_path<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
         None => std::env::remove_var("PATH"),
     }
     result
+}
+
+/// Runs something with the GitHub API at `server`, which serves the release
+/// JSON a test wrote. The tests run one at a time, which is what makes this
+/// safe.
+fn with_github_api<T>(server: &Server, run: impl FnOnce() -> T) -> T {
+    let previous = std::env::var_os("APPIMG_GITHUB_API");
+    std::env::set_var("APPIMG_GITHUB_API", server.base());
+    let result = run();
+    match previous {
+        Some(base) => std::env::set_var("APPIMG_GITHUB_API", base),
+        None => std::env::remove_var("APPIMG_GITHUB_API"),
+    }
+    result
+}
+
+/// A release as the GitHub API returns one, with these assets: a download
+/// URL each, and the `digest` GitHub publishes for it, `None` for an asset
+/// from before it published any.
+fn release_json(tag: &str, assets: &[(&str, Option<&str>)]) -> String {
+    let assets: Vec<String> = assets
+        .iter()
+        .map(|(url, digest)| {
+            let name = url.rsplit('/').next().unwrap();
+            let digest = digest.map_or("null".to_string(), |d| format!("\"sha256:{d}\""));
+            format!(
+                "{{\"url\":\"https://api.github.com/assets/1\",\"name\":\"{name}\",\
+                 \"uploader\":{{\"login\":\"bot\"}},\"size\":1,\"digest\":{digest},\
+                 \"browser_download_url\":\"{url}\"}}"
+            )
+        })
+        .collect();
+    format!(
+        "{{\"assets_url\":\"https://api.github.com/assets\",\"tag_name\":\"{tag}\",\
+         \"target_commitish\":\"main\",\"draft\":false,\"prerelease\":false,\
+         \"published_at\":\"2026-10-01T10:00:00Z\",\"assets\":[{}],\"body\":\"notes\"}}",
+        assets.join(",")
+    )
+}
+
+/// An application installed from a local file that updates from
+/// `github:o/r`, and a server that offers release v2.0.0 of it, whose one
+/// AppImage is `v2`. What GitHub publishes for that AppImage is up to the
+/// test.
+struct GitHubFixture {
+    app: InstalledApp,
+    v1: Vec<u8>,
+    v2: Vec<u8>,
+    /// The SHA-256 of `v2`, which a release that is honest publishes.
+    v2_sha256: String,
+    asset_url: String,
+    server: Server,
+}
+
+impl GitHubFixture {
+    fn new(sandbox: &Sandbox) -> Self {
+        let one = FakeAppImage::new("Fake App")
+            .marker("v1")
+            .build(&sandbox.root, "Fake_App-1.0.0.AppImage");
+        let info = metadata::inspect(&one, None).unwrap();
+        let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
+        install::install(&sandbox.paths, &request).unwrap();
+        let installed = list::find(&sandbox.paths, "fake-app").unwrap();
+        update::set_update_source(&installed, Some("github:o/r")).unwrap();
+
+        // A download only replaces the installed file if it starts with an
+        // ELF header, so this one does.
+        let two = FakeAppImage::new("Fake App")
+            .marker("v2")
+            .elf()
+            .build(&sandbox.root, "Fake_App-2.0.0.AppImage");
+        let server = Server::start(Vec::new());
+        let asset_url = server.url("download/v2.0.0/Fake_App-2.0.0.AppImage");
+        server.route("download/v2.0.0/Fake_App-2.0.0.AppImage", std::fs::read(&two).unwrap());
+
+        Self {
+            app: list::find(&sandbox.paths, "fake-app").unwrap(),
+            v1: std::fs::read(&one).unwrap(),
+            v2: std::fs::read(&two).unwrap(),
+            v2_sha256: appimg_core::digest::sha256_file(&two).unwrap(),
+            asset_url,
+            server,
+        }
+    }
+
+    /// Publishes release v2.0.0 with this digest for its AppImage.
+    fn publish(&self, digest: Option<&str>) {
+        let release = release_json("v2.0.0", &[(&self.asset_url, digest)]);
+        self.server.route("repos/o/r/releases", format!("[{release}]").into_bytes());
+    }
+
+    fn update(&self, sandbox: &Sandbox) -> appimg_core::Result<update::UpdateOutcome> {
+        with_github_api(&self.server, || update::update(&sandbox.paths, &self.app, None))
+    }
+}
+
+#[test]
+fn an_update_out_of_a_github_release_is_checked_against_its_digest() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let fixture = GitHubFixture::new(&sandbox);
+    fixture.publish(Some(&fixture.v2_sha256));
+
+    let outcome = fixture.update(&sandbox).unwrap();
+
+    assert_eq!(outcome.digest, Some(Verified::Matches(fixture.v2_sha256.clone())));
+    assert_eq!(outcome.digest.unwrap().describe(), "sha256 matches the digest GitHub publishes");
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), fixture.v2);
+    assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), fixture.v1);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+}
+
+/// What the check is for: the release says one thing, the file that
+/// arrived is another. It is refused, and nothing of it stays anywhere.
+#[test]
+fn a_github_download_that_does_not_match_its_digest_replaces_nothing() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let fixture = GitHubFixture::new(&sandbox);
+    let elsewhere = "e3".repeat(32);
+    fixture.publish(Some(&elsewhere));
+
+    let entry = read(&fixture.app.desktop_entry_path);
+    let files = walk(&sandbox.paths.data_home);
+
+    let error = fixture.update(&sandbox).unwrap_err();
+
+    // The whole file did arrive: the download itself was fine.
+    let asked: Vec<String> = fixture.server.asked().into_iter().map(|(path, _)| path).collect();
+    assert!(asked.contains(&"/download/v2.0.0/Fake_App-2.0.0.AppImage".to_string()), "{asked:?}");
+    assert!(fixture.server.served().contains(&fixture.v2.len()));
+
+    // The error names the file and both digests.
+    assert!(matches!(error, appimg_core::Error::DigestMismatch { .. }), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains(&fixture.asset_url), "{message}");
+    assert!(message.contains(&fixture.v2_sha256), "{message}");
+    assert!(message.contains(&elsewhere), "{message}");
+
+    // Nothing was replaced, and nothing was left behind: no staged file, no
+    // backup, not one file more or less than before, and the same entry.
+    assert_eq!(std::fs::read(&fixture.app.appimage_path).unwrap(), fixture.v1);
+    assert_eq!(read(&fixture.app.desktop_entry_path), entry);
+    assert_eq!(walk(&sandbox.paths.data_home), files);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
+}
+
+/// Releases from before GitHub published digests carry `null`. That is no
+/// reason to refuse the update, only nothing to check it against, and the
+/// update says so.
+#[test]
+fn a_github_release_without_a_digest_updates_and_says_it_was_not_checked() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let fixture = GitHubFixture::new(&sandbox);
+    fixture.publish(None);
+
+    let outcome = fixture.update(&sandbox).unwrap();
+
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), fixture.v2);
+    let said = outcome.digest.as_ref().unwrap().describe();
+    assert_eq!(said, "not checked, GitHub publishes no digest for this file");
+}
+
+/// A source that is no GitHub release has no digest to check, and says
+/// nothing about one.
+#[test]
+fn an_update_out_of_no_release_says_nothing_about_a_digest() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let built = FakeAppImage::new("Fake App").marker("v1").build(&sandbox.root, "build.AppImage");
+    let server = Server::start(std::fs::read(&built).unwrap());
+    let url = server.url("Fake_App-1.0.0.AppImage");
+    let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
+    download::to_file(&url, &downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None).unwrap();
+    install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info)).unwrap();
+
+    let newer =
+        FakeAppImage::new("Fake App").marker("v2").elf().build(&sandbox.root, "build2.AppImage");
+    server.serve(std::fs::read(&newer).unwrap());
+    let app = list::find(&sandbox.paths, "fake-app").unwrap();
+
+    let outcome = update::update(&sandbox.paths, &app, None).unwrap();
+    assert_eq!(outcome.digest, None);
+}
+
+/// A `gh-releases-zsync` application: v1 installed, and release v2.0.0 with
+/// the AppImage and the zsync file that describes it, side by side as
+/// `zsyncmake` leaves them, the AppImage named by a relative URL.
+struct GitHubDelta {
+    app: InstalledApp,
+    v1: Vec<u8>,
+    payload: Vec<u8>,
+    payload_sha256: String,
+    asset_url: String,
+    zsync_url: String,
+    server: Server,
+}
+
+impl GitHubDelta {
+    fn new(sandbox: &Sandbox) -> Self {
+        let filler: String =
+            noise(4, 256 * 1024).into_iter().map(|byte| char::from(b'a' + byte % 26)).collect();
+        let build = |version: &str| {
+            FakeAppImage::new("Fake App")
+                .key("X-AppImage-Version", version)
+                .marker(&format!("{version}{filler}"))
+                .build(&sandbox.root, "App.AppImage")
+        };
+
+        let one = sandbox.root.join("build1.AppImage");
+        std::fs::copy(build("1.0.0"), &one).unwrap();
+        let info = metadata::inspect(&one, None).unwrap();
+        let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
+        let installed = install::install(&sandbox.paths, &request).unwrap();
+
+        let two = sandbox.root.join("build2.AppImage");
+        std::fs::copy(build("2.0.0"), &two).unwrap();
+        let payload = std::fs::read(&two).unwrap();
+
+        let server = Server::start(Vec::new());
+        let asset_url = server.url("download/v2.0.0/Fake_App-2.0.0.AppImage");
+        let zsync_url = server.url("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync");
+        let control = control_file(
+            "Fake_App-2.0.0.AppImage",
+            "Fake_App-2.0.0.AppImage",
+            &payload,
+            2048,
+            &zsync::sha1_file(&two).unwrap(),
+        );
+        server.route("download/v2.0.0/Fake_App-2.0.0.AppImage", payload.clone());
+        server.route("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync", control);
+
+        let mut entry = DesktopEntry::read(&installed.desktop_entry_path).unwrap();
+        entry.set(KEY_UPDATE_INFO, "gh-releases-zsync|o|r|latest|Fake_App-*.AppImage.zsync");
+        entry.write(&installed.desktop_entry_path).unwrap();
+
+        Self {
+            app: list::find(&sandbox.paths, "fake-app").unwrap(),
+            v1: std::fs::read(&one).unwrap(),
+            payload_sha256: appimg_core::digest::sha256_file(&two).unwrap(),
+            payload,
+            asset_url,
+            zsync_url,
+            server,
+        }
+    }
+
+    /// Publishes release v2.0.0 with this digest for its AppImage, and
+    /// none for the zsync file, which GitHub hashes like any other asset
+    /// but nothing here checks.
+    fn publish(&self, digest: Option<&str>) {
+        let release = release_json("v2.0.0", &[(&self.asset_url, digest), (&self.zsync_url, None)]);
+        self.server.route("repos/o/r/releases", format!("[{release}]").into_bytes());
+    }
+}
+
+#[test]
+fn a_delta_out_of_a_github_release_is_checked_against_its_digest_too() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = GitHubDelta::new(&sandbox);
+    delta.publish(Some(&delta.payload_sha256));
+
+    let outcome = with_failing_appimageupdatetool(&sandbox, || {
+        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
+    })
+    .unwrap();
+
+    assert!(matches!(outcome.path, update::UpdatePath::Delta { .. }), "{:?}", outcome.path);
+    assert_eq!(outcome.digest, Some(Verified::Matches(delta.payload_sha256.clone())));
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
+}
+
+/// The zsync file and the bytes the server sends agree with each other, so
+/// the zsync checksum passes. The release publishes a different digest for
+/// the AppImage, and that is what refuses it.
+#[test]
+fn a_delta_that_does_not_match_its_digest_replaces_nothing() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = GitHubDelta::new(&sandbox);
+    let elsewhere = "5a".repeat(32);
+    delta.publish(Some(&elsewhere));
+    let files = walk(&sandbox.paths.data_home);
+    let entry = read(&delta.app.desktop_entry_path);
+
+    let error = with_failing_appimageupdatetool(&sandbox, || {
+        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
+    })
+    .unwrap_err();
+
+    let message = error.to_string();
+    assert!(matches!(error, appimg_core::Error::DigestMismatch { .. }), "{message}");
+    assert!(message.contains(&delta.payload_sha256) && message.contains(&elsewhere), "{message}");
+    // Refused on the digest, not handed to the fallback.
+    assert!(!message.contains("appimageupdatetool"), "{message}");
+
+    assert_eq!(std::fs::read(&delta.app.appimage_path).unwrap(), delta.v1);
+    assert_eq!(read(&delta.app.desktop_entry_path), entry);
+    assert_eq!(walk(&sandbox.paths.data_home), files);
+}
+
+/// `appimageupdatetool` replaces the file itself, so there is nothing staged
+/// to check before the swap. What it installed is checked afterwards, and a
+/// file that is not the asset goes back out.
+#[test]
+fn what_appimageupdatetool_installs_against_the_digest_is_rolled_back() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = GitHubDelta::new(&sandbox);
+    delta.publish(Some(&"77".repeat(32)));
+    // A zsync file appimg cannot read, so the native path is out and the
+    // tool takes over.
+    delta.server.route("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync", b"not zsync".to_vec());
+    let files = walk(&sandbox.paths.data_home);
+
+    // The stand-in does what the tool does: replaces the file and leaves the
+    // previous version behind as `.zs-old`.
+    let tools = sandbox.root.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let tool = tools.join("appimageupdatetool");
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\ntarget=\"$2\"\ncp \"$target\" \"$target.zs-old\"\ncp '{}' \"$target\"\n",
+            sandbox.root.join("build2.AppImage").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let error = with_tools_on_path(&tools, || {
+        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
+    })
+    .unwrap_err();
+
+    assert!(matches!(error, appimg_core::Error::DigestMismatch { .. }), "{error}");
+    assert_eq!(std::fs::read(&delta.app.appimage_path).unwrap(), delta.v1);
+    assert_eq!(walk(&sandbox.paths.data_home), files);
+}
+
+/// An install from a GitHub release download URL asks for that release,
+/// once, and checks the downloaded file against what it publishes. The URL
+/// is github.com's, which no test talks to: only the API is asked, and the
+/// file was downloaded from the local server beforehand.
+#[test]
+fn a_download_from_a_github_release_url_is_checked_before_anything_installs_it() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let built = FakeAppImage::new("Fake App").elf().build(&sandbox.root, "build.AppImage");
+    let bytes = std::fs::read(&built).unwrap();
+    let sha256 = appimg_core::digest::sha256_file(&built).unwrap();
+    let server = Server::start(bytes.clone());
+    let github = "https://github.com/o/r/releases/download/v2.0.0/Fake_App-2.0.0.AppImage";
+    let downloaded = sandbox.downloads.join("Fake_App-2.0.0.AppImage");
+
+    let check = |digest: Option<&str>| {
+        server.route(
+            "repos/o/r/releases/tags/v2.0.0",
+            release_json("v2.0.0", &[(github, digest)]).into_bytes(),
+        );
+        download::appimage_to_file(&server.url("Fake_App-2.0.0.AppImage"), &downloaded, None)
+            .unwrap();
+        with_github_api(&server, || install::verify_download(&downloaded, github))
+    };
+
+    let matched = check(Some(&sha256)).unwrap();
+    assert_eq!(matched, Some(Verified::Matches(sha256.clone())));
+    assert!(downloaded.exists());
+
+    let unchecked = check(None).unwrap().unwrap();
+    assert_eq!(unchecked.describe(), "not checked, GitHub publishes no digest for this file");
+    assert!(downloaded.exists());
+
+    let elsewhere = "0f".repeat(32);
+    let message = check(Some(&elsewhere)).unwrap_err().to_string();
+    assert!(message.contains(&sha256) && message.contains(&elsewhere), "{message}");
+    assert!(message.contains(github), "{message}");
+    // Nothing of it is left to install by accident.
+    assert!(!downloaded.exists());
+    assert_eq!(walk(&sandbox.paths.data_home), Vec::<PathBuf>::new());
+
+    // One request for the release per check, to the tag the URL names.
+    let api: Vec<String> = server
+        .asked()
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|path| path.starts_with("/repos/"))
+        .collect();
+    assert_eq!(api, vec!["/repos/o/r/releases/tags/v2.0.0"; 3]);
+
+    // A URL that is no release download is not asked about at all.
+    let plain = server.url("Fake_App-2.0.0.AppImage");
+    download::appimage_to_file(&plain, &downloaded, None).unwrap();
+    assert_eq!(install::verify_download(&downloaded, &plain).unwrap(), None);
 }

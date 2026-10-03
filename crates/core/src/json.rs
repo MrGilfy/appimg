@@ -103,6 +103,27 @@ pub fn array_objects(json: &str) -> Vec<&str> {
     objects
 }
 
+/// The objects of the array the first `"key": [...]` in the document holds,
+/// the way [`array_objects`] splits them: the assets of a release, each
+/// with its own download URL and digest.
+pub fn array_field_objects<'a>(json: &'a str, key: &str) -> Vec<&'a str> {
+    let needle = format!("\"{key}\"");
+    let mut position = 0;
+
+    while let Some(found) = json[position..].find(&needle) {
+        position += found + needle.len();
+        let rest = json[position..].trim_start();
+        let Some(value) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let value = value.trim_start();
+        if value.starts_with('[') {
+            return array_objects(value);
+        }
+    }
+    Vec::new()
+}
+
 /// Escapes a string for JSON output.
 pub fn escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
@@ -220,6 +241,22 @@ mod tests {
         );
         assert!(array_objects(r#"{"not": "an array"}"#).is_empty());
         assert!(array_objects("[]").is_empty());
+    }
+
+    #[test]
+    fn splits_the_array_a_field_holds_into_its_objects() {
+        // `assets_url` comes first in a release and is no `assets`.
+        let json = r#"{"assets_url": "https://a/assets", "tag_name": "v1",
+                       "assets" : [{"name": "one", "digest": null},
+                                   {"name": "two", "digest": "sha256:ab"}],
+                       "body": "\"assets\": [{}]"}"#;
+        let assets = array_field_objects(json, "assets");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(string_field(assets[0], "digest"), None);
+        assert_eq!(string_field(assets[1], "digest").as_deref(), Some("sha256:ab"));
+
+        assert!(array_field_objects(r#"{"assets": "none"}"#, "assets").is_empty());
+        assert!(array_field_objects(r#"{"other": []}"#, "assets").is_empty());
     }
 
     #[test]

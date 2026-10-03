@@ -73,6 +73,12 @@ pub enum Error {
     #[error("{url}: {reason}")]
     Zsync { url: String, reason: String },
 
+    #[error(
+        "{url}: the new file is checksummed sha256:{found}, the GitHub release publishes \
+         sha256:{expected}: what arrived is not the file the release holds"
+    )]
+    DigestMismatch { url: String, found: String, expected: String },
+
     #[error("{tool} is not installed, {purpose}")]
     MissingTool { tool: String, purpose: String },
 }
