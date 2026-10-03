@@ -85,7 +85,7 @@ pub struct AdoptArgs {
         long,
         conflicts_with_all = [
             "copy", "keep_entries", "dry_run", "name", "comment", "categories", "args",
-            "terminal", "icon", "update_source",
+            "terminal", "icon", "update_source", "asset",
         ]
     )]
     pub scan: bool,
@@ -140,6 +140,14 @@ pub struct EntryArgs {
     /// github:owner/repo@tag to follow that tag.
     #[arg(long, value_name = "URL|github:owner/repo")]
     pub update_source: Option<String>,
+
+    /// Which file of each GitHub release updates come from: a file name in
+    /// which * stands for whatever changes between releases, such as
+    /// 'SoH-*-Linux.zip', matched without regard to case. It is kept with
+    /// the update source and picks the file instead of the name of the
+    /// installed one. Needs a github: update source.
+    #[arg(long, value_name = "PATTERN")]
+    pub asset: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +193,13 @@ pub struct UpdateSourceArgs {
     /// Update manually from now on, from no source at all.
     #[arg(long, conflicts_with = "source")]
     pub clear: bool,
+
+    /// Pick the file out of each GitHub release with this pattern, a file
+    /// name in which * stands for whatever changes between releases, such
+    /// as 'SoH-*-Linux.zip'. Without a source it is added to the current
+    /// one. Setting a source without it drops the pattern.
+    #[arg(long, value_name = "PATTERN", conflicts_with = "clear")]
+    pub asset: Option<String>,
 }
 
 #[derive(Debug, Args)]

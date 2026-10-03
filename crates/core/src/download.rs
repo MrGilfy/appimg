@@ -6,6 +6,8 @@ use std::time::Duration;
 use ureq::config::RedirectAuthHeaders;
 use ureq::ResponseExt;
 
+use crate::archive;
+use crate::digest::Verified;
 use crate::elf;
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
@@ -106,10 +108,72 @@ pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Resu
 /// is removed again before the error comes back.
 pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Result<u64> {
     let bytes = to_file(url, dest, progress)?;
+    check_appimage(url, dest, None)?;
+    Ok(bytes)
+}
 
+/// What [`appimage_or_archive`] fetched.
+#[derive(Debug)]
+pub struct Fetched {
+    /// What came over the wire.
+    pub bytes: u64,
+    /// What checking the download against the digest its release publishes
+    /// found, when it came out of one.
+    pub verified: Option<Verified>,
+    /// The name of the AppImage inside the archive the server sent, when it
+    /// sent one, for messages only.
+    pub unpacked: Option<String>,
+}
+
+/// Downloads `url` and leaves a checked AppImage at `dest`, whether the
+/// server sent one or an archive with one inside.
+///
+/// `verify` checks a file against what a release publishes for the
+/// download, and removes it when it does not match. An archive goes
+/// through it before anything is unpacked, as it arrived, and next to
+/// `dest` with the extension `archive`, which is gone again afterwards
+/// either way. Out of it comes the one AppImage, written to `dest` and to
+/// nothing else, see [`archive::extract_appimage`]. From there both get the
+/// checks every download gets, see [`appimage_to_file`].
+pub fn appimage_or_archive(
+    url: &str,
+    dest: &Path,
+    verify: &dyn Fn(&Path) -> Result<Option<Verified>>,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<Fetched> {
+    let bytes = to_file(url, dest, progress)?;
+    if archive::Kind::of(dest).is_none() {
+        check_appimage(url, dest, None)?;
+        let verified = verify(dest)?;
+        return Ok(Fetched { bytes, verified, unpacked: None });
+    }
+
+    let packed = dest.with_extension("archive");
+    std::fs::rename(dest, &packed).map_err(|e| Error::io(&packed, e))?;
+    let unpacked = verify(&packed).and_then(|verified| {
+        let extracted = archive::extract_appimage(&packed, dest).map_err(|error| match error {
+            Error::Archive { reason, .. } => Error::Archive { archive: url.to_string(), reason },
+            other => other,
+        })?;
+        Ok((verified, extracted))
+    });
+    let _ = std::fs::remove_file(&packed);
+    let (verified, extracted) = unpacked?;
+    check_appimage(url, dest, Some(&extracted.entry))?;
+    Ok(Fetched { bytes, verified, unpacked: Some(extracted.entry) })
+}
+
+/// The checks a downloaded AppImage gets before it goes anywhere: not
+/// empty, an ELF file, and as long as its front says. `entry` names it when
+/// it came out of an archive. A file that fails is removed.
+fn check_appimage(url: &str, dest: &Path, entry: Option<&str>) -> Result<()> {
+    let what = match entry {
+        Some(entry) => format!("{url}: {entry} out of the archive"),
+        None => url.to_string(),
+    };
     if fs_util::file_size(dest).unwrap_or(0) == 0 {
         let _ = std::fs::remove_file(dest);
-        return Err(Error::Download(format!("{url}: the downloaded file is empty")));
+        return Err(Error::Download(format!("{what}: the downloaded file is empty")));
     }
     // A transfer that arrived whole can still be the wrong file: an error
     // page sent with a 200 and a matching Content-Length passes every check
@@ -125,16 +189,16 @@ pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>
         let _ = std::fs::remove_file(dest);
         return Err(Error::Download(match unfit {
             elf::Unfit::NoElfHeader => format!(
-                "{url}: the server sent a file that is not an AppImage, it does not start with \
+                "{what}: the server sent a file that is not an AppImage, it does not start with \
                  an ELF header"
             ),
             elf::Unfit::CutShort { minimum, actual } => format!(
-                "{url}: the download is cut short, a complete file is at least {minimum} bytes \
+                "{what}: the download is cut short, a complete file is at least {minimum} bytes \
                  and the server sent {actual}"
             ),
         }));
     }
-    Ok(bytes)
+    Ok(())
 }
 
 /// Fetches at most `max_bytes` from the start of a URL, with a ranged

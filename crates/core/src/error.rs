@@ -85,6 +85,18 @@ pub enum Error {
     #[error("{release}: {reason}")]
     NoMatchingAsset { release: String, reason: String },
 
+    #[error(
+        "{0:?} is no asset pattern: give a file name, with * for whatever changes between \
+         releases, and no spaces, slashes or #"
+    )]
+    InvalidAssetPattern(String),
+
+    #[error(
+        "--asset picks a file out of a GitHub release, and {0:?} follows none: give a \
+         github:owner/repo update source with it"
+    )]
+    AssetNeedsGitHub(String),
+
     #[error("{url}: {reason}")]
     Zsync { url: String, reason: String },
 
@@ -117,6 +129,9 @@ pub enum Error {
 
     #[error("`systemctl --user {command}` failed: {message}")]
     Systemctl { command: String, message: String },
+
+    #[error("{archive}: {reason}")]
+    Archive { archive: String, reason: String },
 
     #[error("{path:?} cannot go into a systemd unit: {reason}")]
     NotForUnit { path: PathBuf, reason: &'static str },

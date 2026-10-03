@@ -7,7 +7,10 @@ use appimg_core::update::{self, UpdateSource};
 use appimg_core::{install, list, metadata, Paths};
 
 use crate::cli::AdoptArgs;
-use crate::commands::install::{apply_overrides, confirm_without_metadata, offer_suggested_source};
+use crate::commands::install::{
+    apply_asset, apply_overrides, check_entry_args, confirm_without_metadata,
+    offer_suggested_source,
+};
 use crate::ui::{human_size, Ui};
 use crate::Outcome;
 
@@ -19,9 +22,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
         bail!("name the AppImage to adopt, or pass --scan");
     };
     // Something that is no update source is refused before anything else.
-    if let Some(source) = &args.entry.update_source {
-        update::parse_update_source(source)?;
-    }
+    check_entry_args(&args.entry)?;
 
     // Everything that can be said without running the file comes first:
     // reading the metadata runs it.
@@ -41,6 +42,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     if args.entry.update_source.is_none() {
         offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
+    apply_asset(&mut request, &args.entry)?;
 
     let transfer = if args.copy { Transfer::Copy } else { Transfer::Move };
     let plan = adopt::plan(paths, &request, transfer, in_local_bin(&source))?;

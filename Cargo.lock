@@ -79,6 +79,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "flate2",
  "ratatui",
  "tempfile",
 ]
@@ -87,6 +88,7 @@ dependencies = [
 name = "appimg-core"
 version = "0.3.0"
 dependencies = [
+ "flate2",
  "imagesize",
  "ring",
  "tempfile",

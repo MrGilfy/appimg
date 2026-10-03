@@ -476,6 +476,7 @@ fn an_update_source_given_at_install_is_written_and_followed() {
             repo: "r".to_string(),
             tag: None,
             asset: Some("Fake_App-1.0.0-x86_64.AppImage".to_string()),
+            pattern: None,
         }
     );
 }

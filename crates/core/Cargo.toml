@@ -12,6 +12,9 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
+# Already in the build through ureq's gzip support: zip entries are deflated
+# and tar files gzipped, and appimg reads both formats itself on top of it.
+flate2 = "1.1.10"
 imagesize = "0.15.0"
 ring = "0.17.14"
 tempfile = "3.27.0"

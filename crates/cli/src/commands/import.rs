@@ -132,19 +132,16 @@ fn import_one(paths: &Paths, ui: &Ui, app: &ExportedApp, fetch: &Fetch) -> Resul
     match fetch {
         Fetch::Release { source, asset_hint } => {
             let asset = update::newest_asset(source, asset_hint.as_deref())?;
-            let (file, _scratch) = download_appimage(ui, &asset.url)?;
             // Against what the release publishes, before anything reads the
             // metadata, which runs the file.
-            let verified = digest::verify(&file, &asset.url, &asset.published)?;
-            ui.info(&format!("  {}", ui.dim(&verified.describe())));
+            let verify = |file: &Path| digest::verify(file, &asset.url, &asset.published).map(Some);
+            let (file, _scratch) = download_appimage(ui, &asset.url, &verify)?;
             install_file(paths, ui, app, &file, &asset.url, Some(&asset))?;
             Ok(Imported::Current)
         }
         Fetch::UpdateSource(url) | Fetch::Origin(url) => {
-            let (file, _scratch) = download_appimage(ui, url)?;
-            if let Some(verified) = install::verify_download(&file, url)? {
-                ui.info(&format!("  {}", ui.dim(&verified.describe())));
-            }
+            let (file, _scratch) =
+                download_appimage(ui, url, &|file| install::verify_download(file, url))?;
             let version = install_file(paths, ui, app, &file, url, None)?;
             match bring_up_to_date(paths, ui, app, url) {
                 Ok(()) => Ok(Imported::Current),

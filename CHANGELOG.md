@@ -84,9 +84,48 @@ project adheres to [Semantic Versioning](https://semver.org/).
   and removes both units and that record, and `appimg notify test` shows a
   sample notification right away. Without `notify-send` and `gdbus`,
   `enable` and `test` say so and change nothing.
+- AppImages shipped inside an archive install and update like any other:
+  `appimg install` takes a local zip, tar or tar.gz file or a URL that
+  serves one, and an update from a `github:` source or a URL takes the
+  archive a release ships, the way HarbourMasters/Shipwright ships
+  `soh.appimage` inside `SoH-<codename>-Linux.zip`. The AppImage is found
+  inside by its magic bytes, the ELF header with `AI` and its type, never
+  by its name, and it has to be exactly one: an archive with none or
+  several is refused with what it holds. Encrypted zip entries, zip64 and
+  compression methods other than stored and deflate are refused by name.
+  No name, path or link out of the archive is ever written: the one
+  AppImage is unpacked straight to appimg's own staging file, and to no
+  more than four times the archive's size plus 64 MiB, whatever the
+  archive claims, so a broken or hostile one cannot fill the disk. A
+  download from a GitHub release is checked against its published digest
+  as the archive, before anything is unpacked, and the AppImage then gets
+  the checks every download gets: ELF header, squashfs length, flushed to
+  disk before it takes the installed name. The update output says which
+  file came out of the archive. zip and tar are read by appimg itself on
+  top of `flate2`, which the HTTP client already built in, so no crate was
+  added; xz-compressed tar files are not read, since that would take one.
+- `--asset '<pattern>'` on `install`, `adopt` and `update-source` picks
+  the file out of each GitHub release instead of the name of the
+  installed one: a file name in which `*` stands for whatever changes
+  between releases, matched without regard to case, such as
+  `'SoH-*-Linux.zip'`. It is kept with the update source, as
+  `github:owner/repo#SoH-*-Linux.zip`, and travels with it through export
+  and import. `update-source <app> --asset <pattern>` adds it to the
+  current source, and setting a source without it drops it. A source that
+  follows no GitHub release refuses one.
 
 ### Changed
 
+- A `github:` source whose release has no file matching the installed
+  one by name no longer gives up. It sets aside the AppImages and
+  archives naming another platform, `mac`, `macos`, `osx`, `darwin`,
+  `win` or `windows` with or without digits behind them, and `android`,
+  and those built for another machine, and takes what is left if that is
+  exactly one: a project that renames its files every release still
+  ships one build for Linux. More than one left is an error that lists
+  them and names `--asset`. Archives only count when no AppImage matches,
+  so a release that ships an AppImage beside zips for other platforms is
+  read as before.
 - A zsync check whose offered file is as large as the installed one no
   longer reads all of the installed file to compare checksums. Install,
   update and adopt store the SHA-1 of every AppImage they write in its
@@ -122,6 +161,9 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A `gh-releases-zsync` pattern without a `*` matches that one file name,
+  not every name that starts with it, such as a `.zsync.sha256` beside the
+  zsync file.
 - A `github:` source on an aarch64 machine finds the arm64 AppImage of a
   release that names its x86_64 build without an architecture, the way
   electron-builder does: `Obsidian-1.13.8.AppImage` next to

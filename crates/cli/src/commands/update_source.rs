@@ -1,7 +1,7 @@
 use anyhow::Result;
 use appimg_core::list::InstalledApp;
 use appimg_core::update::{self, UpdateSource};
-use appimg_core::{list, Paths};
+use appimg_core::{download, list, Paths};
 
 use crate::cli::UpdateSourceArgs;
 use crate::ui::Ui;
@@ -9,12 +9,25 @@ use crate::Outcome;
 
 pub fn run(paths: &Paths, ui: &Ui, args: &UpdateSourceArgs) -> Result<Outcome> {
     let app = list::find(paths, &args.name)?;
-    if args.source.is_none() && !args.clear {
+    if args.source.is_none() && !args.clear && args.asset.is_none() {
         show(ui, &app);
         return Ok(Outcome::Done);
     }
 
-    if !update::set_update_source(&app, args.source.as_deref())? {
+    let source = match (&args.source, &args.asset) {
+        (source, None) => source.clone(),
+        (Some(source), Some(pattern)) => Some(update::with_asset_pattern(source, pattern)?),
+        // A pattern alone goes with the source the application has.
+        (None, Some(pattern)) => {
+            let current = app
+                .update_source
+                .as_deref()
+                .or(app.origin.as_deref().filter(|origin| download::is_url(origin)))
+                .unwrap_or(update::MANUAL);
+            Some(update::with_asset_pattern(current, pattern)?)
+        }
+    };
+    if !update::set_update_source(&app, source.as_deref())? {
         ui.info("Nothing changed.");
         return Ok(Outcome::NothingToDo);
     }
@@ -67,10 +80,17 @@ fn following(source: &UpdateSource) -> String {
         UpdateSource::GitHubZsync { owner, repo, .. } => {
             format!("the embedded update information, zsync files of github:{owner}/{repo}")
         }
-        UpdateSource::GitHubRelease { owner, repo, tag: Some(tag), .. } => {
-            format!("github:{owner}/{repo}, the release tagged {tag}")
+        UpdateSource::GitHubRelease { owner, repo, tag: Some(tag), pattern, .. } => {
+            let file = match pattern {
+                Some(pattern) => format!(", the asset matching {pattern}"),
+                None => String::new(),
+            };
+            format!("github:{owner}/{repo}, the release tagged {tag}{file}")
         }
-        UpdateSource::GitHubRelease { owner, repo, tag: None, .. } => {
+        UpdateSource::GitHubRelease { owner, repo, tag: None, pattern: Some(pattern), .. } => {
+            format!("github:{owner}/{repo}, the newest release with an asset matching {pattern}")
+        }
+        UpdateSource::GitHubRelease { owner, repo, tag: None, pattern: None, .. } => {
             format!("github:{owner}/{repo}, the newest release that has this AppImage")
         }
         UpdateSource::DirectUrl { url } => url.clone(),

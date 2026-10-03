@@ -5,6 +5,7 @@
 
 pub mod adopt;
 pub mod appstream;
+pub mod archive;
 pub mod caches;
 pub mod date;
 pub mod desktop_entry;

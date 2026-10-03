@@ -9,7 +9,7 @@ use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, date, icon, json, stamp, version, zsync};
+use crate::{archive, caches, date, icon, json, stamp, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -40,7 +40,15 @@ pub enum UpdateSource {
     /// newest release that has the installed AppImage in it, see
     /// [`release_to_follow`]. `asset` is the name of the file that was
     /// installed, which picks the matching file out of the release.
-    GitHubRelease { owner: String, repo: String, tag: Option<String>, asset: Option<String> },
+    /// `pattern` is one the user gave with `--asset`, which picks the file
+    /// instead, see [`with_asset_pattern`].
+    GitHubRelease {
+        owner: String,
+        repo: String,
+        tag: Option<String>,
+        asset: Option<String>,
+        pattern: Option<String>,
+    },
     /// `gh-releases-zsync`: a GitHub release whose named asset is a zsync
     /// file. The release says which assets exist, the zsync file inside it
     /// says what the update is, and from there this is a zsync source like
@@ -104,6 +112,9 @@ pub enum UpdatePath {
     },
     /// The whole file was downloaded, because the source offers no delta.
     FullDownload { bytes: u64 },
+    /// An archive was downloaded, because that is what the source ships,
+    /// and `entry` is the AppImage that came out of it.
+    Unpacked { bytes: u64, entry: String },
 }
 
 impl UpdatePath {
@@ -126,6 +137,10 @@ impl UpdatePath {
             UpdatePath::FullDownload { bytes } => {
                 format!("no delta for this source, downloaded {}", human_size(*bytes))
             }
+            UpdatePath::Unpacked { bytes, entry } => format!(
+                "no delta for this source, downloaded an archive of {} and took {entry} out of it",
+                human_size(*bytes)
+            ),
         }
     }
 }
@@ -192,8 +207,12 @@ pub fn parse_update_source(value: &str) -> Result<String> {
     let invalid = || Error::InvalidUpdateSource(value.to_string());
 
     if let Some(spec) = trimmed.strip_prefix("github:") {
-        let (owner, repo, tag) = github_spec(spec).ok_or_else(invalid)?;
-        return Ok(github_setting(&owner, &repo, tag.as_deref()));
+        let (owner, repo, tag, pattern) = github_source_spec(spec).ok_or_else(invalid)?;
+        let setting = github_setting(&owner, &repo, tag.as_deref());
+        return Ok(match pattern {
+            Some(pattern) => format!("{setting}#{pattern}"),
+            None => setting,
+        });
     }
     if !download::is_url(trimmed) {
         return Err(invalid());
@@ -222,6 +241,40 @@ pub fn github_repository(value: &str) -> Option<String> {
     }
 }
 
+/// `source` with `pattern` picking the file out of each release, instead of
+/// the name of the installed file: `github:owner/repo[@tag]#<pattern>`, a
+/// file name in which `*` stands for whatever changes from one release to
+/// the next, matched without regard to case. Only a source that follows
+/// GitHub releases can take one. A pattern it had already is replaced.
+pub fn with_asset_pattern(source: &str, pattern: &str) -> Result<String> {
+    if !valid_pattern(pattern) {
+        return Err(Error::InvalidAssetPattern(pattern.to_string()));
+    }
+    match source_from_setting(source, None) {
+        UpdateSource::GitHubRelease { owner, repo, tag, .. } => {
+            Ok(format!("{}#{pattern}", github_setting(&owner, &repo, tag.as_deref())))
+        }
+        _ => Err(Error::AssetNeedsGitHub(source.to_string())),
+    }
+}
+
+/// Checks a pattern as a user gives it with `--asset`, before there is an
+/// update source to keep it with.
+pub fn check_asset_pattern(pattern: &str) -> Result<()> {
+    if valid_pattern(pattern) {
+        Ok(())
+    } else {
+        Err(Error::InvalidAssetPattern(pattern.to_string()))
+    }
+}
+
+/// Whether `pattern` can pick an asset: something that could be a file
+/// name, with `*` where anything may stand.
+fn valid_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && !pattern.chars().any(|c| c.is_whitespace() || c.is_control() || "/#".contains(c))
+}
+
 /// Sets the update source of an installed application, or makes it manual
 /// with `None`, and writes nothing else. Returns whether anything changed.
 pub fn set_update_source(app: &InstalledApp, value: Option<&str>) -> Result<bool> {
@@ -244,10 +297,11 @@ fn source_from_setting(value: &str, origin: Option<&str>) -> UpdateSource {
     let Ok(value) = parse_update_source(value) else {
         return UpdateSource::Manual;
     };
-    match value.strip_prefix("github:").and_then(github_spec) {
+    match value.strip_prefix("github:").and_then(github_source_spec) {
         // The file that was installed is what picks the file out of each
-        // release, whether it came from that release or from anywhere else.
-        Some((owner, repo, tag)) => UpdateSource::GitHubRelease {
+        // release, whether it came from that release or from anywhere else,
+        // unless a pattern the user gave does.
+        Some((owner, repo, tag, pattern)) => UpdateSource::GitHubRelease {
             owner,
             repo,
             tag,
@@ -255,6 +309,7 @@ fn source_from_setting(value: &str, origin: Option<&str>) -> UpdateSource {
                 .and_then(|origin| origin.rsplit('/').next())
                 .filter(|name| !name.is_empty())
                 .map(str::to_string),
+            pattern,
         },
         None => source_from_url(&value),
     }
@@ -262,6 +317,20 @@ fn source_from_setting(value: &str, origin: Option<&str>) -> UpdateSource {
 
 fn source_from_url(url: &str) -> UpdateSource {
     github_source_from_url(url).unwrap_or_else(|| UpdateSource::DirectUrl { url: url.to_string() })
+}
+
+/// What follows `github:` in an update source: [`github_spec`], and a
+/// pattern behind `#` when the user gave one. A tag never holds a `#`.
+fn github_source_spec(spec: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    let (spec, pattern) = match spec.split_once('#') {
+        Some((spec, pattern)) => (spec, Some(pattern)),
+        None => (spec, None),
+    };
+    if pattern.is_some_and(|pattern| !valid_pattern(pattern)) {
+        return None;
+    }
+    let (owner, repo, tag) = github_spec(spec)?;
+    Some((owner, repo, tag, pattern.map(str::to_string)))
 }
 
 /// `owner/repo` or `owner/repo@tag`, as a `github:` update source names a
@@ -392,10 +461,9 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 }
             }
         }
-        UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
-            let release = release_to_follow(owner, repo, tag.as_deref(), |r| {
-                r.has_appimage(asset.as_deref())
-            })?;
+        UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern } => {
+            let wanted = Wanted { pattern: pattern.as_deref(), hint: asset.as_deref() };
+            let release = release_to_follow(owner, repo, tag.as_deref(), |r| r.has_asset(wanted))?;
             status.latest_version = release.version();
             let recorded = recorded_tag(app, owner, repo);
             let (installed, available, note) =
@@ -403,7 +471,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             status.current_version = installed;
             status.available = available;
             status.note = note;
-            if let Err(reason) = release.appimage(asset.as_deref(), Arch::current()) {
+            if let Err(reason) = release.pick(wanted, Arch::current()) {
                 status.available = false;
                 status.note = Some(reason);
             }
@@ -433,16 +501,17 @@ fn manual_note(app: &InstalledApp) -> String {
 }
 
 /// Every name an update can leave next to `<slug>.AppImage`, whoever wrote
-/// it. `.new` is appimg's own staging file and `.bak` its backup of the
-/// previous version. `.zs-old` and `.part` come from the zsync client inside
+/// it. `.new` is appimg's own staging file, `.bak` its backup of the
+/// previous version, and `.archive` an archive an update downloaded, until
+/// the AppImage in it is out. `.zs-old` and `.part` come from the zsync client inside
 /// `appimageupdatetool`, which appimg 0.3 and older fell back to: it
 /// hard-links the previous version out of the way before the swap and
 /// downloads into a partial file, and never cleans up either. appimg no
-/// longer runs it, but those files can still be on disk. All four are named
+/// longer runs it, but those files can still be on disk. All of them are named
 /// after the AppImage, so a file that carries one of these suffixes and a
 /// managed slug is provably ours.
 pub const LEFTOVER_SUFFIXES: &[&str] =
-    &["AppImage.bak", "AppImage.new", "AppImage.zs-old", "AppImage.part"];
+    &["AppImage.bak", "AppImage.new", "AppImage.zs-old", "AppImage.part", "AppImage.archive"];
 
 /// The leftovers of `slug` that exist right now, in the order of
 /// [`LEFTOVER_SUFFIXES`].
@@ -482,16 +551,16 @@ pub fn update(
                 // a delta from, so the whole file it is.
                 None => {
                     let hint = appimage_named_by(asset);
-                    let url = pick_appimage(&release, owner, repo, Some(&hint))?;
+                    let wanted = Wanted { pattern: None, hint: Some(&hint) };
+                    let url = pick_asset(&release, owner, repo, wanted)?;
                     full_download(paths, app, &target, &url, source, from, progress)
                 }
             }
         }
-        UpdateSource::GitHubRelease { owner, repo, tag, asset } => {
-            let release = release_to_follow(owner, repo, tag.as_deref(), |r| {
-                r.has_appimage(asset.as_deref())
-            })?;
-            let url = pick_appimage(&release, owner, repo, asset.as_deref())?;
+        UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern } => {
+            let wanted = Wanted { pattern: pattern.as_deref(), hint: asset.as_deref() };
+            let release = release_to_follow(owner, repo, tag.as_deref(), |r| r.has_asset(wanted))?;
+            let url = pick_asset(&release, owner, repo, wanted)?;
             let from = Provenance::of(owner, repo, &release);
             full_download(paths, app, &target, &url, source, from, progress)
         }
@@ -513,12 +582,16 @@ fn full_download(
     from: Provenance,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<UpdateOutcome> {
-    let (staged, bytes) = download_staged(paths, &app.slug, url, progress)?;
-    let verified = verify_staged(&staged, url, &from)?;
+    let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
+    let verify = |file: &Path| verify_staged(file, url, &from);
+    let fetched = download::appimage_or_archive(url, &staged, &verify, progress)?;
     let backup = swap_in(&staged, target)?;
-    let path = UpdatePath::FullDownload { bytes };
+    let path = match fetched.unpacked {
+        Some(entry) => UpdatePath::Unpacked { bytes: fetched.bytes, entry },
+        None => UpdatePath::FullDownload { bytes: fetched.bytes },
+    };
     let outcome = finish(paths, app, Some(backup), source, from, path, None)?;
-    Ok(UpdateOutcome { digest: verified, ..outcome })
+    Ok(UpdateOutcome { digest: fetched.verified, ..outcome })
 }
 
 /// The version to record for a file: the one it declares, unless that is a
@@ -561,16 +634,18 @@ impl ReleaseAsset {
     }
 }
 
-/// The newest AppImage the `github:owner/repo[@tag]` update source
-/// `source` offers: out of the newest release that has one matching
+/// The newest AppImage, or archive with one inside, the
+/// `github:owner/repo[@tag][#pattern]` update source `source` offers: out
+/// of the newest release that has one matching the pattern, or
 /// `asset_hint`, the file name of an earlier download, the way an update
 /// finds it. One request for the releases.
 pub fn newest_asset(source: &str, asset_hint: Option<&str>) -> Result<ReleaseAsset> {
     let invalid = || Error::InvalidUpdateSource(source.to_string());
-    let (owner, repo, tag) =
-        source.strip_prefix("github:").and_then(github_spec).ok_or_else(invalid)?;
-    let release = release_to_follow(&owner, &repo, tag.as_deref(), |r| r.has_appimage(asset_hint))?;
-    let url = pick_appimage(&release, &owner, &repo, asset_hint)?;
+    let (owner, repo, tag, pattern) =
+        source.strip_prefix("github:").and_then(github_source_spec).ok_or_else(invalid)?;
+    let wanted = Wanted { pattern: pattern.as_deref(), hint: asset_hint };
+    let release = release_to_follow(&owner, &repo, tag.as_deref(), |r| r.has_asset(wanted))?;
+    let url = pick_asset(&release, &owner, &repo, wanted)?;
     let from = Provenance::of(&owner, &repo, &release);
     Ok(ReleaseAsset {
         published: release.published_for(&url),
@@ -752,7 +827,7 @@ fn github_source_from_url(url: &str) -> Option<UpdateSource> {
         _ => None,
     };
     let asset = rest.rsplit('/').next().map(str::to_string);
-    Some(UpdateSource::GitHubRelease { owner, repo, tag, asset })
+    Some(UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern: None })
 }
 
 /// Which tag an update should follow, out of the one the application was
@@ -823,81 +898,182 @@ impl Release {
         self.is_rolling().then(|| self.published.clone()).flatten()
     }
 
-    /// Whether an AppImage of this release fits `hint` on this machine.
-    fn has_appimage(&self, hint: Option<&str>) -> bool {
-        !self.fitting(hint, Arch::current()).is_empty()
+    /// Whether this release has the file `wanted` picks on this machine.
+    fn has_asset(&self, wanted: Wanted) -> bool {
+        !self.candidates(wanted, Arch::current()).0.is_empty()
     }
 
     fn appimages(&self) -> Vec<&String> {
         self.assets.iter().filter(|url| url.to_lowercase().ends_with(".appimage")).collect()
     }
 
-    /// The AppImages of this release that fit `hint`, the way
-    /// [`Release::appimage`] matches them.
-    fn fitting(&self, hint: Option<&str>, here: Option<Arch>) -> Vec<&String> {
-        let wanted = hint.map(AssetName::parse);
-        let appimages: Vec<(&String, AssetName)> =
-            self.appimages().into_iter().map(|url| (url, AssetName::parse(url))).collect();
-        // A name without an architecture is the build for this machine,
-        // unless another AppImage of the release names this machine's: then
-        // it is the build for some other one, the way electron-builder leaves
-        // the x86_64 AppImage unlabeled next to an `-arm64` one. Only the
-        // AppImages count, Obsidian's `_amd64.deb` says nothing about them.
-        let labels_here = here.is_some() && appimages.iter().any(|(_, name)| name.arch == here);
-        let unlabeled = if labels_here { None } else { here };
-        appimages
-            .into_iter()
-            .filter(|(_, candidate)| match &wanted {
-                Some(wanted) => {
-                    candidate.words == wanted.words
-                        && arch_fits(wanted.arch, candidate.arch, here, unlabeled)
-                }
-                None => arch_fits(None, candidate.arch, here, unlabeled),
-            })
-            .map(|(url, _)| url)
-            .collect()
+    /// The archives of this release, any of which may hold an AppImage.
+    fn archives(&self) -> Vec<&String> {
+        self.assets.iter().filter(|url| archive::is_archive_name(last_segment(url))).collect()
     }
 
-    /// Picks the AppImage out of this release that is the one installed.
-    /// `hint` is the name of the installed file: whatever in it is part of a
-    /// version is ignored, the rest of the name and the architecture have to
-    /// match. Without a hint, the AppImage built for `here` is the one.
-    /// Anything but exactly one candidate is an error that lists the
-    /// AppImages there are, never a guess.
-    fn appimage(
-        &self,
-        hint: Option<&str>,
-        here: Option<Arch>,
-    ) -> std::result::Result<String, String> {
-        let appimages = self.appimages();
-        if appimages.is_empty() {
-            return Err("the release has no AppImage".to_string());
+    /// What `wanted` picks out of this release on a machine that is `here`,
+    /// and by which rule, in this order:
+    ///
+    /// 1. A pattern the user gave picks the assets it fits, and nothing
+    ///    else is looked at.
+    /// 2. The AppImages whose name matches the installed file's, see
+    ///    [`fitting`]: without a name, the ones built for `here`.
+    /// 3. With a name, the archives whose name matches it.
+    /// 4. When neither found anything, the AppImages and archives that are
+    ///    left once those naming another platform are set aside, see
+    ///    [`for_other_platform`], and those built for another machine: a
+    ///    project that renames its files every release, the way Shipwright
+    ///    puts a new codename into `SoH-<codename>-Linux.zip`, still ships
+    ///    one build for Linux.
+    fn candidates(&self, wanted: Wanted, here: Option<Arch>) -> (Vec<&String>, Rule) {
+        if let Some(pattern) = wanted.pattern {
+            let fits =
+                self.assets.iter().filter(|url| glob_matches(pattern, last_segment(url))).collect();
+            return (fits, Rule::Pattern);
         }
-        let fits = self.fitting(hint, here);
+        let by_name = fitting(self.appimages(), wanted.hint, here);
+        if !by_name.is_empty() {
+            return (by_name, Rule::Name { archives: false });
+        }
+        if wanted.hint.is_some() {
+            let by_name = fitting(self.archives(), wanted.hint, here);
+            if !by_name.is_empty() {
+                return (by_name, Rule::Name { archives: true });
+            }
+        }
+        let left: Vec<&String> = self
+            .appimages()
+            .into_iter()
+            .chain(self.archives())
+            .filter(|url| !for_other_platform(url))
+            .collect();
+        (fitting(left, None, here), Rule::Platform)
+    }
 
-        let what = match hint {
+    /// Picks the file out of this release that an update takes, see
+    /// [`Release::candidates`]. Anything but exactly one is an error that
+    /// lists what there is, never a guess.
+    fn pick(&self, wanted: Wanted, here: Option<Arch>) -> std::result::Result<String, String> {
+        let (appimages, archives) = (self.appimages(), self.archives());
+        if wanted.pattern.is_none() && appimages.is_empty() && archives.is_empty() {
+            return Err("the release has neither an AppImage nor an archive that could hold one"
+                .to_string());
+        }
+        let (fits, rule) = self.candidates(wanted, here);
+        if let [one] = fits.as_slice() {
+            return Ok((*one).clone());
+        }
+
+        let what = match wanted.hint {
             Some(hint) => last_segment(hint).to_string(),
             None => format!("one built for {}", here.map_or("this machine", Arch::name)),
         };
-        let advice = "set the update source to the download URL of the one to follow";
-        match fits.as_slice() {
-            [one] => Ok((*one).clone()),
-            [] => Err(format!(
-                "none of its AppImages matches {what}: {}; {advice}",
-                names(&appimages)
-            )),
-            several => Err(format!(
-                "{} of its AppImages match {what}: {}; {advice}",
-                several.len(),
-                names(several)
-            )),
-        }
+        let kinds = match (appimages.is_empty(), archives.is_empty()) {
+            (false, true) => "AppImages",
+            (true, false) => "archives",
+            _ => "AppImages or archives",
+        };
+        let installable: Vec<&String> = appimages.iter().chain(&archives).copied().collect();
+        let advice = "pick one with --asset '<pattern>' on appimg update-source, or set the \
+                      update source to the download URL of the one to follow";
+        Err(match (rule, wanted.pattern) {
+            (Rule::Pattern, Some(pattern)) if fits.is_empty() => format!(
+                "none of its assets matches {pattern}: {}",
+                names(&self.assets.iter().collect::<Vec<_>>())
+            ),
+            (Rule::Pattern, pattern) => format!(
+                "{} of its assets match {}: {}; make the pattern narrower",
+                fits.len(),
+                pattern.unwrap_or_default(),
+                names(&fits)
+            ),
+            (Rule::Name { archives }, _) => format!(
+                "{} of its {} match {what}: {}; {advice}",
+                fits.len(),
+                if archives { "archives" } else { "AppImages" },
+                names(&fits)
+            ),
+            (Rule::Platform, _) if fits.is_empty() => format!(
+                "none of its {kinds} matches {what}, and none is left for this machine once the \
+                 builds for other platforms are set aside: {}; {advice}",
+                names(&installable)
+            ),
+            (Rule::Platform, _) => format!(
+                "none of its {kinds} matches {what}, and {} are left for this machine once the \
+                 builds for other platforms are set aside: {}; {advice}",
+                fits.len(),
+                names(&fits)
+            ),
+        })
     }
 }
 
-/// The download URL of the AppImage to update to, out of a release.
-fn pick_appimage(release: &Release, owner: &str, repo: &str, hint: Option<&str>) -> Result<String> {
-    release.appimage(hint, Arch::current()).map_err(|reason| Error::NoMatchingAsset {
+/// How the file to update to is picked out of a release, see
+/// [`Release::candidates`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Wanted<'a> {
+    /// A pattern the user gave, see [`with_asset_pattern`].
+    pattern: Option<&'a str>,
+    /// The name of the installed file, or of the archive it came in.
+    hint: Option<&'a str>,
+}
+
+/// Which rule of [`Release::candidates`] found what it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Pattern,
+    Name { archives: bool },
+    Platform,
+}
+
+/// The files out of `files` that fit `hint`. `hint` is the name of the
+/// installed file: whatever in it is part of a version is ignored, the rest
+/// of the name and the architecture have to match. Without a hint, the
+/// files built for `here` fit.
+fn fitting<'a>(files: Vec<&'a String>, hint: Option<&str>, here: Option<Arch>) -> Vec<&'a String> {
+    let wanted = hint.map(AssetName::parse);
+    let named: Vec<(&String, AssetName)> =
+        files.into_iter().map(|url| (url, AssetName::parse(url))).collect();
+    // A name without an architecture is the build for this machine, unless
+    // another file of the same kind names this machine's: then it is the
+    // build for some other one, the way electron-builder leaves the x86_64
+    // AppImage unlabeled next to an `-arm64` one. Only files of the kind
+    // asked about count, Obsidian's `_amd64.deb` says nothing about them.
+    let labels_here = here.is_some() && named.iter().any(|(_, name)| name.arch == here);
+    let unlabeled = if labels_here { None } else { here };
+    named
+        .into_iter()
+        .filter(|(_, candidate)| match &wanted {
+            Some(wanted) => {
+                candidate.words == wanted.words
+                    && arch_fits(wanted.arch, candidate.arch, here, unlabeled)
+            }
+            None => arch_fits(None, candidate.arch, here, unlabeled),
+        })
+        .map(|(url, _)| url)
+        .collect()
+}
+
+/// Whether an asset name says it is built for a platform other than Linux:
+/// one of its words is `mac`, `macos`, `osx`, `darwin`, `win`, `windows` or
+/// `android`, digits after it aside, as in `Win64`.
+fn for_other_platform(name: &str) -> bool {
+    last_segment(name)
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|word| word.trim_end_matches(|c: char| c.is_ascii_digit()))
+        .any(|word| {
+            matches!(
+                word,
+                "mac" | "macos" | "macosx" | "osx" | "darwin" | "win" | "windows" | "android"
+            )
+        })
+}
+
+/// The download URL of the file to update to, out of a release.
+fn pick_asset(release: &Release, owner: &str, repo: &str, wanted: Wanted) -> Result<String> {
+    release.pick(wanted, Arch::current()).map_err(|reason| Error::NoMatchingAsset {
         release: match &release.tag {
             Some(tag) => format!("release {tag} of github:{owner}/{repo}"),
             None => format!("the release of github:{owner}/{repo} it follows"),
@@ -1001,7 +1177,10 @@ struct AssetName {
 impl AssetName {
     fn parse(name: &str) -> Self {
         let file = last_segment(name).to_lowercase();
-        let stem = file.strip_suffix(".appimage").unwrap_or(&file);
+        let stem = file
+            .strip_suffix(".appimage")
+            .or_else(|| archive::strip_archive_suffix(&file))
+            .unwrap_or(&file);
         let tokens: Vec<&str> =
             stem.split(|c: char| !c.is_alphanumeric()).filter(|token| !token.is_empty()).collect();
 
@@ -1171,6 +1350,10 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
     let Some(mut rest) = name.strip_prefix(first) else { return false };
 
     let mut parts = parts.peekable();
+    // Without a wildcard, the pattern is the whole name.
+    if parts.peek().is_none() {
+        return rest.is_empty();
+    }
     while let Some(part) = parts.next() {
         if parts.peek().is_none() {
             // The last piece has to sit at the end, unless the pattern
@@ -2032,6 +2215,7 @@ mod tests {
                 repo: "repo".to_string(),
                 tag: None,
                 asset: Some("App.AppImage".to_string()),
+                pattern: None,
             })
         );
         assert_eq!(github_source_from_url("https://example.com/App.AppImage"), None);
@@ -2047,6 +2231,7 @@ mod tests {
                 repo: "AppImageUpdate".to_string(),
                 tag: Some("continuous".to_string()),
                 asset: Some("appimageupdatetool-x86_64.AppImage".to_string()),
+                pattern: None,
             })
         );
     }
@@ -2056,8 +2241,14 @@ mod tests {
         release_with(tag, names)
     }
 
+    /// What an update source without a pattern wants, for the installed
+    /// file `hint`.
+    fn hinted(hint: Option<&str>) -> Wanted<'_> {
+        Wanted { pattern: None, hint }
+    }
+
     fn picked(release: &Release, hint: Option<&str>, here: Arch) -> Option<String> {
-        release.appimage(hint, Some(here)).ok().map(|url| last_segment(&url).to_string())
+        release.pick(hinted(hint), Some(here)).ok().map(|url| last_segment(&url).to_string())
     }
 
     #[test]
@@ -2201,7 +2392,7 @@ mod tests {
             ],
         );
         let error =
-            next.appimage(Some("App-1.0.0-x86_64.AppImage"), Some(Arch::X86_64)).unwrap_err();
+            next.pick(hinted(Some("App-1.0.0-x86_64.AppImage")), Some(Arch::X86_64)).unwrap_err();
         assert!(error.contains("2 of its AppImages match App-1.0.0-x86_64.AppImage"), "{error}");
         assert!(
             error.contains("App-2.0.0-x86_64.AppImage, App-2.1.0-beta-x86_64.AppImage"),
@@ -2212,18 +2403,29 @@ mod tests {
     }
 
     #[test]
-    fn another_variant_is_no_match_and_says_what_there_is() {
+    fn another_variant_is_taken_only_when_it_is_the_one_build_left_for_this_machine() {
+        let hint = hinted(Some("App-qt5-1.0-x86_64.AppImage"));
         let next = names_in("v2.0", &["App-qt6-2.0-x86_64.AppImage", "App-qt6-2.0-arm64.AppImage"]);
-        let error =
-            next.appimage(Some("App-qt5-1.0-x86_64.AppImage"), Some(Arch::X86_64)).unwrap_err();
+        assert_eq!(
+            picked(&next, hint.hint, Arch::X86_64).as_deref(),
+            Some("App-qt6-2.0-x86_64.AppImage")
+        );
+
+        let next =
+            names_in("v2.0", &["App-qt6-2.0-x86_64.AppImage", "App-gtk-2.0-x86_64.AppImage"]);
+        let error = next.pick(hint, Some(Arch::X86_64)).unwrap_err();
         assert!(
-            error.contains("none of its AppImages matches App-qt5-1.0-x86_64.AppImage"),
+            error.contains(
+                "none of its AppImages matches App-qt5-1.0-x86_64.AppImage, and 2 are left for \
+                 this machine once the builds for other platforms are set aside"
+            ),
             "{error}"
         );
         assert!(
-            error.contains("App-qt6-2.0-x86_64.AppImage, App-qt6-2.0-arm64.AppImage"),
+            error.contains("App-qt6-2.0-x86_64.AppImage, App-gtk-2.0-x86_64.AppImage"),
             "{error}"
         );
+        assert!(error.contains("--asset"), "{error}");
     }
 
     #[test]
@@ -2234,20 +2436,221 @@ mod tests {
             picked(&release, None, Arch::Aarch64).as_deref(),
             Some("App-2-aarch64.AppImage")
         );
-        let error = release.appimage(None, Some(Arch::Armhf)).unwrap_err();
+        let error = release.pick(hinted(None), Some(Arch::Armhf)).unwrap_err();
         assert!(error.contains("none of its AppImages matches one built for armhf"), "{error}");
 
         let variants = names_in("v2", &["App-2-x86_64.AppImage", "App-Lite-2-x86_64.AppImage"]);
-        let error = variants.appimage(None, Some(Arch::X86_64)).unwrap_err();
+        let error = variants.pick(hinted(None), Some(Arch::X86_64)).unwrap_err();
         assert!(error.contains("2 of its AppImages match one built for x86_64"), "{error}");
     }
 
+    /// What HarbourMasters/Shipwright does: a new codename in every file
+    /// name, one archive per platform, and the AppImage inside the Linux one.
     #[test]
-    fn a_release_without_appimages_offers_nothing() {
+    fn a_new_codename_is_found_through_the_one_build_for_linux() {
+        let next = names_in(
+            "9.3.0",
+            &["SoH-Blue-Echo-Linux.zip", "SoH-Blue-Echo-Mac.zip", "SoH-Blue-Echo-Win64.zip"],
+        );
+        let hint = hinted(Some("SoH-Ackbar-Delta-Linux.zip"));
+        let (fits, rule) = next.candidates(hint, Some(Arch::X86_64));
+        assert_eq!(rule, Rule::Platform);
+        assert_eq!(names(&fits), "SoH-Blue-Echo-Linux.zip");
+        assert!(next.has_asset(hint));
+
+        // The same name in the next release is found by name, as before.
+        let same = names_in("9.3.1", &["SoH-Blue-Echo-Linux.zip", "SoH-Blue-Echo-Win64.zip"]);
+        let (fits, rule) = same.candidates(hinted(Some("SoH-Blue-Echo-Linux.zip")), None);
+        assert_eq!(
+            (names(&fits).as_str(), rule),
+            ("SoH-Blue-Echo-Linux.zip", Rule::Name { archives: true })
+        );
+
+        // Two Linux builds left is no guess.
+        let two = names_in(
+            "9.4.0",
+            &["SoH-Foxtrot-Linux.zip", "SoH-Foxtrot-Linux-Debug.zip", "SoH-Foxtrot-Mac.zip"],
+        );
+        let error = two.pick(hint, Some(Arch::X86_64)).unwrap_err();
+        assert!(
+            error.contains(
+                "none of its archives matches SoH-Ackbar-Delta-Linux.zip, and 2 are left"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("SoH-Foxtrot-Linux.zip, SoH-Foxtrot-Linux-Debug.zip"), "{error}");
+
+        // A build labeled for another machine is not this machine's.
+        let arm = names_in("9.5.0", &["SoH-Golf-Linux-arm64.zip", "SoH-Golf-Win64.zip"]);
+        let error = arm.pick(hint, Some(Arch::X86_64)).unwrap_err();
+        assert!(error.contains("none is left for this machine"), "{error}");
+        assert!(error.contains("SoH-Golf-Linux-arm64.zip, SoH-Golf-Win64.zip"), "{error}");
+    }
+
+    #[test]
+    fn the_names_of_other_platforms_are_recognised() {
+        for name in [
+            "App-macOS-universal.zip",
+            "app_darwin_arm64.tar.gz",
+            "App-OSX.zip",
+            "App-Mac.zip",
+            "App-win32.zip",
+            "App-Win64.zip",
+            "App-Windows-x64.zip",
+            "App-android.zip",
+        ] {
+            assert!(for_other_platform(name), "{name}");
+        }
+        for name in ["App-Linux-x86_64.zip", "Winamp-Linux.zip", "Machinery.AppImage", "soh.zip"] {
+            assert!(!for_other_platform(name), "{name}");
+        }
+    }
+
+    /// Archives only come into it when no AppImage does: a release that
+    /// ships an AppImage beside Windows and macOS zips is read as before.
+    #[test]
+    fn an_appimage_beats_any_archive() {
+        let release = names_in(
+            "v2.0",
+            &[
+                "App-2.0-x86_64.AppImage",
+                "App-2.0-x86_64.zip",
+                "App-2.0-Win64.zip",
+                "App-2.0-Mac.zip",
+            ],
+        );
+        for hint in [None, Some("App-1.0-x86_64.AppImage")] {
+            assert_eq!(
+                picked(&release, hint, Arch::X86_64).as_deref(),
+                Some("App-2.0-x86_64.AppImage"),
+                "{hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_picks_the_asset_whatever_the_names_say() {
+        let release = names_in(
+            "9.4.0",
+            &[
+                "SoH-Foxtrot-Linux.zip",
+                "SoH-Foxtrot-Linux-Debug.zip",
+                "SoH-Foxtrot-Mac.zip",
+                "soh-foxtrot.AppImage",
+            ],
+        );
+        let wanted = |pattern| Wanted { pattern: Some(pattern), hint: Some("soh-ackbar.AppImage") };
+
+        let (fits, rule) = release.candidates(wanted("SoH-*-Linux.zip"), Some(Arch::X86_64));
+        assert_eq!((names(&fits).as_str(), rule), ("SoH-Foxtrot-Linux.zip", Rule::Pattern));
+        // Case does not count, as with the names of the files.
+        assert_eq!(
+            picked_by(&release, wanted("soh-*-linux.ZIP")).as_deref(),
+            Some("SoH-Foxtrot-Linux.zip")
+        );
+        // Not even an AppImage that matches by name comes first.
+        assert_eq!(
+            picked_by(&release, wanted("SoH-*-Linux-Debug.zip")).as_deref(),
+            Some("SoH-Foxtrot-Linux-Debug.zip")
+        );
+
+        let error = release.pick(wanted("SoH-*-Linux*.zip"), Some(Arch::X86_64)).unwrap_err();
+        assert!(error.starts_with("2 of its assets match SoH-*-Linux*.zip"), "{error}");
+        assert!(error.contains("make the pattern narrower"), "{error}");
+        let error = release.pick(wanted("SoH-*-Linux.tar.gz"), Some(Arch::X86_64)).unwrap_err();
+        assert!(
+            error.starts_with(
+                "none of its assets matches SoH-*-Linux.tar.gz: SoH-Foxtrot-Linux.zip"
+            ),
+            "{error}"
+        );
+    }
+
+    fn picked_by(release: &Release, wanted: Wanted) -> Option<String> {
+        release.pick(wanted, Some(Arch::X86_64)).ok().map(|url| last_segment(&url).to_string())
+    }
+
+    #[test]
+    fn a_pattern_is_kept_with_the_update_source() {
+        assert_eq!(
+            parse_update_source("github:o/r#SoH-*-Linux.zip").unwrap(),
+            "github:o/r#SoH-*-Linux.zip"
+        );
+        assert_eq!(
+            parse_update_source("github:o/r@continuous#*.zip").unwrap(),
+            "github:o/r@continuous#*.zip"
+        );
+        for invalid in ["github:o/r#", "github:o/r#a b", "github:o/r#a/b.zip", "github:o/r#a#b"] {
+            assert!(parse_update_source(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(
+            source_from_setting(
+                "github:o/r#SoH-*-Linux.zip",
+                Some("/home/u/SoH-Ackbar-Delta-Linux.zip")
+            ),
+            UpdateSource::GitHubRelease {
+                owner: "o".to_string(),
+                repo: "r".to_string(),
+                tag: None,
+                asset: Some("SoH-Ackbar-Delta-Linux.zip".to_string()),
+                pattern: Some("SoH-*-Linux.zip".to_string()),
+            }
+        );
+
+        assert_eq!(
+            with_asset_pattern("github:o/r", "SoH-*-Linux.zip").unwrap(),
+            "github:o/r#SoH-*-Linux.zip"
+        );
+        assert_eq!(
+            with_asset_pattern("github:o/r#old*.zip", "new*.zip").unwrap(),
+            "github:o/r#new*.zip"
+        );
+        assert_eq!(
+            with_asset_pattern("github:o/r@continuous", "*.zip").unwrap(),
+            "github:o/r@continuous#*.zip"
+        );
+        // A release download URL follows its repository, as it does without.
+        assert_eq!(
+            with_asset_pattern(
+                "https://github.com/HarbourMasters/Shipwright/releases/download/9.2.3/SoH-Ackbar-Delta-Linux.zip",
+                "SoH-*-Linux.zip"
+            )
+            .unwrap(),
+            "github:HarbourMasters/Shipwright#SoH-*-Linux.zip"
+        );
+        assert!(matches!(
+            with_asset_pattern("https://example.com/App.zip", "*.zip"),
+            Err(Error::AssetNeedsGitHub(_))
+        ));
+        assert!(matches!(with_asset_pattern("manual", "*.zip"), Err(Error::AssetNeedsGitHub(_))));
+        assert!(matches!(
+            with_asset_pattern("github:o/r", "a b.zip"),
+            Err(Error::InvalidAssetPattern(_))
+        ));
+    }
+
+    #[test]
+    fn a_pattern_without_a_wildcard_is_the_whole_name() {
+        assert!(glob_matches("App.zip", "app.ZIP"));
+        assert!(!glob_matches("App.zip", "App.zip.sha256"));
+        assert!(!glob_matches("App.zip", "My-App.zip"));
+        assert!(glob_matches("App-*.zip", "App-1.zip"));
+        assert!(!glob_matches("App-*.zip", "App-1.zip.sha256"));
+    }
+
+    #[test]
+    fn an_archive_of_the_same_name_stands_in_and_without_one_nothing_is_offered() {
         let release = names_in("v1", &["App.tar.gz", "App.AppImage.zsync"]);
         assert_eq!(
-            release.appimage(Some("App.AppImage"), Some(Arch::X86_64)),
-            Err("the release has no AppImage".to_string())
+            picked(&release, Some("App.AppImage"), Arch::X86_64).as_deref(),
+            Some("App.tar.gz")
+        );
+
+        let release = names_in("v1", &["App.dmg", "App.AppImage.zsync", "App.zip.sha256"]);
+        assert_eq!(
+            release.pick(hinted(Some("App.AppImage")), Some(Arch::X86_64)),
+            Err("the release has neither an AppImage nor an archive that could hold one"
+                .to_string())
         );
     }
 
@@ -2313,7 +2716,7 @@ mod tests {
 
     fn followed(releases: &[Listed], hint: Option<&str>) -> Option<Release> {
         newest_where(published_releases(&listing(releases)), |release| {
-            !release.fitting(hint, Some(Arch::X86_64)).is_empty()
+            !release.candidates(hinted(hint), Some(Arch::X86_64)).0.is_empty()
         })
     }
 
@@ -2346,7 +2749,7 @@ mod tests {
             (Some("1.13.7".to_string()), false, None)
         );
         assert_eq!(
-            release.appimage(Some("Obsidian-1.13.7.AppImage"), Some(Arch::X86_64)).as_deref(),
+            release.pick(hinted(Some("Obsidian-1.13.7.AppImage")), Some(Arch::X86_64)).as_deref(),
             Ok("https://github.com/obsidianmd/obsidian-releases/releases/download/v1.13.7/Obsidian-1.13.7.AppImage")
         );
 
@@ -2381,25 +2784,26 @@ mod tests {
         ];
         let release = followed(releases, Some("Obsidian-1.13.6.AppImage")).unwrap();
         assert_eq!(release.tag.as_deref(), Some("v1.13.8"));
-        let error = pick_appimage(&release, "obsidianmd", "obsidian-releases", None).unwrap_err();
+        let error =
+            pick_asset(&release, "obsidianmd", "obsidian-releases", Wanted::default()).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "release v1.13.8 of github:obsidianmd/obsidian-releases: the release has no AppImage"
+            "release v1.13.8 of github:obsidianmd/obsidian-releases: the release has neither an \
+             AppImage nor an archive that could hold one"
         );
 
-        // AppImages that are all something else are no match either, and
-        // the newest release lists them.
+        // A release whose AppImages are all named something else has
+        // nothing by name, and is followed as long as it leaves one build
+        // for this machine: the project renamed its file.
         let releases: &[Listed] = &[
-            ("v3", false, false, &["Other-3-x86_64.AppImage"]),
+            ("v3", false, false, &["Other-3-x86_64.AppImage", "Other-3-arm64.AppImage"]),
             ("v2", false, false, &["Other-2-x86_64.AppImage"]),
         ];
         let release = followed(releases, Some("Obsidian-1.13.7.AppImage")).unwrap();
         assert_eq!(release.tag.as_deref(), Some("v3"));
-        let error =
-            release.appimage(Some("Obsidian-1.13.7.AppImage"), Some(Arch::X86_64)).unwrap_err();
-        assert!(
-            error.starts_with("none of its AppImages matches Obsidian-1.13.7.AppImage"),
-            "{error}"
+        assert_eq!(
+            picked(&release, Some("Obsidian-1.13.7.AppImage"), Arch::X86_64).as_deref(),
+            Some("Other-3-x86_64.AppImage")
         );
     }
 
@@ -2725,6 +3129,7 @@ mod tests {
             repo: repo.to_string(),
             tag: tag.map(str::to_string),
             asset: asset.map(str::to_string),
+            pattern: None,
         }
     }
 

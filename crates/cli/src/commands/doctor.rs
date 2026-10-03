@@ -102,6 +102,7 @@ fn describe_leftover(file: &Path) -> &'static str {
     match file.extension().and_then(|e| e.to_str()) {
         Some("bak") => "backup of the previous version",
         Some("new") => "half-finished download",
+        Some("archive") => "archive downloaded by an update that did not get to unpack it",
         Some("zs-old") => {
             "copy of the previous version, left by appimageupdatetool under an older appimg"
         }

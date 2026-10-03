@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use appimg_core::digest::Verified;
 use appimg_core::install::{IconChoice, InstallRequest};
 use appimg_core::metadata::AppImageInfo;
 use appimg_core::update::{self, UpdateSource};
-use appimg_core::{download, install, list, metadata, Paths};
+use appimg_core::{archive, download, install, list, metadata, Paths};
 use tempfile::TempDir;
 
 use crate::cli::{EntryArgs, InstallArgs};
@@ -14,9 +15,7 @@ use crate::Outcome;
 pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     // Something that is no update source is refused before anything is
     // downloaded.
-    if let Some(source) = &args.entry.update_source {
-        update::parse_update_source(source)?;
-    }
+    check_entry_args(&args.entry)?;
     // The temporary directory has to outlive the installation, a downloaded
     // AppImage lives in it until it has been copied into place.
     let (source, origin, _scratch) = resolve_source(ui, &args.source)?;
@@ -39,6 +38,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     if args.entry.update_source.is_none() {
         offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
+    apply_asset(&mut request, &args.entry)?;
 
     let plan = install::plan(paths, &request)?;
     if args.dry_run {
@@ -86,6 +86,31 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     Ok(Outcome::Done)
 }
 
+/// Refuses an update source, or an asset pattern, that is none, before
+/// anything is downloaded or run.
+pub(crate) fn check_entry_args(args: &EntryArgs) -> Result<()> {
+    if let Some(source) = &args.update_source {
+        update::parse_update_source(source)?;
+    }
+    if let Some(pattern) = &args.asset {
+        update::check_asset_pattern(pattern)?;
+        if let Some(source) = &args.update_source {
+            update::with_asset_pattern(source, pattern)?;
+        }
+    }
+    Ok(())
+}
+
+/// Keeps the pattern `--asset` gave with the update source the request
+/// ended up with, which has to follow GitHub releases.
+pub(crate) fn apply_asset(request: &mut InstallRequest, args: &EntryArgs) -> Result<()> {
+    if let Some(pattern) = &args.asset {
+        let source = request.update_source.as_deref().unwrap_or(update::MANUAL);
+        request.update_source = Some(update::with_asset_pattern(source, pattern)?);
+    }
+    Ok(())
+}
+
 /// Asks about the update source the AppStream metadata inside the AppImage
 /// suggests, yes by default, the way the TUI prefills it. `--yes` takes it
 /// and says so. With nobody to ask, on a pipe, it is left out and the flag
@@ -118,8 +143,9 @@ pub(crate) fn offer_suggested_source(
     Ok(())
 }
 
-/// Turns the argument into a local file. URLs are downloaded into a
-/// temporary directory that the caller keeps alive.
+/// Turns the argument into a local AppImage. URLs are downloaded, and an
+/// archive is unpacked, into a temporary directory that the caller keeps
+/// alive. The origin is what the user gave, archive or not.
 fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<TempDir>)> {
     if !download::is_url(source) {
         let path = PathBuf::from(source);
@@ -127,42 +153,64 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
             bail!("{} does not exist", path.display());
         }
         let absolute = path.canonicalize().unwrap_or(path);
+        let origin = absolute.to_string_lossy().into_owned();
+        if archive::Kind::of(&absolute).is_some() {
+            let scratch = scratch_dir("appimg-unpack-")?;
+            let dest = scratch.path().join("unpacked.AppImage");
+            let extracted = archive::extract_appimage(&absolute, &dest)?;
+            ui.info(&format!("Took {} out of {}", extracted.entry, absolute.display()));
+            install::check_file(&dest)?;
+            return Ok((dest, origin, Some(scratch)));
+        }
         // The same checks a download gets, before the metadata is read,
         // which runs the file.
         install::check_file(&absolute)?;
-        let origin = absolute.to_string_lossy().into_owned();
         return Ok((absolute, origin, None));
     }
 
-    let (dest, scratch) = download_appimage(ui, source)?;
-    // Before anything reads the metadata, which runs the file.
-    if let Some(verified) = install::verify_download(&dest, source)? {
-        ui.info(&format!("  {}", ui.dim(&verified.describe())));
-    }
-
+    // Against the digest its release publishes, before anything reads the
+    // metadata, which runs the file.
+    let (dest, scratch) =
+        download_appimage(ui, source, &|file| install::verify_download(file, source))?;
     Ok((dest, source.to_string(), Some(scratch)))
 }
 
-/// Downloads an AppImage into a temporary directory that the caller keeps
-/// alive, with the checks every download gets: complete, flushed, and an
-/// ELF file at least as long as its squashfs says. Checking it against a
-/// published digest is up to the caller, which knows where to look.
-pub(crate) fn download_appimage(ui: &Ui, url: &str) -> Result<(PathBuf, TempDir)> {
-    let scratch = tempfile::Builder::new()
-        .prefix("appimg-download-")
+fn scratch_dir(prefix: &str) -> Result<TempDir> {
+    tempfile::Builder::new()
+        .prefix(prefix)
         .tempdir()
-        .context("cannot create a temporary directory for the download")?;
+        .context("cannot create a temporary directory for the download")
+}
+
+/// Downloads an AppImage, or an archive with one inside, into a temporary
+/// directory that the caller keeps alive, see
+/// [`download::appimage_or_archive`]: checked against what its release
+/// publishes with `verify`, the archive before it is unpacked, then
+/// complete, flushed, and an ELF file at least as long as its squashfs says.
+pub(crate) fn download_appimage(
+    ui: &Ui,
+    url: &str,
+    verify: &dyn Fn(&Path) -> appimg_core::Result<Option<Verified>>,
+) -> Result<(PathBuf, TempDir)> {
+    let scratch = scratch_dir("appimg-download-")?;
     let dest = scratch.path().join(download::file_name_from_url(url));
 
     ui.info(&format!("Downloading {}", ui.accent(url)));
     let mut progress = ui.progress();
-    let bytes = download::appimage_to_file(
+    let fetched = download::appimage_or_archive(
         url,
         &dest,
+        verify,
         Some(&mut |done, total| progress.update(done, total)),
     )?;
     progress.finish();
-    ui.info(&format!("  {} downloaded", human_size(bytes)));
+    ui.info(&format!("  {} downloaded", human_size(fetched.bytes)));
+    if let Some(verified) = &fetched.verified {
+        ui.info(&format!("  {}", ui.dim(&verified.describe())));
+    }
+    if let Some(entry) = &fetched.unpacked {
+        ui.info(&format!("  took {entry} out of the archive"));
+    }
     Ok((dest, scratch))
 }
 

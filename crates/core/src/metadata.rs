@@ -135,7 +135,14 @@ pub fn appimage_type(appimage: &Path) -> Option<u8> {
     let mut head = [0u8; 11];
     let mut file = File::open(appimage).ok()?;
     file.read_exact(&mut head).ok()?;
-    if &head[0..4] != b"\x7fELF" || &head[8..10] != b"AI" {
+    appimage_magic(&head)
+}
+
+/// The AppImage type the first bytes of a file declare: the ELF magic, and
+/// `AI` with the type behind it at offset 8, where an ELF header leaves
+/// room. `None` for bytes that declare none.
+pub fn appimage_magic(head: &[u8]) -> Option<u8> {
+    if head.len() < 11 || &head[0..4] != b"\x7fELF" || &head[8..10] != b"AI" {
         return None;
     }
     Some(head[10])
