@@ -54,6 +54,9 @@ pub struct InstallRequest {
     /// The GitHub release the file came out of, as `github:owner/repo@tag`,
     /// when it was downloaded from one.
     pub release: Option<String>,
+    /// The slug to install under instead of the one the name gives: an
+    /// import keeps the one the application had, whatever it was renamed to.
+    pub slug: Option<String>,
     /// Replace an existing installation with the same slug.
     pub overwrite: bool,
 }
@@ -85,6 +88,7 @@ impl InstallRequest {
                 .then(|| update::parse_update_source(origin).ok())
                 .flatten(),
             release: update::release_of_download(origin),
+            slug: None,
             overwrite: false,
         }
     }
@@ -152,7 +156,13 @@ pub struct InstallPlan {
 }
 
 pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
-    let slug = slug::slugify(&request.name)?;
+    let slug = match &request.slug {
+        Some(slug) => {
+            slug::check(slug)?;
+            slug.clone()
+        }
+        None => slug::slugify(&request.name)?,
+    };
     let appimage_path = paths.appimage_path(&slug);
     let desktop_entry_path = paths.desktop_entry_path(&slug);
     let categories = effective_categories(request)?;
@@ -331,6 +341,7 @@ mod tests {
             update_info: None,
             update_source: None,
             release: None,
+            slug: None,
             overwrite: false,
         }
     }

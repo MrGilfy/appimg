@@ -42,6 +42,23 @@ project adheres to [Semantic Versioning](https://semver.org/).
   appimages directory, `~/Applications` and `~/.local/bin`, with the
   foreign entries that launch each one and the exact `appimg adopt`
   command for it. It runs none of them and changes nothing.
+- `appimg export [FILE]` writes every managed AppImage to a versioned JSON
+  file, or to standard output: slug, name, comment, categories, launch
+  arguments, terminal flag, update source, origin, and the installed
+  version for information. `appimg import FILE` installs them on another
+  machine, downloading each again, from the first of these it has: the
+  newest matching AppImage of a `github:` update source, picked by the
+  file name it was installed from; an update source that is a URL; the
+  URL it was installed from, brought up to date right away when it has
+  something to update from. The entry gets what the export holds, under
+  the slug it had, without asking about AppStream. Downloads get the
+  digest, ELF and squashfs checks an install gives them. An app that is
+  installed already is skipped, one with none of these is listed at the
+  end with what it needs, and one that fails does not stop the others. One
+  whose update right after the install fails stays installed at the
+  version it was installed from, and the output says only the update
+  failed. The exit code is 1 if anything failed. A format version it does
+  not know is refused, and `--dry-run` shows the plan and changes nothing.
 
 ### Changed
 

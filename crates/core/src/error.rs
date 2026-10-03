@@ -11,6 +11,9 @@ pub enum Error {
     #[error("the name {0:?} contains no usable characters")]
     InvalidName(String),
 
+    #[error("{0:?} is not a slug: lowercase letters, digits, '.', '_' and '-' only")]
+    InvalidSlug(String),
+
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -90,6 +93,15 @@ pub enum Error {
          sha256:{expected}: what arrived is not the file the release holds"
     )]
     DigestMismatch { url: String, found: String, expected: String },
+
+    #[error("not an appimg export: {0}")]
+    NotAnExport(String),
+
+    #[error(
+        "the export has format version {found}, which this appimg does not know: it reads \
+         version {supported}"
+    )]
+    UnknownExportVersion { found: u64, supported: u64 },
 }
 
 impl Error {

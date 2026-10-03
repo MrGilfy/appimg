@@ -519,6 +519,65 @@ fn full_download(
     Ok(UpdateOutcome { digest: verified, ..outcome })
 }
 
+/// The version to record for a file: the one it declares, unless that is a
+/// build id or there is none, then what the release it came out of knows,
+/// then what its file name says.
+fn version_to_record(
+    declared: Option<String>,
+    from_release: Option<String>,
+    file_name: &str,
+) -> Option<String> {
+    match declared {
+        // A build id says nothing about age. Recording the date of the
+        // release it was downloaded from is what lets the next check tell
+        // whether this file has fallen behind.
+        Some(declared) if version::is_rolling(&declared) => from_release.or(Some(declared)),
+        Some(declared) => Some(declared),
+        None => from_release.or_else(|| version::extract(file_name)),
+    }
+}
+
+/// The AppImage a `github:` update source offers now, picked the way an
+/// update picks it, with what its release publishes about it.
+#[derive(Debug, Clone)]
+pub struct ReleaseAsset {
+    pub url: String,
+    /// `github:owner/repo@tag`, for [`desktop_entry::KEY_RELEASE`].
+    pub release: Option<String>,
+    /// What the release publishes for the file, to check it against.
+    pub published: Published,
+    /// The version the release knows, for a file that declares none worth
+    /// keeping.
+    from_release: Option<String>,
+}
+
+impl ReleaseAsset {
+    /// The version to record for the file, which declares `declared`, the
+    /// way an update records it.
+    pub fn version_for(&self, declared: Option<String>) -> Option<String> {
+        version_to_record(declared, self.from_release.clone(), last_segment(&self.url))
+    }
+}
+
+/// The newest AppImage the `github:owner/repo[@tag]` update source
+/// `source` offers: out of the newest release that has one matching
+/// `asset_hint`, the file name of an earlier download, the way an update
+/// finds it. One request for the releases.
+pub fn newest_asset(source: &str, asset_hint: Option<&str>) -> Result<ReleaseAsset> {
+    let invalid = || Error::InvalidUpdateSource(source.to_string());
+    let (owner, repo, tag) =
+        source.strip_prefix("github:").and_then(github_spec).ok_or_else(invalid)?;
+    let release = release_to_follow(&owner, &repo, tag.as_deref(), |r| r.has_appimage(asset_hint))?;
+    let url = pick_appimage(&release, &owner, &repo, asset_hint)?;
+    let from = Provenance::of(&owner, &repo, &release);
+    Ok(ReleaseAsset {
+        published: release.published_for(&url),
+        release: from.release,
+        from_release: from.version,
+        url,
+    })
+}
+
 /// Drops the backup of a successful update, and with it anything else the
 /// update left next to the AppImage. Once the new binary is confirmed, none
 /// of it is worth the disk it sits on.
@@ -578,16 +637,11 @@ fn finish(
         None => Vec::new(),
     };
 
-    let new_version = match info.as_ref().and_then(|info| info.version.clone()) {
-        // A build id says nothing about age. Recording the date of the
-        // release it was downloaded from is what lets the next check tell
-        // whether this file has fallen behind.
-        Some(declared) if version::is_rolling(&declared) => from_release.or(Some(declared)),
-        Some(declared) => Some(declared),
-        None => from_release.or_else(|| {
-            version::extract(&target.file_name().unwrap_or_default().to_string_lossy())
-        }),
-    };
+    let new_version = version_to_record(
+        info.as_ref().and_then(|info| info.version.clone()),
+        from_release,
+        &target.file_name().unwrap_or_default().to_string_lossy(),
+    );
 
     let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
     entry.set_optional(desktop_entry::KEY_VERSION, new_version.clone());

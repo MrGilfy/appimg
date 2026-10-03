@@ -2,6 +2,8 @@ pub mod adopt;
 pub mod completions;
 pub mod doctor;
 pub mod edit;
+pub mod export;
+pub mod import;
 pub mod install;
 pub mod list;
 pub mod remove;

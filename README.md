@@ -28,6 +28,8 @@ Run `appimg` without arguments for the TUI, or go straight to a command:
     appimg install https://example.com/someapp.AppImage
     appimg adopt ~/Applications/someapp.AppImage
     appimg adopt --scan
+    appimg export apps.json
+    appimg import apps.json
     appimg list --json
     appimg update --all --check
     appimg remove someapp

@@ -228,10 +228,48 @@ pub fn build_exec_line(binary: &Path, extra_args: &[String], field_code: Option<
     tokens.join(" ")
 }
 
+/// The extra arguments an `Exec` line [`build_exec_line`] wrote passes the
+/// AppImage: every token after the program, unquoted the way that function
+/// quotes them, without the field code at the end.
+pub fn exec_arguments(exec: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = exec.chars().peekable();
+    loop {
+        while chars.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(first) = chars.next() else {
+            break;
+        };
+        let mut token = String::new();
+        if first == '"' {
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => token.extend(chars.next()),
+                    c => token.push(c),
+                }
+            }
+        } else {
+            token.push(first);
+            while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                token.push(c);
+            }
+        }
+        tokens.push(token);
+    }
+    if tokens.last().is_some_and(|last| FIELD_CODES.contains(&last.as_str())) {
+        tokens.pop();
+    }
+    tokens.into_iter().skip(1).collect()
+}
+
+/// The field codes an `Exec` line can end in, the ones that take files or
+/// URLs, which are the ones carried over.
+const FIELD_CODES: [&str; 4] = ["%U", "%F", "%u", "%f"];
+
 /// Returns the field code an embedded `Exec` line declared, if any. Only the
 /// codes that accept files or URLs are carried over.
 pub fn field_code_of(exec: &str) -> Option<&'static str> {
-    ["%U", "%F", "%u", "%f"].into_iter().find(|code| exec.contains(code))
+    FIELD_CODES.into_iter().find(|code| exec.contains(code))
 }
 
 #[cfg(test)]
@@ -332,6 +370,26 @@ Exec=AppRun --new-window
             None,
         );
         assert_eq!(exec, "\"/a.AppImage\" --flag \"two words\"");
+    }
+
+    /// What an export reads out of an entry is what the install wrote into
+    /// it, however the arguments had to be quoted.
+    #[test]
+    fn the_arguments_of_an_exec_line_read_back_as_they_were_written() {
+        let binary = PathBuf::from("/home/u/My Apps/a.AppImage");
+        let cases: [&[&str]; 4] = [
+            &[],
+            &["--flag", "two words", "--x=\"q\"", "back\\slash", "$HOME", "`cmd`", ""],
+            &["it's", "a;b", "%%"],
+            &["--only"],
+        ];
+        for args in cases {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            for code in [None, Some("%U"), Some("%f")] {
+                let exec = build_exec_line(&binary, &args, code);
+                assert_eq!(exec_arguments(&exec), args, "{exec}");
+            }
+        }
     }
 
     #[test]

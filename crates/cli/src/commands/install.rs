@@ -134,27 +134,36 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
         return Ok((absolute, origin, None));
     }
 
-    let scratch = tempfile::Builder::new()
-        .prefix("appimg-download-")
-        .tempdir()
-        .context("cannot create a temporary directory for the download")?;
-    let dest = scratch.path().join(download::file_name_from_url(source));
-
-    ui.info(&format!("Downloading {}", ui.accent(source)));
-    let mut progress = ui.progress();
-    let bytes = download::appimage_to_file(
-        source,
-        &dest,
-        Some(&mut |done, total| progress.update(done, total)),
-    )?;
-    progress.finish();
-    ui.info(&format!("  {} downloaded", human_size(bytes)));
+    let (dest, scratch) = download_appimage(ui, source)?;
     // Before anything reads the metadata, which runs the file.
     if let Some(verified) = install::verify_download(&dest, source)? {
         ui.info(&format!("  {}", ui.dim(&verified.describe())));
     }
 
     Ok((dest, source.to_string(), Some(scratch)))
+}
+
+/// Downloads an AppImage into a temporary directory that the caller keeps
+/// alive, with the checks every download gets: complete, flushed, and an
+/// ELF file at least as long as its squashfs says. Checking it against a
+/// published digest is up to the caller, which knows where to look.
+pub(crate) fn download_appimage(ui: &Ui, url: &str) -> Result<(PathBuf, TempDir)> {
+    let scratch = tempfile::Builder::new()
+        .prefix("appimg-download-")
+        .tempdir()
+        .context("cannot create a temporary directory for the download")?;
+    let dest = scratch.path().join(download::file_name_from_url(url));
+
+    ui.info(&format!("Downloading {}", ui.accent(url)));
+    let mut progress = ui.progress();
+    let bytes = download::appimage_to_file(
+        url,
+        &dest,
+        Some(&mut |done, total| progress.update(done, total)),
+    )?;
+    progress.finish();
+    ui.info(&format!("  {} downloaded", human_size(bytes)));
+    Ok((dest, scratch))
 }
 
 /// Extraction failed, so name, icon and categories would be guesses. Say

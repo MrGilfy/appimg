@@ -60,6 +60,63 @@ pub fn bool_field(json: &str, key: &str) -> Option<bool> {
     None
 }
 
+/// The first `"key": <number>` in the document, a whole number that is not
+/// negative.
+pub fn number_field(json: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let mut position = 0;
+
+    while let Some(found) = json[position..].find(&needle) {
+        position += found + needle.len();
+        let Some(value) = json[position..].trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let value = value.trim_start();
+        let digits = value.len() - value.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let rest = value[digits..].trim_start();
+        let ends = rest.is_empty() || rest.starts_with([',', '}', ']']);
+        if digits > 0 && ends {
+            return value[..digits].parse().ok();
+        }
+    }
+    None
+}
+
+/// The strings of the array the first `"key": [...]` in the document holds.
+/// `None` when there is no such array, or something in it is no string.
+pub fn string_array_field(json: &str, key: &str) -> Option<Vec<String>> {
+    let needle = format!("\"{key}\"");
+    let mut position = 0;
+
+    while let Some(found) = json[position..].find(&needle) {
+        position += found + needle.len();
+        let rest = json[position..].trim_start();
+        let Some(value) = rest.strip_prefix(':') else {
+            continue;
+        };
+        let Some(mut rest) = value.trim_start().strip_prefix('[') else {
+            continue;
+        };
+        let mut values = Vec::new();
+        loop {
+            rest = rest.trim_start();
+            if rest.starts_with(']') {
+                return Some(values);
+            }
+            let start = json.len() - rest.len();
+            let (value, end) = read_string(json, start)?;
+            values.push(value);
+            rest = json[end..].trim_start();
+            rest = match rest.strip_prefix(',') {
+                Some(after) => after,
+                None if rest.starts_with(']') => rest,
+                None => return None,
+            };
+        }
+    }
+    None
+}
+
 /// The objects of a top-level array, each as the part of the document it
 /// spans, so the fields of one can be read without those of the next.
 /// Brackets inside strings do not count.
@@ -257,6 +314,32 @@ mod tests {
 
         assert!(array_field_objects(r#"{"assets": "none"}"#, "assets").is_empty());
         assert!(array_field_objects(r#"{"other": []}"#, "assets").is_empty());
+    }
+
+    #[test]
+    fn reads_numbers() {
+        let json = r#"{"name": "version 3", "version" : 12, "other": 1.5, "last": 7}"#;
+        assert_eq!(number_field(json, "version"), Some(12));
+        assert_eq!(number_field(json, "other"), None);
+        assert_eq!(number_field(json, "last"), Some(7));
+        assert_eq!(number_field(r#"{"v": "1"}"#, "v"), None);
+        assert_eq!(number_field(r#"{"v": -1}"#, "v"), None);
+        assert_eq!(number_field(r#"{"v": 1e3}"#, "v"), None);
+        assert_eq!(number_field(r#"{}"#, "v"), None);
+    }
+
+    #[test]
+    fn reads_arrays_of_strings() {
+        let json = r#"{"a": ["x", "y \"z\"", ""], "b": [], "c": ["x", 1], "d": "no", "e": ["x""#;
+        assert_eq!(
+            string_array_field(json, "a"),
+            Some(vec!["x".to_string(), "y \"z\"".to_string(), String::new()])
+        );
+        assert_eq!(string_array_field(json, "b"), Some(Vec::new()));
+        assert_eq!(string_array_field(json, "c"), None);
+        assert_eq!(string_array_field(json, "d"), None);
+        assert_eq!(string_array_field(json, "e"), None);
+        assert_eq!(string_array_field(json, "missing"), None);
     }
 
     #[test]

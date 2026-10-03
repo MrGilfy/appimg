@@ -109,7 +109,11 @@ fn check(ui: &Ui, apps: &[InstalledApp], json: bool) -> Result<Outcome> {
 }
 
 /// Updates one application. Returns `None` when there was nothing to do.
-fn update_one(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<Option<UpdateOutcome>> {
+pub(crate) fn update_one(
+    paths: &Paths,
+    ui: &Ui,
+    app: &InstalledApp,
+) -> Result<Option<UpdateOutcome>> {
     // A source that cannot be checked can still be re-downloaded.
     let status = update::check(app).ok();
     if let Some(status) = &status {

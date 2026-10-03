@@ -27,6 +27,16 @@ pub fn slugify(name: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// Checks a slug that comes from elsewhere, such as an export, before it
+/// names any file: it has to be one [`slugify`] could have made, so it
+/// stays inside the directory it is joined to.
+pub fn check(slug: &str) -> Result<()> {
+    match slugify(slug) {
+        Ok(made) if made == slug => Ok(()),
+        _ => Err(Error::InvalidSlug(slug.to_string())),
+    }
+}
+
 /// Strips a trailing `.AppImage` and a trailing version suffix from a file
 /// name so it can serve as a default application name.
 pub fn name_from_filename(file_name: &str) -> String {

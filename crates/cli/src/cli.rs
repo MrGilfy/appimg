@@ -45,6 +45,10 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Change the desktop entry of an installed AppImage in $EDITOR.
     Edit(EditArgs),
+    /// Write the installed AppImages to a file another machine can import.
+    Export(ExportArgs),
+    /// Install the AppImages an export lists, downloading each again.
+    Import(ImportArgs),
     /// Check the environment and look for leftovers.
     Doctor,
     /// Print a shell completion script.
@@ -190,6 +194,22 @@ pub struct RemoveArgs {
 pub struct EditArgs {
     /// Name or slug of the application to edit.
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// The file to write. Without one, the export goes to standard output.
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct ImportArgs {
+    /// A file `appimg export` wrote.
+    pub file: PathBuf,
+
+    /// Show what would be installed and from where, and change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]
