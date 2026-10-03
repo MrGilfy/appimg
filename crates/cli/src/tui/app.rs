@@ -323,6 +323,9 @@ impl App {
     }
 
     fn inspect(&mut self, path: PathBuf) -> Result<()> {
+        // The same checks a download gets, before the metadata is read,
+        // which runs the file.
+        install::check_file(&path)?;
         let info = metadata::inspect(&path, appimg_core::current_locale().as_deref())?;
         // Not extracting is not fatal here, the form asks for name and icon
         // anyway, but the reason belongs on screen.

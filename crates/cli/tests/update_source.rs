@@ -26,18 +26,35 @@ impl Home {
     fn new() -> Self {
         let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        for sub in ["home", "data", "config", "tmp", "downloads"] {
+        for sub in ["home", "data", "config", "tmp", "downloads", "tools"] {
             fs::create_dir_all(root.join(sub)).unwrap();
         }
+        // The fixtures only start like an AppImage, so they extract through
+        // a stand-in for `unsquashfs`, called as `unsquashfs -no-progress -o
+        // OFFSET -d ROOT FILE`: it copies the payload the file names.
+        let unsquashfs = root.join("tools/unsquashfs");
+        fs::write(
+            &unsquashfs,
+            "#!/bin/sh\npayload=$(sed -n 's/^payload=//p' \"$6\")\nmkdir -p \"$5\"\n\
+             cp -R \"$payload/.\" \"$5/\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&unsquashfs, fs::Permissions::from_mode(0o755)).unwrap();
         Self { _dir: dir, root }
     }
 
     /// Runs `appimg` with these arguments, on a pipe, with nobody to answer
     /// a question.
     fn run(&self, args: &[&str]) -> Output {
+        let path = format!(
+            "{}:{}",
+            self.root.join("tools").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         Command::new(env!("CARGO_BIN_EXE_appimg"))
             .arg("--no-color")
             .args(args)
+            .env("PATH", path)
             .env("HOME", self.root.join("home"))
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -52,9 +69,11 @@ impl Home {
         fs::read_to_string(self.root.join(format!("data/applications/{slug}.desktop"))).unwrap()
     }
 
-    /// A shell script that behaves like an AppImage runtime: called with
-    /// `--appimage-extract` it drops a `squashfs-root` with a desktop entry,
-    /// and the AppStream metainfo given, next to itself.
+    /// A file that starts the way an AppImage does, with the ELF magic, and
+    /// names a payload directory with a desktop entry and the AppStream
+    /// metainfo given, which the stand-in for `unsquashfs` extracts. The
+    /// squashfs magic at the end is what tells appimg where the payload
+    /// starts.
     fn appimage(&self, file_name: &str, metainfo_urls: Option<&str>) -> PathBuf {
         let dir = self.root.join("downloads");
         let payload = dir.join(format!(".payload-{file_name}"));
@@ -75,11 +94,8 @@ impl Home {
             .unwrap();
         }
 
-        let script = format!(
-            "#!/bin/sh\nif [ \"$1\" != \"--appimage-extract\" ]; then exit 0; fi\n\
-             mkdir -p squashfs-root\ncp -R '{}/.' squashfs-root/\n",
-            payload.display()
-        );
+        let script =
+            format!("\x7fELF\npayload={}\n# fake AppImage runtime\nhsqs\n", payload.display());
         let path = dir.join(file_name);
         let partial = dir.join(format!(".{file_name}.partial"));
         let mut file = File::create(&partial).unwrap();

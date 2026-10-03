@@ -24,6 +24,45 @@ pub fn has_magic(path: &Path) -> bool {
     File::open(path).and_then(|mut file| file.read_exact(&mut magic)).is_ok() && &magic == ELF_MAGIC
 }
 
+/// Why a file is no complete AppImage, as far as its front can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unfit {
+    /// It does not start with the ELF magic every AppImage starts with.
+    NoElfHeader,
+    /// It is shorter than its front says a complete file is, see
+    /// [`minimum_length`].
+    CutShort { minimum: u64, actual: u64 },
+}
+
+impl std::fmt::Display for Unfit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unfit::NoElfHeader => write!(f, "it is not an AppImage, it does not start with an ELF header"),
+            Unfit::CutShort { minimum, actual } => write!(
+                f,
+                "it is cut short, a complete file is at least {minimum} bytes and this one is {actual}"
+            ),
+        }
+    }
+}
+
+/// The checks a file gets before anything runs it or installs it, whether
+/// it was downloaded or was on disk already: it starts the way every
+/// AppImage does, and it is at least as long as its front says. Only the
+/// front and the length are read, nothing is run.
+pub fn check_whole(path: &Path) -> Result<(), Unfit> {
+    if !has_magic(path) {
+        return Err(Unfit::NoElfHeader);
+    }
+    if let Some(minimum) = minimum_length(path) {
+        let actual = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if actual < minimum {
+            return Err(Unfit::CutShort { minimum, actual });
+        }
+    }
+    Ok(())
+}
+
 /// Where the ELF part of the file ends, which is where an AppImage keeps
 /// its squashfs payload. Reading the header beats scanning for magic bytes,
 /// because the magic can also appear inside the payload itself.

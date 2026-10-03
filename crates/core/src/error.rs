@@ -27,6 +27,18 @@ pub enum Error {
     #[error("{0} does not look like an AppImage")]
     NotAnAppImage(PathBuf),
 
+    #[error("{path}: {unfit}")]
+    Unfit { path: PathBuf, unfit: crate::elf::Unfit },
+
+    #[error("{path} is a symbolic link to {target}, adopt the file it points to instead")]
+    SymbolicLink { path: PathBuf, target: PathBuf },
+
+    #[error("{path} is already installed as {slug:?}")]
+    AlreadyManaged { path: PathBuf, slug: String },
+
+    #[error("{taken_by} is already there, so {slug:?} is taken: pass --name to adopt it under another name")]
+    SlugTaken { slug: String, taken_by: PathBuf },
+
     #[error("{0:?} is not a valid freedesktop main category")]
     InvalidCategory(String),
 

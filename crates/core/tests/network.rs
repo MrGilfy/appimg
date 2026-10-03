@@ -6,7 +6,7 @@ mod common;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +17,7 @@ use appimg_core::install::InstallRequest;
 use appimg_core::list::InstalledApp;
 use appimg_core::{download, install, list, metadata, update, zsync};
 
-use common::{read, walk, FakeAppImage, Sandbox};
+use common::{read, walk, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
 
 /// The path a request was made to, and the `Range` header it carried.
 type Asked = (String, Option<String>);
@@ -1347,44 +1347,6 @@ fn a_zsync_file_that_cannot_be_read_changes_nothing() {
     assert_eq!(walk(&sandbox.paths.data_home), files);
     // Not a byte of the AppImage was asked for.
     assert!(delta.payload_server.asked().is_empty());
-}
-
-/// Runs something with a stand-in for `unsquashfs` on `PATH`, the one way a
-/// `FakeAppImage::elf` build extracts: it copies the payload the file names
-/// into the directory it is asked to unpack to.
-fn with_unsquashfs_stand_in<T>(sandbox: &Sandbox, run: impl FnOnce() -> T) -> T {
-    let dir = sandbox.root.join("unsquashfs-tool");
-    std::fs::create_dir_all(&dir).unwrap();
-    let tool = dir.join("unsquashfs");
-    // Called as `unsquashfs -no-progress -o OFFSET -d ROOT FILE`.
-    std::fs::write(
-        &tool,
-        "#!/bin/sh\n\
-         payload=$(sed -n 's/^payload=//p' \"$6\")\n\
-         mkdir -p \"$5\"\n\
-         cp -R \"$payload/.\" \"$5/\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    with_tools_on_path(&dir, run)
-}
-
-/// Runs something with a directory prepended to `PATH`. The tests run one at
-/// a time, which is what makes this safe.
-fn with_tools_on_path<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
-    let previous = std::env::var_os("PATH");
-    let mut path = dir.as_os_str().to_os_string();
-    if let Some(existing) = &previous {
-        path.push(":");
-        path.push(existing);
-    }
-    std::env::set_var("PATH", path);
-    let result = run();
-    match previous {
-        Some(path) => std::env::set_var("PATH", path),
-        None => std::env::remove_var("PATH"),
-    }
-    result
 }
 
 /// Runs something with the GitHub API at `server`, which serves the release

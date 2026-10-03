@@ -3,6 +3,7 @@
 //! Nothing in here writes to a terminal or asks a question. Every decision a
 //! user could make arrives as data, every path comes from [`Paths`].
 
+pub mod adopt;
 pub mod appstream;
 pub mod caches;
 pub mod date;

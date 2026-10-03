@@ -115,28 +115,24 @@ pub fn appimage_to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>
     // page sent with a 200 and a matching Content-Length passes every check
     // on the transfer. Nothing is installed, and nothing replaces an
     // installed AppImage, unless it at least starts the way every AppImage
-    // does.
-    if !elf::has_magic(dest) {
+    // does. And a server that sends neither a Content-Length nor a chunked
+    // body and hangs up early leaves a file whose front is intact, but that
+    // front says how long a complete file is at least: the ELF header says
+    // where the payload starts, and a squashfs superblock there says how
+    // long the payload is. A file on disk gets the same checks before it is
+    // installed or adopted.
+    if let Err(unfit) = elf::check_whole(dest) {
         let _ = std::fs::remove_file(dest);
-        return Err(Error::Download(format!(
-            "{url}: the server sent a file that is not an AppImage, it does not start with an \
-             ELF header"
-        )));
-    }
-    // A server that sends neither a Content-Length nor a chunked body and
-    // hangs up early leaves a file whose front is intact, so it passes the
-    // check above. That front says how long a complete file is at least:
-    // the ELF header says where the payload starts, and a squashfs
-    // superblock there says how long the payload is.
-    if let Some(minimum) = elf::minimum_length(dest) {
-        let actual = fs_util::file_size(dest).unwrap_or(0);
-        if actual < minimum {
-            let _ = std::fs::remove_file(dest);
-            return Err(Error::Download(format!(
+        return Err(Error::Download(match unfit {
+            elf::Unfit::NoElfHeader => format!(
+                "{url}: the server sent a file that is not an AppImage, it does not start with \
+                 an ELF header"
+            ),
+            elf::Unfit::CutShort { minimum, actual } => format!(
                 "{url}: the download is cut short, a complete file is at least {minimum} bytes \
                  and the server sent {actual}"
-            )));
-        }
+            ),
+        }));
     }
     Ok(bytes)
 }

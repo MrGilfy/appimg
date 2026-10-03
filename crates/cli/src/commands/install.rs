@@ -7,14 +7,14 @@ use appimg_core::update::{self, UpdateSource};
 use appimg_core::{download, install, list, metadata, Paths};
 use tempfile::TempDir;
 
-use crate::cli::InstallArgs;
+use crate::cli::{EntryArgs, InstallArgs};
 use crate::ui::{human_size, Ui};
 use crate::Outcome;
 
 pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     // Something that is no update source is refused before anything is
     // downloaded.
-    if let Some(source) = &args.update_source {
+    if let Some(source) = &args.entry.update_source {
         update::parse_update_source(source)?;
     }
     // The temporary directory has to outlive the installation, a downloaded
@@ -26,17 +26,17 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     }
 
     let info = metadata::inspect(&source, appimg_core::current_locale().as_deref())?;
-    if info.extract_root().is_none() && !confirm_without_metadata(ui, &info)? {
+    if info.extract_root().is_none() && !confirm_without_metadata(ui, &info, "Install")? {
         ui.info("Nothing was installed.");
         return Ok(Outcome::NothingToDo);
     }
 
     let mut request = InstallRequest::from_info(&source, &origin, &info);
-    apply_overrides(&mut request, args)?;
+    apply_overrides(&mut request, &args.entry)?;
     if request.name.trim().is_empty() {
         bail!("no name could be determined, pass --name");
     }
-    if args.update_source.is_none() {
+    if args.entry.update_source.is_none() {
         offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
 
@@ -90,7 +90,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
 /// suggests, yes by default, the way the TUI prefills it. `--yes` takes it
 /// and says so. With nobody to ask, on a pipe, it is left out and the flag
 /// that sets it is named, since nobody confirmed it.
-fn offer_suggested_source(
+pub(crate) fn offer_suggested_source(
     ui: &Ui,
     request: &mut InstallRequest,
     info: &AppImageInfo,
@@ -127,6 +127,9 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
             bail!("{} does not exist", path.display());
         }
         let absolute = path.canonicalize().unwrap_or(path);
+        // The same checks a download gets, before the metadata is read,
+        // which runs the file.
+        install::check_file(&absolute)?;
         let origin = absolute.to_string_lossy().into_owned();
         return Ok((absolute, origin, None));
     }
@@ -156,22 +159,26 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
 
 /// Extraction failed, so name, icon and categories would be guesses. Say
 /// exactly what went wrong and let the user decide, unless --yes already
-/// decided.
-fn confirm_without_metadata(ui: &Ui, info: &appimg_core::AppImageInfo) -> Result<bool> {
+/// decided. `verb` is what is about to happen, `Install` or `Adopt`.
+pub(crate) fn confirm_without_metadata(
+    ui: &Ui,
+    info: &appimg_core::AppImageInfo,
+    verb: &str,
+) -> Result<bool> {
     ui.warn("the AppImage did not extract, so its name, icon and categories are unknown:");
     for problem in &info.extract_problems {
         ui.warn(&format!("  {problem}"));
     }
     ui.info(&format!(
-        "Installing anyway uses the name {:?} and the generic icon. Passing --name and --icon \
+        "Going ahead uses the name {:?} and the generic icon. Passing --name and --icon \
          instead gives the entry the values you want.",
         info.name.clone().unwrap_or_default()
     ));
 
-    ui.confirm("Install without the embedded metadata?", false)
+    ui.confirm(&format!("{verb} without the embedded metadata?"), false)
 }
 
-fn apply_overrides(request: &mut InstallRequest, args: &InstallArgs) -> Result<()> {
+pub(crate) fn apply_overrides(request: &mut InstallRequest, args: &EntryArgs) -> Result<()> {
     if let Some(name) = &args.name {
         request.name = name.clone();
     }

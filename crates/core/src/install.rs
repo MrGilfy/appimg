@@ -8,7 +8,7 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
-use crate::{caches, download, slug, update};
+use crate::{caches, download, elf, slug, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
 const DEFAULT_CATEGORY: &str = "Utility";
@@ -88,6 +88,13 @@ impl InstallRequest {
             overwrite: false,
         }
     }
+}
+
+/// The checks a file on disk gets before anything reads its metadata, which
+/// runs it, and before it is installed or adopted: the same ones a download
+/// gets, see [`elf::check_whole`].
+pub fn check_file(path: &Path) -> Result<()> {
+    elf::check_whole(path).map_err(|unfit| Error::Unfit { path: path.to_path_buf(), unfit })
 }
 
 /// Checks an AppImage downloaded from `url` against the digest its GitHub
@@ -190,11 +197,7 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
     fs_util::copy_atomic(&request.source, &plan.appimage_path, MODE_EXEC)?;
 
     let icons = install_icons(paths, request, &plan.slug);
-    let icon_field = if icons.is_empty() { FALLBACK_ICON.to_string() } else { plan.slug.clone() };
-
-    let mut entry = plan.desktop_entry;
-    entry.set("Icon", icon_field);
-    entry.write(&plan.desktop_entry_path)?;
+    write_entry(&plan, &icons)?;
 
     let validation_warnings = caches::validate_desktop_entry(&plan.desktop_entry_path);
     caches::refresh(paths);
@@ -209,7 +212,16 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
     })
 }
 
-fn install_icons(paths: &Paths, request: &InstallRequest, slug: &str) -> Vec<PathBuf> {
+/// Writes the planned desktop entry, with the icon the installed icons
+/// make it, or the generic one without any.
+pub(crate) fn write_entry(plan: &InstallPlan, icons: &[PathBuf]) -> Result<()> {
+    let icon_field = if icons.is_empty() { FALLBACK_ICON.to_string() } else { plan.slug.clone() };
+    let mut entry = plan.desktop_entry.clone();
+    entry.set("Icon", icon_field);
+    entry.write(&plan.desktop_entry_path)
+}
+
+pub(crate) fn install_icons(paths: &Paths, request: &InstallRequest, slug: &str) -> Vec<PathBuf> {
     match &request.icon {
         IconChoice::Fallback => Vec::new(),
         IconChoice::File(file) => icon::install_icon(file, slug, &paths.icons_root)

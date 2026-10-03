@@ -32,6 +32,9 @@ pub struct Cli {
 pub enum Command {
     /// Install an AppImage from a file or a URL.
     Install(InstallArgs),
+    /// Take over an AppImage that is already on disk, or list the ones that
+    /// could be.
+    Adopt(AdoptArgs),
     /// Show the installed AppImages.
     List(ListArgs),
     /// Update installed AppImages.
@@ -53,6 +56,53 @@ pub struct InstallArgs {
     /// Path to an AppImage file, or a URL to download it from.
     pub source: String,
 
+    #[command(flatten)]
+    pub entry: EntryArgs,
+
+    /// Show what would happen and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+#[command(group = clap::ArgGroup::new("what").args(["path", "scan"]).required(true))]
+pub struct AdoptArgs {
+    /// The AppImage file to take over. It moves into $XDG_DATA_HOME/appimages;
+    /// one in ~/.local/bin leaves a symbolic link to it behind.
+    pub path: Option<PathBuf>,
+
+    /// List the AppImages that could be adopted, with the command for each,
+    /// and change nothing: files appimg does not manage in its appimages
+    /// directory, ~/Applications and ~/.local/bin.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "copy", "keep_entries", "dry_run", "name", "comment", "categories", "args",
+            "terminal", "icon", "update_source",
+        ]
+    )]
+    pub scan: bool,
+
+    /// Copy the file and leave the original where it is, instead of moving it.
+    #[arg(long)]
+    pub copy: bool,
+
+    /// Leave desktop entries from elsewhere that launch the file alone,
+    /// without asking.
+    #[arg(long)]
+    pub keep_entries: bool,
+
+    #[command(flatten)]
+    pub entry: EntryArgs,
+
+    /// Show what would happen and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// What goes into the desktop entry, for an install and an adoption alike.
+#[derive(Debug, Args)]
+pub struct EntryArgs {
     /// Application name, defaults to what the AppImage declares.
     #[arg(long)]
     pub name: Option<String>,
@@ -83,10 +133,6 @@ pub struct InstallArgs {
     /// github:owner/repo@tag to follow that tag.
     #[arg(long, value_name = "URL|github:owner/repo")]
     pub update_source: Option<String>,
-
-    /// Show what would happen and write nothing.
-    #[arg(long)]
-    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

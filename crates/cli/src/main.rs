@@ -43,6 +43,7 @@ fn run(args: &Cli, ui: &Ui) -> anyhow::Result<Outcome> {
 
     match &args.command {
         Some(Command::Install(install_args)) => commands::install::run(&paths, ui, install_args),
+        Some(Command::Adopt(adopt_args)) => commands::adopt::run(&paths, ui, adopt_args),
         Some(Command::List(list_args)) => commands::list::run(&paths, ui, list_args),
         Some(Command::Update(update_args)) => commands::update::run(&paths, ui, update_args),
         Some(Command::UpdateSource(source_args)) => {

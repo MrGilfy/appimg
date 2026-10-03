@@ -259,3 +259,104 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
 }
+
+/// Runs something with a stand-in for `unsquashfs` on `PATH`, the one way a
+/// `FakeAppImage::elf` build extracts: it copies the payload the file names
+/// into the directory it is asked to unpack to.
+pub fn with_unsquashfs_stand_in<T>(sandbox: &Sandbox, run: impl FnOnce() -> T) -> T {
+    let dir = sandbox.root.join("unsquashfs-tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tool = dir.join("unsquashfs");
+    // Called as `unsquashfs -no-progress -o OFFSET -d ROOT FILE`.
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\n\
+         payload=$(sed -n 's/^payload=//p' \"$6\")\n\
+         mkdir -p \"$5\"\n\
+         cp -R \"$payload/.\" \"$5/\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    with_tools_on_path(&dir, run)
+}
+
+/// Runs something with a directory prepended to `PATH`. The tests run one at
+/// a time, which is what makes this safe.
+pub fn with_tools_on_path<T>(dir: &Path, run: impl FnOnce() -> T) -> T {
+    let previous = std::env::var_os("PATH");
+    let mut path = dir.as_os_str().to_os_string();
+    if let Some(existing) = &previous {
+        path.push(":");
+        path.push(existing);
+    }
+    std::env::set_var("PATH", path);
+    let result = run();
+    match previous {
+        Some(path) => std::env::set_var("PATH", path),
+        None => std::env::remove_var("PATH"),
+    }
+    result
+}
+
+/// What a file or link under a directory is, as far as telling whether it
+/// was touched goes: a file's mode and the SHA-256 of what it holds, or
+/// where a link points.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Node {
+    File { mode: u32, sha256: String },
+    Link(PathBuf),
+}
+
+/// Every file and symbolic link below `root`, by its path relative to it,
+/// with what it is. Directories are left out: creating one touches nothing
+/// that was there.
+pub fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Node> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if meta.file_type().is_symlink() {
+                found.insert(relative, Node::Link(fs::read_link(&path).unwrap()));
+            } else if meta.is_dir() {
+                stack.push(path);
+            } else {
+                let sha256 = appimg_core::digest::sha256_file(&path).unwrap();
+                found.insert(
+                    relative,
+                    Node::File { mode: meta.permissions().mode() & 0o7777, sha256 },
+                );
+            }
+        }
+    }
+    found
+}
+
+/// The files the desktop database and the icon cache tools write after an
+/// install, or after anything else that changes entries or icons. Whether
+/// they are there depends on the machine running the tests.
+pub fn is_cache(relative: &Path) -> bool {
+    let name = relative.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    matches!(name, "mimeinfo.cache" | "icon-theme.cache" | "index.theme")
+}
+
+/// What changed between two snapshots, caches aside: what is gone, what is
+/// new, and what is different.
+pub fn changes(
+    before: &std::collections::BTreeMap<PathBuf, Node>,
+    after: &std::collections::BTreeMap<PathBuf, Node>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let gone = before.keys().filter(|p| !after.contains_key(*p) && !is_cache(p)).cloned().collect();
+    let new = after.keys().filter(|p| !before.contains_key(*p) && !is_cache(p)).cloned().collect();
+    let changed = before
+        .iter()
+        .filter(|(p, node)| !is_cache(p) && after.get(*p).is_some_and(|other| other != *node))
+        .map(|(p, _)| p.clone())
+        .collect();
+    (gone, new, changed)
+}

@@ -19,8 +19,35 @@ project adheres to [Semantic Versioning](https://semver.org/).
   version stays as it was. An asset without a digest, as on releases from
   before GitHub published them, is installed as before. Either way, the
   install and update output says what the check found in one line.
+- `appimg adopt <path>` takes over an AppImage that is already on disk,
+  without downloading it again. It moves into the appimages directory, or
+  with `--copy` is copied and the original stays. A move across
+  filesystems copies, checks the copy against the original and deletes the
+  original only once the entry is written. One in `~/.local/bin` leaves a
+  symbolic link to the adopted file in its place, so the command keeps
+  working. It gets the checks, desktop entry, icons and update source an
+  install gives it, with the original path as its origin, and a slug that
+  is taken is refused with `--name` named. Desktop entries from elsewhere
+  whose `Exec` runs exactly that file, such as AppImageLauncher's
+  `appimagekit_*.desktop`, are listed and removed when confirmed, together
+  with the icons AppImageLauncher made for that file when no other entry
+  uses them. `--keep-entries` keeps them. One of them already at
+  `<slug>.desktop` does not take the slug: when they go, the adopted entry
+  is written over it, and its icons named after the slug go, every size of
+  them, before the adopted icons take that name, unless another entry uses
+  them too. Only while they stay is the slug taken. A
+  failure on the way puts everything back, and gives an entry or icons it
+  wrote over their exact bytes back.
+- `appimg adopt --scan` lists the AppImages appimg does not manage in its
+  appimages directory, `~/Applications` and `~/.local/bin`, with the
+  foreign entries that launch each one and the exact `appimg adopt`
+  command for it. It runs none of them and changes nothing.
 
 ### Changed
+
+- A local install, from the command line or the TUI, gets the checks a
+  download gets before anything runs the file: it has to start with an ELF
+  header and be at least as long as its squashfs says.
 
 - A zsync update whose delta fails, for any reason, downloads the complete
   file the zsync file names instead of handing over to
