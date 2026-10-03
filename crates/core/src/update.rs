@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::desktop_entry::{self, DesktopEntry};
 use crate::digest::{self, Published, Verified};
@@ -32,8 +31,8 @@ pub const MANUAL: &str = "manual";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSource {
     /// `X-AppImg-UpdateInfo` pointing at a zsync file. The check reads that
-    /// file's header directly, and appimg applies the delta itself;
-    /// `appimageupdatetool` is the fallback when that fails.
+    /// file's header directly, and appimg applies the delta itself; a full
+    /// download of the file it describes is the fallback when that fails.
     Zsync { update_info: String },
     /// A GitHub release, queried through the API. `tag` is the tag to
     /// follow: one that keeps moving out of a download URL, see
@@ -96,10 +95,12 @@ pub enum UpdatePath {
     /// A zsync source whose server ignored the range requests and sent the
     /// whole file, so there was no delta to apply after all.
     ZsyncWithoutRanges { bytes: u64 },
-    /// `appimageupdatetool` did it, after appimg's own delta path failed.
-    ExternalTool {
-        /// Why the native path gave up.
+    /// Applying the delta failed, so the whole file the zsync file names
+    /// was downloaded instead, and held to the same checksum.
+    DeltaFailed {
+        /// Why the delta gave up.
         reason: String,
+        bytes: u64,
     },
     /// The whole file was downloaded, because the source offers no delta.
     FullDownload { bytes: u64 },
@@ -118,9 +119,10 @@ impl UpdatePath {
                 "the server ignored the range requests, downloaded the whole file, {}",
                 human_size(*bytes)
             ),
-            UpdatePath::ExternalTool { reason } => {
-                format!("applied with appimageupdatetool, appimg's own delta path failed: {reason}")
-            }
+            UpdatePath::DeltaFailed { reason, bytes } => format!(
+                "the delta failed, downloaded the whole file instead, {}: {reason}",
+                human_size(*bytes)
+            ),
             UpdatePath::FullDownload { bytes } => {
                 format!("no delta for this source, downloaded {}", human_size(*bytes))
             }
@@ -430,18 +432,15 @@ fn manual_note(app: &InstalledApp) -> String {
 
 /// Every name an update can leave next to `<slug>.AppImage`, whoever wrote
 /// it. `.new` is appimg's own staging file and `.bak` its backup of the
-/// previous version; `.zs-old` and `.part` come from the zsync client inside
-/// `appimageupdatetool`, which hard-links the previous version out of the
-/// way before the swap and downloads into a partial file. All four are named
+/// previous version. `.zs-old` and `.part` come from the zsync client inside
+/// `appimageupdatetool`, which appimg 0.3 and older fell back to: it
+/// hard-links the previous version out of the way before the swap and
+/// downloads into a partial file, and never cleans up either. appimg no
+/// longer runs it, but those files can still be on disk. All four are named
 /// after the AppImage, so a file that carries one of these suffixes and a
 /// managed slug is provably ours.
 pub const LEFTOVER_SUFFIXES: &[&str] =
     &["AppImage.bak", "AppImage.new", "AppImage.zs-old", "AppImage.part"];
-
-/// What `appimageupdatetool` calls the copy of the version it replaced. It
-/// never deletes it, so a delta update otherwise leaves a second full
-/// AppImage behind.
-const ZSYNC_BACKUP: &str = "AppImage.zs-old";
 
 /// The leftovers of `slug` that exist right now, in the order of
 /// [`LEFTOVER_SUFFIXES`].
@@ -547,22 +546,6 @@ pub fn rollback(paths: &Paths, slug: &str) -> Result<()> {
 
 pub fn backup_path(paths: &Paths, slug: &str) -> PathBuf {
     paths.appimage_dir.join(format!("{slug}.AppImage.bak"))
-}
-
-/// Renames the copy `appimageupdatetool` left behind to the `.bak` every
-/// other source uses, so one rollback and one cleanup cover them all.
-/// Returns `None` when the tool wrote no backup, which is what an update
-/// that had nothing to apply looks like.
-fn claim_zsync_backup(paths: &Paths, slug: &str) -> Option<PathBuf> {
-    let left_behind = paths.appimage_dir.join(format!("{slug}.{ZSYNC_BACKUP}"));
-    if !left_behind.is_file() {
-        return None;
-    }
-    let backup = backup_path(paths, slug);
-    // A rename inside one directory either works or leaves both files where
-    // they were, and doctor reports whatever stays.
-    fs::rename(&left_behind, &backup).ok()?;
-    Some(backup)
 }
 
 /// Re-reads metadata and icons from the new binary and refreshes only the
@@ -1490,11 +1473,14 @@ fn zsync_compare(header: &zsync::Header, appimage: &Path) -> Result<(bool, Optio
     }
 }
 
-/// Applies the delta. This is the one step that still needs the external
-/// tool, and saying so is more use than silently doing nothing.
-/// The whole of a zsync update: appimg's own delta path, and the tool it
-/// falls back to when that fails, for any reason. The outcome says which one
-/// ran either way.
+/// The whole of a zsync update. appimg applies the delta itself: reads the
+/// control file, works out which blocks the installed AppImage already
+/// holds, fetches the rest and assembles `<slug>.AppImage.new`, checked
+/// against the checksum in the zsync header. When that fails, for any
+/// reason, the complete file the zsync file names is downloaded instead and
+/// held to the same checksum. Either way the new file goes on like every
+/// other update: checked against the digest its release publishes when it
+/// came out of one, then swapped in. The outcome says which way it went.
 fn apply_zsync(
     paths: &Paths,
     app: &InstalledApp,
@@ -1504,82 +1490,8 @@ fn apply_zsync(
     from: Provenance,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<UpdateOutcome> {
-    match apply_delta(paths, &app.slug, zsync_url, target, progress) {
-        Ok((staged, applied, payload)) => {
-            // The zsync checksum says the file is the one the zsync file
-            // describes, the digest that it is the one the release holds.
-            let verified = verify_staged(&staged, &payload, &from)?;
-            let backup = swap_in(&staged, target)?;
-            let path = UpdatePath::from(applied);
-            let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
-            Ok(UpdateOutcome { digest: verified, ..outcome })
-        }
-        Err(native) => {
-            if let Err(tool) = zsync_update(target) {
-                return Err(Error::Download(format!(
-                    "{native}; appimageupdatetool could not take over either: {tool}"
-                )));
-            }
-            let backup = claim_zsync_backup(paths, &app.slug);
-            let backed_up = backup.is_some();
-            let verified = verify_replaced(paths, &app.slug, target, zsync_url, &from, backed_up)?;
-            let path = UpdatePath::ExternalTool { reason: native.to_string() };
-            let outcome = finish(paths, app, target, backup, source, from, path)?;
-            Ok(UpdateOutcome { digest: verified, ..outcome })
-        }
-    }
-}
-
-/// Checks what `appimageupdatetool` installed, which replaces the file
-/// itself and so leaves nothing staged to check first. The asset it is
-/// checked against is the AppImage the zsync file is named after, the way
-/// `zsyncmake` names it, since appimg never got to read the zsync file. A
-/// file that is not that asset goes back out, and the previous version
-/// back in, when the tool kept one.
-fn verify_replaced(
-    paths: &Paths,
-    slug: &str,
-    target: &Path,
-    zsync_url: &str,
-    from: &Provenance,
-    backed_up: bool,
-) -> Result<Option<Verified>> {
-    let cut = zsync_url.len().saturating_sub(".zsync".len());
-    let Some(asset) = zsync_url
-        .get(cut..)
-        .filter(|suffix| suffix.eq_ignore_ascii_case(".zsync"))
-        .map(|_| &zsync_url[..cut])
-    else {
-        return Ok(None);
-    };
-    let Some(published) = from.published_for(asset) else {
-        return Ok(None);
-    };
-    match digest::verify(target, asset, &published) {
-        Ok(verified) => Ok(Some(verified)),
-        Err(error) => {
-            if backed_up {
-                rollback(paths, slug)?;
-            }
-            Err(error)
-        }
-    }
-}
-
-/// Applies the delta with appimg's own zsync: reads the control file, works
-/// out which blocks the installed AppImage already holds, fetches the rest
-/// and assembles `<slug>.AppImage.new`. The file is verified against the
-/// checksum in the zsync header before it is handed back, and removed if it
-/// does not match. Handed back with it is the URL it was assembled from.
-fn apply_delta(
-    paths: &Paths,
-    slug: &str,
-    zsync_url: &str,
-    appimage: &Path,
-    progress: Option<ProgressFn<'_>>,
-) -> Result<(PathBuf, zsync::Applied, String)> {
-    if !appimage.is_file() {
-        return Err(Error::NotFound(appimage.to_path_buf()));
+    if !target.is_file() {
+        return Err(Error::NotFound(target.to_path_buf()));
     }
 
     let control = zsync::fetch_control(zsync_url)?;
@@ -1588,9 +1500,71 @@ fn apply_delta(
         reason: "the zsync file names no URL for the file it describes".to_string(),
     })?;
 
-    let staged = paths.appimage_dir.join(format!("{slug}.AppImage.new"));
-    let applied = zsync::apply(&control, &url, appimage, &staged, progress)?;
-    Ok((staged, applied, url))
+    let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
+    let mut progress = progress;
+    // The delta reports through this, so the caller's progress is still
+    // there for the whole file if the delta fails.
+    let mut report = |done, total| {
+        if let Some(report) = progress.as_mut() {
+            report(done, total);
+        }
+    };
+    let path = match zsync::apply(&control, &url, target, &staged, Some(&mut report)) {
+        Ok(applied) => UpdatePath::from(applied),
+        Err(delta) => {
+            let bytes = download_whole(paths, &app.slug, &url, &control.header, progress).map_err(
+                |whole| {
+                    Error::Download(format!(
+                        "{delta}; downloading the whole file instead failed too: {whole}"
+                    ))
+                },
+            )?;
+            UpdatePath::DeltaFailed { reason: delta.to_string(), bytes }
+        }
+    };
+
+    // The zsync checksum says the file is the one the zsync file describes,
+    // the digest that it is the one the release holds.
+    let verified = verify_staged(&staged, &url, &from)?;
+    let backup = swap_in(&staged, target)?;
+    let outcome = finish(paths, app, target, Some(backup), source, from, path)?;
+    Ok(UpdateOutcome { digest: verified, ..outcome })
+}
+
+/// Downloads the complete file a zsync file describes, after applying the
+/// delta failed, and holds it to what the zsync header says about it: its
+/// length, and its checksum when the header has one. A header without one
+/// leaves the download as unchecked as any download from a URL. A file that
+/// does not match is removed before the error comes back.
+fn download_whole(
+    paths: &Paths,
+    slug: &str,
+    url: &str,
+    header: &zsync::Header,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<u64> {
+    let (staged, bytes) = download_staged(paths, slug, url, progress)?;
+    let mismatch = if bytes != header.length {
+        Some(format!("the downloaded file is {bytes} bytes, the zsync file says {}", header.length))
+    } else {
+        match header.sha1.as_deref() {
+            Some(expected) => {
+                let found = zsync::sha1_file(&staged)?;
+                (found != expected).then(|| {
+                    format!("the downloaded file is checksummed {found}, the zsync file says {expected}")
+                })
+            }
+            None => None,
+        }
+    };
+    if let Some(mismatch) = mismatch {
+        let _ = fs::remove_file(&staged);
+        return Err(Error::Zsync {
+            url: url.to_string(),
+            reason: format!("{mismatch}: what the server sent is not the file it described"),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Where the complete file lives, as the zsync header names it. A relative
@@ -1607,31 +1581,6 @@ fn payload_url(zsync_url: &str, header: &zsync::Header) -> Option<String> {
     let without_query = zsync_url.split(['?', '#']).next().unwrap_or(zsync_url);
     let (directory, _) = without_query.rsplit_once('/')?;
     Some(format!("{directory}/{url}"))
-}
-
-fn zsync_update(appimage: &Path) -> Result<()> {
-    let Some(tool) = fs_util::which("appimageupdatetool") else {
-        return Err(Error::MissingTool {
-            tool: "appimageupdatetool".to_string(),
-            purpose: "it applies the zsync delta an update of this application needs".to_string(),
-        });
-    };
-    let status = Command::new(tool)
-        .arg("--overwrite")
-        .arg(appimage)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| Error::io(appimage, e))?;
-
-    if !status.success() {
-        return Err(Error::Download(format!(
-            "appimageupdatetool could not update {}",
-            appimage.display()
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1803,9 +1752,15 @@ mod tests {
         let whole = UpdatePath::ZsyncWithoutRanges { bytes: 2_172_096 };
         assert!(whole.describe().contains("ignored the range requests"), "{}", whole.describe());
 
-        let tool = UpdatePath::ExternalTool { reason: "the server hung up".to_string() };
-        assert!(tool.describe().contains("appimageupdatetool"), "{}", tool.describe());
-        assert!(tool.describe().contains("the server hung up"), "{}", tool.describe());
+        // A delta that failed says so, says why, and says what it cost
+        // instead.
+        let failed =
+            UpdatePath::DeltaFailed { reason: "the server hung up".to_string(), bytes: 3 << 20 };
+        let described = failed.describe();
+        assert!(described.contains("the delta failed"), "{described}");
+        assert!(described.contains("downloaded the whole file instead"), "{described}");
+        assert!(described.contains("3.0 MB"), "{described}");
+        assert!(described.contains("the server hung up"), "{described}");
 
         // And the sources that have no delta to apply say so too.
         let full = UpdatePath::FullDownload { bytes: 190 * 1024 * 1024 };
@@ -1932,25 +1887,22 @@ mod tests {
         }
     }
 
+    /// appimg no longer runs `appimageupdatetool`, but the copy it left
+    /// when an older appimg fell back to it can still be on disk, as large
+    /// as the AppImage itself. The next confirmed update takes it along.
     #[test]
-    fn the_copy_appimageupdatetool_leaves_becomes_the_backup() {
+    fn what_appimageupdatetool_left_goes_with_the_next_confirmed_update() {
         let dir = tempfile::tempdir().unwrap();
         let paths = sandbox_paths(dir.path());
-        let left_behind = dir.path().join("krita.AppImage.zs-old");
-        fs::write(&left_behind, "the previous 371 MB").unwrap();
+        let zs_old = dir.path().join("krita.AppImage.zs-old");
+        let part = dir.path().join("krita.AppImage.part");
+        fs::write(&zs_old, "the previous 371 MB").unwrap();
+        fs::write(&part, "half a delta").unwrap();
+        fs::write(backup_path(&paths, "krita"), "the version just replaced").unwrap();
 
-        let backup = claim_zsync_backup(&paths, "krita").unwrap();
-        assert_eq!(backup, backup_path(&paths, "krita"));
-        assert!(!left_behind.exists());
-        assert_eq!(fs::read_to_string(&backup).unwrap(), "the previous 371 MB");
-
-        // Confirming the update takes it away, so nothing of the previous
-        // version is left on disk.
         confirm(&paths, "krita").unwrap();
         assert!(leftovers(&paths, "krita").is_empty());
-
-        // An update that had nothing to apply writes no backup.
-        assert_eq!(claim_zsync_backup(&paths, "krita"), None);
+        assert!(!zs_old.exists() && !part.exists());
     }
 
     #[test]

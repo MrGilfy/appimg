@@ -78,9 +78,6 @@ pub enum Error {
          sha256:{expected}: what arrived is not the file the release holds"
     )]
     DigestMismatch { url: String, found: String, expected: String },
-
-    #[error("{tool} is not installed, {purpose}")]
-    MissingTool { tool: String, purpose: String },
 }
 
 impl Error {

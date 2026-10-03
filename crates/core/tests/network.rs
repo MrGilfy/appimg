@@ -669,8 +669,9 @@ fn an_update_keeps_manual_edits() {
     let icons = walk(&sandbox.paths.icons_root);
     assert!(icons.contains(&"128x128/apps/my-renamed-app.png".into()), "{icons:?}");
 
-    // Whatever else the update left next to the AppImage goes with the
-    // backup: `appimageupdatetool` writes these, and never cleans them up.
+    // Whatever else an update left next to the AppImage goes with the
+    // backup: `appimageupdatetool` left these when an older appimg fell back
+    // to it, and nothing else ever cleans them up.
     let zs_old = sandbox.paths.appimage_dir.join("my-renamed-app.AppImage.zs-old");
     std::fs::write(&zs_old, "the previous version, a second time").unwrap();
 
@@ -760,8 +761,8 @@ fn a_download_that_is_not_an_appimage_never_replaces_the_installed_one() {
     assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
 }
 
-/// `update --check` on a zsync source, without `appimageupdatetool`: the
-/// header of the zsync file is enough, and one ranged request gets it.
+/// `update --check` on a zsync source: the header of the zsync file is
+/// enough, and one ranged request gets it.
 #[test]
 fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
     let _serial = common::serial();
@@ -789,7 +790,7 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
     );
 
     let before = walk(&sandbox.paths.data_home);
-    let status = without_appimageupdatetool(|| update::check(&app).unwrap());
+    let status = update::check(&app).unwrap();
     assert!(!status.available);
     assert_eq!(status.note, None);
     assert_eq!(status.latest_version.as_deref(), Some("1.0.0"));
@@ -799,7 +800,7 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
 
     // A bigger file is an update, and the sizes are reported as they are.
     server.serve(zsync_file("Fake_App-2.0.0.AppImage", length + 4096, &"0".repeat(40)));
-    let status = without_appimageupdatetool(|| update::check(&app).unwrap());
+    let status = update::check(&app).unwrap();
     assert!(status.available);
     assert_eq!(status.latest_version.as_deref(), Some("2.0.0"));
     let note = status.note.unwrap();
@@ -809,7 +810,7 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
 
     // The same size but a different checksum is an update as well.
     server.serve(zsync_file("Fake_App-1.0.1.AppImage", length, &"0".repeat(40)));
-    let status = without_appimageupdatetool(|| update::check(&app).unwrap());
+    let status = update::check(&app).unwrap();
     assert!(status.available);
     assert_eq!(status.latest_version.as_deref(), Some("1.0.1"));
     assert!(status.note.unwrap().contains("checksum"));
@@ -837,19 +838,6 @@ fn a_zsync_url_that_serves_something_else_is_an_error() {
     let app = list::find(&sandbox.paths, "fake-app").unwrap();
     let error = update::check(&app).unwrap_err().to_string();
     assert!(error.contains("zsync"), "{error}");
-}
-
-/// Runs a check with an empty `PATH`, so no external tool can be found. The
-/// tests run one at a time, which is what makes this safe.
-fn without_appimageupdatetool<T>(check: impl FnOnce() -> T) -> T {
-    let previous = std::env::var_os("PATH");
-    std::env::set_var("PATH", "");
-    let result = check();
-    match previous {
-        Some(path) => std::env::set_var("PATH", path),
-        None => std::env::remove_var("PATH"),
-    }
-    result
 }
 
 /// Bytes that do not repeat, so a block of them only matches where it
@@ -1144,9 +1132,12 @@ struct Delta {
 }
 
 /// Two builds of the same fake AppImage that differ in one byte near the
-/// front, so a delta update has exactly one block to fetch. `payload_path`
+/// front, so a delta update has exactly one block to fetch. Both start with
+/// an ELF header, as an AppImage a full download accepts has to, so they
+/// only extract through the stand-in for `unsquashfs`. `payload_path`
 /// decides how the AppImage is served: a plain name is answered with ranges,
-/// `plain/...` is a server that ignores them.
+/// `plain/...` is a server that ignores them, `short/...` one whose ranges
+/// all stop a byte early while a plain request gets the whole file.
 fn delta_fixture(sandbox: &Sandbox, payload_path: &str) -> Delta {
     // A quarter of a megabyte of filler inside the runtime's comment line,
     // so the two builds share 127 blocks of 2048 bytes.
@@ -1161,13 +1152,14 @@ fn delta_fixture(sandbox: &Sandbox, payload_path: &str) -> Delta {
         FakeAppImage::new("Fake App")
             .key("X-AppImage-Version", version)
             .marker(&format!("{version}{filler}"))
+            .elf()
             .build(&sandbox.root, "App.AppImage")
     };
 
     let one = sandbox.root.join("build1.AppImage");
     std::fs::copy(build("1.0.0"), &one).unwrap();
 
-    let info = metadata::inspect(&one, None).unwrap();
+    let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None)).unwrap();
     let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
     let installed = install::install(&sandbox.paths, &request).unwrap();
 
@@ -1204,12 +1196,9 @@ fn a_zsync_update_applies_the_delta_itself_and_reports_what_it_did() {
     let sandbox = Sandbox::new();
     let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
 
-    // The tool is there and refuses to work: if the native path had not
-    // done this, there would be no update at all.
-    let outcome = with_failing_appimageupdatetool(&sandbox, || {
-        update::update(&sandbox.paths, &delta.app, None)
-    })
-    .unwrap();
+    let outcome =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &delta.app, None))
+            .unwrap();
 
     // The installed file is the one the zsync file described, byte for byte.
     assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
@@ -1242,32 +1231,31 @@ fn bytes_that_do_not_assemble_into_the_right_file_are_thrown_away() {
     let sandbox = Sandbox::new();
     let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
     let before = std::fs::read(&delta.installed).unwrap();
+    let files = walk(&sandbox.paths.data_home);
 
     // The server answers the range with the right number of bytes, at the
     // right offset, with a 206 like any other: they are simply not the bytes
     // the zsync file describes. Nothing before the whole-file checksum can
-    // tell the difference.
+    // tell the difference. The ELF header is left alone, so the whole file
+    // that is downloaded instead looks like an AppImage as well, and only
+    // the checksum can tell the difference there either.
     let mut wrong = delta.payload.clone();
-    wrong[..2048].fill(b'#');
+    wrong[16..2048].fill(b'#');
     delta.payload_server.serve(wrong);
 
-    let error = with_failing_appimageupdatetool(&sandbox, || {
-        update::update(&sandbox.paths, &delta.app, None)
-    })
-    .unwrap_err()
-    .to_string();
+    let error = update::update(&sandbox.paths, &delta.app, None).unwrap_err().to_string();
 
-    // The checksum caught it, and the message says what did not match.
-    assert!(error.contains("checksummed"), "{error}");
-    assert!(
-        error.contains(&zsync::sha1_file(&sandbox.root.join("build2.AppImage")).unwrap()),
-        "{error}"
-    );
-    // The fallback was tried, and it failed too, so nothing was installed.
-    assert!(error.contains("appimageupdatetool could not take over"), "{error}");
+    // The checksum caught the delta, the whole file was tried instead, and
+    // the checksum caught that too. The message says what did not match.
+    let expected = zsync::sha1_file(&sandbox.root.join("build2.AppImage")).unwrap();
+    assert!(error.contains("the assembled file is checksummed"), "{error}");
+    assert!(error.contains("downloading the whole file instead failed too"), "{error}");
+    assert!(error.contains("the downloaded file is checksummed"), "{error}");
+    assert!(error.contains(&expected), "{error}");
 
     // Nothing was installed, nothing was staged, nothing was backed up.
     assert_eq!(std::fs::read(&delta.installed).unwrap(), before);
+    assert_eq!(walk(&sandbox.paths.data_home), files);
     assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
     assert!(!update::backup_path(&sandbox.paths, "fake-app").exists());
 
@@ -1282,10 +1270,7 @@ fn a_server_that_ignores_ranges_still_updates_and_says_so() {
     let sandbox = Sandbox::new();
     let delta = delta_fixture(&sandbox, "plain/Fake_App-2.0.0.AppImage");
 
-    let outcome = with_failing_appimageupdatetool(&sandbox, || {
-        update::update(&sandbox.paths, &delta.app, None)
-    })
-    .unwrap();
+    let outcome = update::update(&sandbox.paths, &delta.app, None).unwrap();
 
     assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
     match outcome.path {
@@ -1298,61 +1283,70 @@ fn a_server_that_ignores_ranges_still_updates_and_says_so() {
     assert!(described.contains("ignored the range requests"), "{described}");
 }
 
+/// What replaced the fallback to `appimageupdatetool`: every range the
+/// delta asks for comes back a byte short, so the delta fails. The complete
+/// file the zsync file names is downloaded instead, held to the same
+/// checksum, and installed like any other update.
 #[test]
-fn a_native_path_that_fails_hands_over_to_appimageupdatetool_and_says_so() {
+fn a_delta_whose_ranges_fail_ends_in_a_correct_full_download() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let delta = delta_fixture(&sandbox, "short/Fake_App-2.0.0.AppImage");
+
+    let outcome =
+        with_unsquashfs_stand_in(&sandbox, || update::update(&sandbox.paths, &delta.app, None))
+            .unwrap();
+
+    // The installed file is the one the zsync file described, byte for
+    // byte, and the previous version is the backup a rollback uses.
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
+    assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), delta.v1);
+    assert!(!sandbox.paths.appimage_dir.join("fake-app.AppImage.new").exists());
+    assert_eq!(outcome.to_version.as_deref(), Some("2.0.0"));
+
+    // The delta was tried first: a range, which came back short. Then the
+    // whole file, without one.
+    let asked = delta.payload_server.asked();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(asked[0].1.is_some(), "{asked:?}");
+    assert_eq!(asked[1], ("/short/Fake_App-2.0.0.AppImage".to_string(), None));
+    assert_eq!(delta.payload_server.served()[1], delta.payload.len());
+
+    // And the update says so, with the reason the delta gave up.
+    match &outcome.path {
+        update::UpdatePath::DeltaFailed { reason, bytes } => {
+            assert_eq!(*bytes, delta.payload.len() as u64);
+            assert!(reason.contains("/short/Fake_App-2.0.0.AppImage"), "{reason}");
+        }
+        other => panic!("a full download after the delta should have been reported: {other:?}"),
+    }
+    let described = outcome.path.describe();
+    assert!(described.contains("the delta failed"), "{described}");
+    assert!(described.contains("downloaded the whole file instead"), "{described}");
+}
+
+/// Without a zsync file to read there is no delta to try, and no URL of a
+/// complete file to fall back on either. The update fails and changes
+/// nothing.
+#[test]
+fn a_zsync_file_that_cannot_be_read_changes_nothing() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let delta = delta_fixture(&sandbox, "Fake_App-2.0.0.AppImage");
-
-    // A zsync file appimg cannot read at all, so the native path is out.
     let broken = Server::start(b"not a zsync file at all".to_vec());
     let mut entry = DesktopEntry::read(&delta.app.desktop_entry_path).unwrap();
     entry.set(KEY_UPDATE_INFO, format!("zsync|{}", broken.url("Fake_App.AppImage.zsync")));
     entry.write(&delta.app.desktop_entry_path).unwrap();
     let app = list::find(&sandbox.paths, "fake-app").unwrap();
+    let files = walk(&sandbox.paths.data_home);
 
-    // A stand-in for the tool that does what it does: replaces the file and
-    // leaves the previous version behind as `.zs-old`.
-    let tools = sandbox.root.join("tools");
-    std::fs::create_dir_all(&tools).unwrap();
-    let tool = tools.join("appimageupdatetool");
-    std::fs::write(
-        &tool,
-        format!(
-            "#!/bin/sh\ntarget=\"$2\"\ncp \"$target\" \"$target.zs-old\"\ncp '{}' \"$target\"\n",
-            sandbox.root.join("build2.AppImage").display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let error = update::update(&sandbox.paths, &app, None).unwrap_err().to_string();
 
-    let outcome =
-        with_tools_on_path(&tools, || update::update(&sandbox.paths, &app, None)).unwrap();
-
-    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
-    // The copy the tool left behind became the backup a rollback uses.
-    assert_eq!(std::fs::read(outcome.backup_path.as_ref().unwrap()).unwrap(), delta.v1);
-
-    match &outcome.path {
-        update::UpdatePath::ExternalTool { reason } => {
-            assert!(reason.contains("zsync"), "{reason}");
-        }
-        other => panic!("the fallback should have been reported: {other:?}"),
-    }
-    let described = outcome.path.describe();
-    assert!(described.contains("appimageupdatetool"), "{described}");
-}
-
-/// Runs something with an `appimageupdatetool` on `PATH` that always fails.
-/// Whether the real one is installed on the machine running the tests is
-/// then neither here nor there.
-fn with_failing_appimageupdatetool<T>(sandbox: &Sandbox, run: impl FnOnce() -> T) -> T {
-    let dir = sandbox.root.join("failing-tool");
-    std::fs::create_dir_all(&dir).unwrap();
-    let tool = dir.join("appimageupdatetool");
-    std::fs::write(&tool, "#!/bin/sh\necho 'stand-in, not the real thing' >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    with_tools_on_path(&dir, run)
+    assert!(error.contains("Fake_App.AppImage.zsync"), "{error}");
+    assert_eq!(std::fs::read(&delta.installed).unwrap(), delta.v1);
+    assert_eq!(walk(&sandbox.paths.data_home), files);
+    // Not a byte of the AppImage was asked for.
+    assert!(delta.payload_server.asked().is_empty());
 }
 
 /// Runs something with a stand-in for `unsquashfs` on `PATH`, the one way a
@@ -1581,7 +1575,9 @@ fn an_update_out_of_no_release_says_nothing_about_a_digest() {
 
 /// A `gh-releases-zsync` application: v1 installed, and release v2.0.0 with
 /// the AppImage and the zsync file that describes it, side by side as
-/// `zsyncmake` leaves them, the AppImage named by a relative URL.
+/// `zsyncmake` leaves them, the AppImage named by a relative URL. The
+/// release is served below `prefix`, which picks how the server answers,
+/// see [`delta_fixture`].
 struct GitHubDelta {
     app: InstalledApp,
     v1: Vec<u8>,
@@ -1593,19 +1589,20 @@ struct GitHubDelta {
 }
 
 impl GitHubDelta {
-    fn new(sandbox: &Sandbox) -> Self {
+    fn new(sandbox: &Sandbox, prefix: &str) -> Self {
         let filler: String =
             noise(4, 256 * 1024).into_iter().map(|byte| char::from(b'a' + byte % 26)).collect();
         let build = |version: &str| {
             FakeAppImage::new("Fake App")
                 .key("X-AppImage-Version", version)
                 .marker(&format!("{version}{filler}"))
+                .elf()
                 .build(&sandbox.root, "App.AppImage")
         };
 
         let one = sandbox.root.join("build1.AppImage");
         std::fs::copy(build("1.0.0"), &one).unwrap();
-        let info = metadata::inspect(&one, None).unwrap();
+        let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None)).unwrap();
         let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
         let installed = install::install(&sandbox.paths, &request).unwrap();
 
@@ -1614,8 +1611,8 @@ impl GitHubDelta {
         let payload = std::fs::read(&two).unwrap();
 
         let server = Server::start(Vec::new());
-        let asset_url = server.url("download/v2.0.0/Fake_App-2.0.0.AppImage");
-        let zsync_url = server.url("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync");
+        let asset = format!("{prefix}download/v2.0.0/Fake_App-2.0.0.AppImage");
+        let zsync = format!("{asset}.zsync");
         let control = control_file(
             "Fake_App-2.0.0.AppImage",
             "Fake_App-2.0.0.AppImage",
@@ -1623,8 +1620,8 @@ impl GitHubDelta {
             2048,
             &zsync::sha1_file(&two).unwrap(),
         );
-        server.route("download/v2.0.0/Fake_App-2.0.0.AppImage", payload.clone());
-        server.route("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync", control);
+        server.route(&asset, payload.clone());
+        server.route(&zsync, control);
 
         let mut entry = DesktopEntry::read(&installed.desktop_entry_path).unwrap();
         entry.set(KEY_UPDATE_INFO, "gh-releases-zsync|o|r|latest|Fake_App-*.AppImage.zsync");
@@ -1635,8 +1632,8 @@ impl GitHubDelta {
             v1: std::fs::read(&one).unwrap(),
             payload_sha256: appimg_core::digest::sha256_file(&two).unwrap(),
             payload,
-            asset_url,
-            zsync_url,
+            asset_url: server.url(&asset),
+            zsync_url: server.url(&zsync),
             server,
         }
     }
@@ -1648,19 +1645,22 @@ impl GitHubDelta {
         let release = release_json("v2.0.0", &[(&self.asset_url, digest), (&self.zsync_url, None)]);
         self.server.route("repos/o/r/releases", format!("[{release}]").into_bytes());
     }
+
+    fn update(&self, sandbox: &Sandbox) -> appimg_core::Result<update::UpdateOutcome> {
+        with_unsquashfs_stand_in(sandbox, || {
+            with_github_api(&self.server, || update::update(&sandbox.paths, &self.app, None))
+        })
+    }
 }
 
 #[test]
 fn a_delta_out_of_a_github_release_is_checked_against_its_digest_too() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
-    let delta = GitHubDelta::new(&sandbox);
+    let delta = GitHubDelta::new(&sandbox, "");
     delta.publish(Some(&delta.payload_sha256));
 
-    let outcome = with_failing_appimageupdatetool(&sandbox, || {
-        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
-    })
-    .unwrap();
+    let outcome = delta.update(&sandbox).unwrap();
 
     assert!(matches!(outcome.path, update::UpdatePath::Delta { .. }), "{:?}", outcome.path);
     assert_eq!(outcome.digest, Some(Verified::Matches(delta.payload_sha256.clone())));
@@ -1674,65 +1674,47 @@ fn a_delta_out_of_a_github_release_is_checked_against_its_digest_too() {
 fn a_delta_that_does_not_match_its_digest_replaces_nothing() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
-    let delta = GitHubDelta::new(&sandbox);
+    let delta = GitHubDelta::new(&sandbox, "");
     let elsewhere = "5a".repeat(32);
     delta.publish(Some(&elsewhere));
     let files = walk(&sandbox.paths.data_home);
     let entry = read(&delta.app.desktop_entry_path);
 
-    let error = with_failing_appimageupdatetool(&sandbox, || {
-        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
-    })
-    .unwrap_err();
+    let error = delta.update(&sandbox).unwrap_err();
 
     let message = error.to_string();
     assert!(matches!(error, appimg_core::Error::DigestMismatch { .. }), "{message}");
     assert!(message.contains(&delta.payload_sha256) && message.contains(&elsewhere), "{message}");
-    // Refused on the digest, not handed to the fallback.
-    assert!(!message.contains("appimageupdatetool"), "{message}");
+    // The delta itself worked, the digest refused what it assembled.
+    let asked = delta.server.asked();
+    assert!(asked.iter().all(|(path, range)| !path.ends_with(".AppImage") || range.is_some()));
 
     assert_eq!(std::fs::read(&delta.app.appimage_path).unwrap(), delta.v1);
     assert_eq!(read(&delta.app.desktop_entry_path), entry);
     assert_eq!(walk(&sandbox.paths.data_home), files);
 }
 
-/// `appimageupdatetool` replaces the file itself, so there is nothing staged
-/// to check before the swap. What it installed is checked afterwards, and a
-/// file that is not the asset goes back out.
+/// A full download after a failed delta goes the way every other update
+/// goes, the digest check included: refused when the release publishes
+/// another digest, installed when it publishes this one.
 #[test]
-fn what_appimageupdatetool_installs_against_the_digest_is_rolled_back() {
+fn a_full_download_after_a_failed_delta_is_checked_against_the_digest() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
-    let delta = GitHubDelta::new(&sandbox);
-    delta.publish(Some(&"77".repeat(32)));
-    // A zsync file appimg cannot read, so the native path is out and the
-    // tool takes over.
-    delta.server.route("download/v2.0.0/Fake_App-2.0.0.AppImage.zsync", b"not zsync".to_vec());
+    let delta = GitHubDelta::new(&sandbox, "short/");
     let files = walk(&sandbox.paths.data_home);
 
-    // The stand-in does what the tool does: replaces the file and leaves the
-    // previous version behind as `.zs-old`.
-    let tools = sandbox.root.join("tools");
-    std::fs::create_dir_all(&tools).unwrap();
-    let tool = tools.join("appimageupdatetool");
-    std::fs::write(
-        &tool,
-        format!(
-            "#!/bin/sh\ntarget=\"$2\"\ncp \"$target\" \"$target.zs-old\"\ncp '{}' \"$target\"\n",
-            sandbox.root.join("build2.AppImage").display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-
-    let error = with_tools_on_path(&tools, || {
-        with_github_api(&delta.server, || update::update(&sandbox.paths, &delta.app, None))
-    })
-    .unwrap_err();
-
+    delta.publish(Some(&"77".repeat(32)));
+    let error = delta.update(&sandbox).unwrap_err();
     assert!(matches!(error, appimg_core::Error::DigestMismatch { .. }), "{error}");
     assert_eq!(std::fs::read(&delta.app.appimage_path).unwrap(), delta.v1);
     assert_eq!(walk(&sandbox.paths.data_home), files);
+
+    delta.publish(Some(&delta.payload_sha256));
+    let outcome = delta.update(&sandbox).unwrap();
+    assert!(matches!(outcome.path, update::UpdatePath::DeltaFailed { .. }), "{:?}", outcome.path);
+    assert_eq!(outcome.digest, Some(Verified::Matches(delta.payload_sha256.clone())));
+    assert_eq!(std::fs::read(&outcome.appimage_path).unwrap(), delta.payload);
 }
 
 /// An install from a GitHub release download URL asks for that release,

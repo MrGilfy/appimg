@@ -16,11 +16,32 @@ project adheres to [Semantic Versioning](https://semver.org/).
   install checks the file before reading its metadata, which runs it. A
   file that does not match is deleted and refused with an error that names
   both digests, the way a failed zsync checksum is, and the installed
-  version stays as it was. What `appimageupdatetool` installs in its
-  fallback is checked afterwards and rolled back on a mismatch. An asset
-  without a digest, as on releases from before GitHub published them, is
-  installed as before. Either way, the install and update output says what
-  the check found in one line.
+  version stays as it was. An asset without a digest, as on releases from
+  before GitHub published them, is installed as before. Either way, the
+  install and update output says what the check found in one line.
+
+### Changed
+
+- A zsync update whose delta fails, for any reason, downloads the complete
+  file the zsync file names instead of handing over to
+  `appimageupdatetool`. That file goes the way every other update goes: it
+  is held to the length and checksum in the zsync file, checked against the
+  GitHub digest where there is one, flushed to disk and swapped in with the
+  previous version kept for a rollback. The update says that the delta
+  failed, why, and what the whole file cost:
+  `the delta failed, downloaded the whole file instead, 107.0 MB: ...`. A
+  zsync file that cannot be read at all names no file to fall back on, and
+  the update fails without changing anything.
+
+### Removed
+
+- The fallback to `appimageupdatetool`, and with it the `doctor` line about
+  the tool. No external tool downloads or applies an update anymore. The
+  `.zs-old` and `.part` files it left next to an AppImage under an older
+  appimg are still reported by `doctor` and still removed with the next
+  confirmed update or with `appimg remove`.
+
+### Fixed
 
 - A `github:` source on an aarch64 machine finds the arm64 AppImage of a
   release that names its x86_64 build without an architecture, the way

@@ -221,7 +221,8 @@ fn doctor_reports_only_leftovers_of_managed_slugs() {
 
     // An update leaves these behind, all of them named after a slug appimg
     // manages. The first two are appimg's own, the other two are what
-    // `appimageupdatetool` leaves next to the file it updated.
+    // `appimageupdatetool` left next to the file it updated, back when an
+    // older appimg fell back to it.
     let backup = sandbox.paths.appimage_dir.join("fake-app.AppImage.bak");
     let staged = sandbox.paths.appimage_dir.join("fake-app.AppImage.new");
     let zs_old = sandbox.paths.appimage_dir.join("fake-app.AppImage.zs-old");
@@ -267,18 +268,11 @@ fn missing_optional_tools_are_not_a_problem() {
             found: true,
             consequence: String::new(),
         }],
-        optional_tools: vec![
-            doctor::ToolStatus {
-                name: "appimageupdatetool".to_string(),
-                found: false,
-                consequence: String::new(),
-            },
-            doctor::ToolStatus {
-                name: "unsquashfs".to_string(),
-                found: false,
-                consequence: String::new(),
-            },
-        ],
+        optional_tools: vec![doctor::ToolStatus {
+            name: "unsquashfs".to_string(),
+            found: false,
+            consequence: String::new(),
+        }],
         orphaned_icons: Vec::new(),
         leftover_files: Vec::new(),
         broken_entries: Vec::new(),

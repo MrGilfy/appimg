@@ -19,14 +19,8 @@ const REQUIRED_TOOLS: &[(&str, &str)] = &[
     ("desktop-file-validate", "generated entries cannot be validated"),
 ];
 
-const OPTIONAL_TOOLS: &[(&str, &str)] = &[
-    (
-        "appimageupdatetool",
-        "nothing on its own: appimg applies zsync deltas itself and only falls back to this tool \
-         when that fails",
-    ),
-    ("unsquashfs", "AppImages with a broken runtime cannot be inspected"),
-];
+const OPTIONAL_TOOLS: &[(&str, &str)] =
+    &[("unsquashfs", "AppImages with a broken runtime cannot be inspected")];
 
 #[derive(Debug, Clone)]
 pub struct ToolStatus {
@@ -45,8 +39,9 @@ pub struct DoctorReport {
     /// Icons of a slug appimg manages whose entry no longer refers to them.
     pub orphaned_icons: Vec<PathBuf>,
     /// Files an update left next to the AppImage of a slug appimg manages:
-    /// its own `.bak` and `.new`, and the `.zs-old` and `.part` of
-    /// `appimageupdatetool`. See [`update::LEFTOVER_SUFFIXES`].
+    /// its own `.bak` and `.new`, and the `.zs-old` and `.part` that
+    /// `appimageupdatetool` left when an older appimg fell back to it. See
+    /// [`update::LEFTOVER_SUFFIXES`].
     pub leftover_files: Vec<PathBuf>,
     /// Managed entries whose AppImage or slug is missing.
     pub broken_entries: Vec<(String, PathBuf)>,
@@ -193,8 +188,9 @@ fn in_apps_directory(icon: &Path) -> bool {
 }
 
 /// The staging and backup files an update leaves behind, appimg's own as
-/// well as those of `appimageupdatetool`. Every one of them is named after a
-/// managed slug, so they are provably ours to report.
+/// well as those `appimageupdatetool` left when an older appimg fell back to
+/// it. Every one of them is named after a managed slug, so they are provably
+/// ours to report.
 fn collect_leftovers(paths: &Paths, managed: &HashMap<String, String>) -> Vec<PathBuf> {
     let mut leftovers: Vec<PathBuf> =
         managed.keys().flat_map(|slug| update::leftovers(paths, slug)).collect();

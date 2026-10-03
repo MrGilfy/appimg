@@ -88,8 +88,8 @@ cat "$work/update.log"
 version=$("$appimg" list --json | jq -r '.[] | select(.slug == "imhex") | .version')
 [ "$version" = "$to" ] || fail "ImHex is at $version after the update, not $to"
 
-# The line every delta update prints. A fallback to appimageupdatetool, or a
-# server that ignored the ranges, prints something else.
+# The line every delta update prints. A full download after a failed delta,
+# or a server that ignored the ranges, prints something else.
 grep -Eq 'reused [1-9][0-9]* of [0-9]+ blocks' "$work/update.log" ||
 	fail "the update did not apply a zsync delta that reused blocks"
 

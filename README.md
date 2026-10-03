@@ -45,8 +45,9 @@ interface: its field set may change between versions without notice.
 No extra tool is needed. An application whose update information names a zsync
 file, either `zsync|<url>` or `gh-releases-zsync|...`, fetches only the parts
 of the new version it does not already have and verifies the assembled file
-before installing it. Every other source downloads the whole thing. Each
-update says which it was and what it cost:
+before installing it. If the delta fails, it downloads the whole file instead
+and verifies that the same way. Every other source downloads the whole thing.
+Each update says which it was and what it cost:
 
       reused 19054 of 46308 blocks, fetched 107.0 MB in 22 requests
 
