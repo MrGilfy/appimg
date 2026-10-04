@@ -77,6 +77,19 @@ The file to download is the one whose name matches the installed file,
 versions aside. When the AppStream metadata inside an AppImage links a
 GitHub repository, the install suggests it as the update source.
 
+A URL can be a vendor's download link that redirects to the current
+version, such as `https://lmstudio.ai/download/latest/linux/x64`, or a fixed
+name whose file changes. A check follows it with HEAD requests, one per
+redirect, and downloads nothing. A version in the name of the file the link
+lands on decides. Without one, the path it lands on, the `ETag`, the
+`Last-Modified` date and the `Content-Length` are compared with what the
+server said when the installed file was downloaded, which its entry keeps.
+The host and query of the URL never count: CDNs rotate the one and sign the
+other. A file the server changed under a version that is installed already
+is no update, the check says so in a note. A server that says nothing about
+its files leaves it to the update, which downloads the file and keeps the
+installed one when it is the same.
+
 GitHub's API answers 60 requests an hour without a token, which checking a
 few applications more than once can use up. With `GH_TOKEN` or `GITHUB_TOKEN`
 set, appimg sends it as a bearer token to `api.github.com` over https, and to

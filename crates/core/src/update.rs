@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::desktop_entry::{self, DesktopEntry};
+use crate::desktop_entry::{self, DesktopEntry, KEY_REMOTE};
 use crate::digest::{self, Published, Verified};
 use crate::download::{self, ProgressFn};
 use crate::error::{Error, Result};
@@ -9,6 +9,7 @@ use crate::fs_util::{self, human_size, MODE_EXEC};
 use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
+use crate::remote::{self, Remote};
 use crate::{archive, caches, date, icon, json, stamp, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -54,7 +55,9 @@ pub enum UpdateSource {
     /// says what the update is, and from there this is a zsync source like
     /// any other. `asset` is the pattern the update information names.
     GitHubZsync { owner: String, repo: String, tag: Option<String>, asset: String },
-    /// Plain re-download of the stored URL.
+    /// A URL, often a vendor link that redirects to the current file. The
+    /// check asks the server about the file without downloading it, see
+    /// [`crate::remote`]; the update downloads it whole.
     DirectUrl { url: String },
     /// Nothing to update from: no update information, no update source.
     Manual,
@@ -88,8 +91,20 @@ pub struct UpdateStatus {
     pub latest_version: Option<String>,
     pub available: bool,
     pub source: UpdateSource,
-    /// Why nothing can be said, when that is the case.
+    /// Why nothing can be said, when that is the case, or with `settled`
+    /// something worth knowing about an answer that stands.
     pub note: Option<String>,
+    /// Whether the check settled that there is nothing to update, so that a
+    /// note is information and no reason to download anything.
+    pub settled: bool,
+}
+
+impl UpdateStatus {
+    /// Whether an update would have nothing to do: nothing is available, and
+    /// the check either had nothing to add or settled it.
+    pub fn nothing_to_do(&self) -> bool {
+        !self.available && (self.note.is_none() || self.settled)
+    }
 }
 
 /// How an update was carried out. Every update reports one of these, so it
@@ -121,6 +136,9 @@ pub enum UpdatePath {
     /// An archive was downloaded, because that is what the source ships,
     /// and `entry` is the AppImage that came out of it.
     Unpacked { bytes: u64, entry: String },
+    /// The whole file was downloaded and turned out to be the installed one,
+    /// which stays as it is.
+    Unchanged { bytes: u64 },
 }
 
 impl UpdatePath {
@@ -145,6 +163,10 @@ impl UpdatePath {
             }
             UpdatePath::Unpacked { bytes, entry } => format!(
                 "no delta for this source, downloaded an archive of {} and took {entry} out of it",
+                human_size(*bytes)
+            ),
+            UpdatePath::Unchanged { bytes } => format!(
+                "downloaded {}, the same file as the installed one, which stays",
                 human_size(*bytes)
             ),
         }
@@ -430,6 +452,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
         available: false,
         source: source.clone(),
         note: None,
+        settled: false,
     };
 
     match &source {
@@ -493,12 +516,58 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 status.note = Some(reason);
             }
         }
-        UpdateSource::DirectUrl { .. } => {
-            status.note =
-                Some("the source URL carries no version, updating re-downloads it".to_string());
+        UpdateSource::DirectUrl { url } => {
+            let offered = download::probe(url)?;
+            let verdict = remote::judge(
+                &offered,
+                recorded_remote(app).as_ref(),
+                current.as_deref(),
+                installed_since(app),
+            );
+            status.latest_version = offered.version().or_else(|| {
+                // Nothing newer, and nothing else to call it.
+                verdict.settled.then(|| current.clone()).flatten()
+            });
+            status.available = verdict.available;
+            status.settled = verdict.settled;
+            status.note = match (verdict.note, github_hint(&offered, &app.slug)) {
+                (Some(note), Some(hint)) => Some(format!("{note}; {hint}")),
+                (note, hint) => note.or(hint),
+            };
         }
     }
     Ok(status)
+}
+
+/// What the server said about the installed file when it was downloaded,
+/// as long as that is still the installed file, see [`KEY_REMOTE`].
+fn recorded_remote(app: &InstalledApp) -> Option<Remote> {
+    let entry = DesktopEntry::read(&app.desktop_entry_path).ok()?;
+    let (sha1, recorded) = Remote::parse_record(entry.get(KEY_REMOTE)?)?;
+    (stamp::sha1(app).ok()? == sha1).then_some(recorded)
+}
+
+/// When the installed file was written, in seconds since the epoch: when it
+/// was installed, or later when an update replaced it.
+fn installed_since(app: &InstalledApp) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    let installed = app.installed_at.as_deref().and_then(|at| at.parse::<i64>().ok());
+    let written = fs::metadata(&app.appimage_path).ok().map(|meta| meta.mtime());
+    installed.max(written)
+}
+
+/// A vendor link that lands on a GitHub release names the repository it
+/// could follow instead, which also checks every download against the
+/// digest the release publishes. The link stays the update source.
+fn github_hint(offered: &Remote, slug: &str) -> Option<String> {
+    offered.hops.iter().skip(1).find_map(|hop| match github_source_from_url(hop)? {
+        UpdateSource::GitHubRelease { owner, repo, .. } => Some(format!(
+            "the link leads to a release of github:{owner}/{repo}, following that checks each \
+             download against the digest the release publishes: appimg update-source {slug} \
+             github:{owner}/{repo}"
+        )),
+        _ => None,
+    })
 }
 
 /// What to say about an application that has nothing to update from.
@@ -583,7 +652,7 @@ pub fn update(
         }
         UpdateSource::DirectUrl { url } => {
             let url = url.clone();
-            full_download(paths, app, &target, &url, source, Provenance::default(), progress)
+            url_download(paths, app, &target, &url, source, progress)
         }
     }
 }
@@ -609,6 +678,59 @@ fn full_download(
     };
     let outcome = finish(paths, app, Some(backup), source, from, path, None)?;
     Ok(UpdateOutcome { digest: fetched.verified, ..outcome })
+}
+
+/// The update of a URL source: the whole file, the way [`full_download`]
+/// gets it, kept out when it is the installed file once more, which a server
+/// that says nothing about its files leaves no other way to find out. Either
+/// way, what the server said about it is recorded for the next check.
+fn url_download(
+    paths: &Paths,
+    app: &InstalledApp,
+    target: &Path,
+    url: &str,
+    source: UpdateSource,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<UpdateOutcome> {
+    let staged = paths.appimage_dir.join(format!("{}.AppImage.new", app.slug));
+    let fetched = download::appimage_or_archive(url, &staged, &|_| Ok(None), progress)?;
+    let sha1 = match zsync::sha1_file(&staged) {
+        Ok(sha1) => sha1,
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
+
+    if stamp::sha1(app).ok().as_deref() == Some(sha1.as_str()) {
+        fs::remove_file(&staged).map_err(|e| Error::io(&staged, e))?;
+        let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
+        remote::record_in(&mut entry, Some(&fetched.remote));
+        entry.write(&app.desktop_entry_path)?;
+        return Ok(UpdateOutcome {
+            slug: app.slug.clone(),
+            from_version: app.version.clone(),
+            to_version: app.version.clone(),
+            appimage_path: target.to_path_buf(),
+            backup_path: None,
+            icons: Vec::new(),
+            source,
+            path: UpdatePath::Unchanged { bytes: fetched.bytes },
+            digest: None,
+        });
+    }
+
+    let backup = swap_in(&staged, target)?;
+    let path = match fetched.unpacked {
+        Some(entry) => UpdatePath::Unpacked { bytes: fetched.bytes, entry },
+        None => UpdatePath::FullDownload { bytes: fetched.bytes },
+    };
+    let from = Provenance {
+        version: fetched.remote.version(),
+        remote: Some(fetched.remote),
+        ..Provenance::default()
+    };
+    finish(paths, app, Some(backup), source, from, path, Some(&sha1))
 }
 
 /// The version to record for a file: the one it declares, unless that is a
@@ -750,6 +872,7 @@ fn finish(
     }
     entry.set_optional(desktop_entry::KEY_RELEASE, from.release);
     stamp::record(&mut entry, target, sha1);
+    remote::record_in(&mut entry, from.remote.as_ref());
     entry.write(&app.desktop_entry_path)?;
 
     caches::refresh(paths);
@@ -1635,8 +1758,8 @@ impl ReleaseDownload {
     }
 }
 
-/// What an update knows from the GitHub release it came out of, and the
-/// file it installs does not.
+/// What an update knows from where the file came from, the GitHub release
+/// or the server behind a URL, and the file it installs does not.
 #[derive(Debug, Default)]
 struct Provenance {
     /// The version to record when the file carries none worth keeping: a
@@ -1649,6 +1772,9 @@ struct Provenance {
     /// update that came out of no release, which has nothing to check a
     /// file against and nothing to say about it.
     out_of: Option<Release>,
+    /// What the server said about a file downloaded from a URL source, for
+    /// [`KEY_REMOTE`]. `None` for any other update, which leaves no record.
+    remote: Option<Remote>,
 }
 
 impl Provenance {
@@ -1657,6 +1783,7 @@ impl Provenance {
             version: release.recorded_version(),
             release: release.tag.as_deref().map(|tag| github_setting(owner, repo, Some(tag))),
             out_of: Some(release.clone()),
+            remote: None,
         }
     }
 
@@ -3377,5 +3504,33 @@ mod tests {
         header.filename = Some("appimageupdatetool-x86_64.AppImage".to_string());
         header.mtime = None;
         assert_eq!(offered_by_zsync(&header), None);
+    }
+
+    /// Bitwarden's download link redirects to a GitHub release. It stays the
+    /// update source, and the check names the repository it could follow.
+    #[test]
+    fn a_vendor_link_that_lands_on_a_github_release_names_the_repository() {
+        let hops = |hops: &[&str]| Remote {
+            hops: hops.iter().map(|hop| hop.to_string()).collect(),
+            ..Remote::default()
+        };
+        let offered = hops(&[
+            "https://vault.bitwarden.com/download/?app=desktop&platform=linux",
+            "https://github.com/bitwarden/clients/releases/download/desktop-v2026.9.1/\
+             Bitwarden-2026.9.1-x86_64.AppImage",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/1/2?sig=x",
+        ]);
+        let hint = github_hint(&offered, "bitwarden").unwrap();
+        assert!(hint.contains("a release of github:bitwarden/clients"), "{hint}");
+        assert!(
+            hint.ends_with("appimg update-source bitwarden github:bitwarden/clients"),
+            "{hint}"
+        );
+
+        let elsewhere = hops(&[
+            "https://lmstudio.ai/download/latest/linux/x64",
+            "https://installers.lmstudio.ai/linux/x64/0.4.25-1/LM-Studio-0.4.25-1-x64.AppImage",
+        ]);
+        assert_eq!(github_hint(&elsewhere, "lm-studio"), None);
     }
 }

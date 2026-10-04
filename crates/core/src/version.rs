@@ -9,7 +9,41 @@ enum Segment {
 /// Compares two loose version strings. Numeric runs compare numerically,
 /// everything else lexically. Separators are ignored. This is not semver, it
 /// only has to order the version strings AppImages actually ship.
+///
+/// A build number behind the version, `0.4.25-1` or `0.4.25+1`, counts only
+/// between two versions that both name one: those are the same build, and
+/// `0.4.25-2` is a later one. A version without one stands for any build
+/// of it, the way metadata that says `0.4.25` and a file named
+/// `0.4.25-1` speak of the same release.
 pub fn compare(a: &str, b: &str) -> Ordering {
+    let (a, a_build) = split_build(a);
+    let (b, b_build) = split_build(b);
+    match compare_without_build(a, b) {
+        Ordering::Equal => match (a_build, b_build) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            _ => Ordering::Equal,
+        },
+        other => other,
+    }
+}
+
+/// A version and the build number behind it: the digits after a last `-`
+/// or `+`, when what comes before them names a version. `0.4.25-1` is build
+/// 1 of `0.4.25`, and so is `0.4.25+1`. `1.2.0-rc1` has none, nor does
+/// a date like `2025-10-18`.
+fn split_build(version: &str) -> (&str, Option<u64>) {
+    let version = version.trim();
+    let digits = version.len() - version.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let base = &version[..version.len() - digits];
+    match base.strip_suffix(['-', '+']) {
+        Some(base) if digits > 0 && names_a_version(base) => {
+            (base, version[version.len() - digits..].parse().ok())
+        }
+        _ => (version, None),
+    }
+}
+
+fn compare_without_build(a: &str, b: &str) -> Ordering {
     let left = segments(a);
     let right = segments(b);
 
@@ -169,10 +203,17 @@ pub fn display(version: &str) -> String {
 
 /// Pulls a version out of a file or tag name, e.g. `v1.2.3` or
 /// `App-1.2.3-x86_64.AppImage` both yield `1.2.3`.
+///
+/// A build number behind the version comes along, see [`compare`]:
+/// `LM-Studio-0.4.25-1-x64.AppImage` yields `0.4.25-1`, and
+/// `App-0.4.25+1.AppImage` yields `0.4.25+1`.
 pub fn extract(text: &str) -> Option<String> {
     let mut plain_number = None;
+    let mut start = 0;
 
     for token in text.split(['-', '_', ' ', '/']) {
+        let after = &text[(start + token.len()).min(text.len())..];
+        start += token.len() + 1;
         let candidate = token.trim_start_matches(['v', 'V']);
         if !candidate.starts_with(|c: char| c.is_ascii_digit()) {
             continue;
@@ -181,7 +222,17 @@ pub fn extract(text: &str) -> Option<String> {
             candidate.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(candidate.len());
         let version = candidate[..end].trim_end_matches('.');
         if version.contains('.') {
-            return Some(version.to_string());
+            let rest = &candidate[version.len()..];
+            let build = match rest.strip_prefix('+') {
+                Some(plus) => build_number(plus).map(|build| format!("+{build}")),
+                // Only a dash right behind the version leads to a build
+                // number, `_1` or ` 1` is something else.
+                None if rest.is_empty() => {
+                    after.strip_prefix('-').and_then(build_number).map(|build| format!("-{build}"))
+                }
+                None => None,
+            };
+            return Some(format!("{version}{}", build.unwrap_or_default()));
         }
         // Bare numbers like the `x86` in `x86_64` are a poor guess, so they
         // only serve as a fallback when nothing dotted shows up.
@@ -190,6 +241,18 @@ pub fn extract(text: &str) -> Option<String> {
         }
     }
     plain_number
+}
+
+/// The digits a build number is made of, at the start of `text`: all of
+/// it, or up to a file extension. `1` and `1.AppImage` are build 1, while
+/// `64bit` and `4.5` are no build number.
+fn build_number(text: &str) -> Option<&str> {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let rest = &text[digits..];
+    let ends = rest.is_empty()
+        || rest.starts_with(['-', '_', ' ', '/'])
+        || (rest.starts_with('.') && !rest[1..].starts_with(|c: char| c.is_ascii_digit()));
+    (digits > 0 && ends).then(|| &text[..digits])
 }
 
 /// The alphanumeric words of a version string, whatever separates them.
@@ -387,6 +450,56 @@ mod tests {
         assert!(!comparable("a211784", "2.0.0"));
         assert!(!comparable("255-a211784", "2025-10-18"));
         assert!(comparable("1.2.3", "2.0.0"));
+    }
+
+    #[test]
+    fn a_build_number_is_read_with_the_version() {
+        let read = |text: &str| extract(text);
+        assert_eq!(read("LM-Studio-0.4.25-1-x64.AppImage").as_deref(), Some("0.4.25-1"));
+        assert_eq!(
+            read("/linux/x64/0.4.25-2/LM-Studio-0.4.25-2-x64.AppImage").as_deref(),
+            Some("0.4.25-2")
+        );
+        assert_eq!(read("App-0.4.25+1-x86_64.AppImage").as_deref(), Some("0.4.25+1"));
+        assert_eq!(read("App-1.2.3-1.AppImage").as_deref(), Some("1.2.3-1"));
+        assert_eq!(read("App-1.2.3+7.AppImage").as_deref(), Some("1.2.3+7"));
+        // Digits that are no build number stay out of it.
+        for name in [
+            "App-1.2.3-x86_64.AppImage",
+            "App-1.2.3-64bit.AppImage",
+            "App-1.2.3-4.5.AppImage",
+            "App-1.2.3_1.AppImage",
+            "App-1.2.3+x.AppImage",
+        ] {
+            assert_eq!(read(name).as_deref(), Some("1.2.3"), "{name}");
+        }
+        assert_eq!(read("2.0.0-alpha-1-20251018").as_deref(), Some("2.0.0"));
+    }
+
+    /// Issue #28: LM Studio's metadata says `0.4.25+1`, the file it ships is
+    /// `LM-Studio-0.4.25-1-x64.AppImage`. One build, two spellings.
+    #[test]
+    fn a_build_number_compares_by_its_number_whichever_sign_it_follows() {
+        assert_eq!(compare("0.4.25-1", "0.4.25+1"), Ordering::Equal);
+        assert!(is_newer("0.4.25-2", "0.4.25+1"));
+        assert!(is_newer("0.4.26-1", "0.4.25+1"));
+        assert!(is_newer("0.4.25-10", "0.4.25-9"));
+        assert!(!is_newer("0.4.25-1", "0.4.25-2"));
+        // A version that names no build number stands for any build of it.
+        assert_eq!(compare("0.4.25", "0.4.25-1"), Ordering::Equal);
+        assert!(is_newer("0.4.26", "0.4.25-3"));
+        assert!(!is_newer("0.4.25-3", "0.4.26"));
+    }
+
+    #[test]
+    fn a_prerelease_stays_one_next_to_a_build_number() {
+        assert!(is_newer("1.2.0", "1.2.0-beta"));
+        assert!(is_newer("1.2.0-1", "1.2.0-beta"));
+        assert!(is_newer("1.2.0", "1.2.0-rc1"));
+        assert!(is_newer("1.2.0", "1.2.0-alpha-3"));
+        assert!(is_newer("1.2.0-rc-2", "1.2.0-rc-1"));
+        assert_eq!(compare("1.2.0-beta", "1.2.0-beta"), Ordering::Equal);
+        assert!(!same_but_label("1.2.0-beta", "1.2.0"));
     }
 
     #[test]

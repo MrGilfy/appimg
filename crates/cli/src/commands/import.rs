@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use appimg_core::export::{self, ExportedApp, Fetch};
 use appimg_core::install::InstallRequest;
+use appimg_core::remote::Remote;
 use appimg_core::update::{self, ReleaseAsset, UpdateSource};
 use appimg_core::{digest, install, list, metadata, Paths};
 
@@ -135,14 +136,14 @@ fn import_one(paths: &Paths, ui: &Ui, app: &ExportedApp, fetch: &Fetch) -> Resul
             // Against what the release publishes, before anything reads the
             // metadata, which can run the file.
             let verify = |file: &Path| digest::verify(file, &asset.url, &asset.published).map(Some);
-            let (file, _scratch) = download_appimage(ui, &asset.url, &verify)?;
-            install_file(paths, ui, app, &file, &asset.url, Some(&asset))?;
+            let (file, _scratch, _) = download_appimage(ui, &asset.url, &verify)?;
+            install_file(paths, ui, app, &file, &asset.url, Some(&asset), None)?;
             Ok(Imported::Current)
         }
         Fetch::UpdateSource(url) | Fetch::Origin(url) => {
-            let (file, _scratch) =
+            let (file, _scratch, remote) =
                 download_appimage(ui, url, &|file| install::verify_download(file, url))?;
-            let version = install_file(paths, ui, app, &file, url, None)?;
+            let version = install_file(paths, ui, app, &file, url, None, Some(remote))?;
             match bring_up_to_date(paths, ui, app, url) {
                 Ok(()) => Ok(Imported::Current),
                 Err(error) => Ok(Imported::NotUpdated(format!(
@@ -170,6 +171,7 @@ fn install_file(
     file: &Path,
     origin: &str,
     asset: Option<&ReleaseAsset>,
+    remote: Option<Remote>,
 ) -> Result<Option<String>> {
     // Only a real import gets here, never a dry run: it is the install the
     // user asked for.
@@ -187,6 +189,7 @@ fn install_file(
     }
 
     let mut request = InstallRequest::from_info(file, origin, &info);
+    request.remote = remote;
     request.slug = Some(app.slug.clone());
     request.name = app.name.clone();
     request.comment = app.comment.clone();

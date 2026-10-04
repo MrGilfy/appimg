@@ -8,6 +8,7 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
+use crate::remote::{self, Remote};
 use crate::{archive, caches, download, elf, slug, stamp, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
@@ -54,6 +55,10 @@ pub struct InstallRequest {
     /// The GitHub release the file came out of, as `github:owner/repo@tag`,
     /// when it was downloaded from one.
     pub release: Option<String>,
+    /// What the server said about the file, when it was downloaded from a
+    /// URL, for the first check of that URL to compare with, see
+    /// [`crate::remote`].
+    pub remote: Option<Remote>,
     /// The slug to install under instead of the one the name gives: an
     /// import keeps the one the application had, whatever it was renamed to.
     pub slug: Option<String>,
@@ -88,6 +93,7 @@ impl InstallRequest {
                 .then(|| update::parse_update_source(origin).ok())
                 .flatten(),
             release: update::release_of_download(origin),
+            remote: None,
             slug: None,
             overwrite: false,
         }
@@ -177,6 +183,9 @@ pub struct InstallPlan {
     pub desktop_entry_path: PathBuf,
     pub desktop_entry: DesktopEntry,
     pub already_installed: bool,
+    /// What [`InstallRequest::remote`] says, recorded with the checksum of
+    /// the installed file once it is in place.
+    pub remote: Option<Remote>,
 }
 
 pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
@@ -195,6 +204,7 @@ pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
     Ok(InstallPlan {
         desktop_entry: build_entry(request, &slug, &appimage_path, &categories, &icon_field),
         already_installed: desktop_entry_path.exists() || appimage_path.exists(),
+        remote: request.remote.clone(),
         slug,
         appimage_path,
         desktop_entry_path,
@@ -247,13 +257,14 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
 }
 
 /// Writes the planned desktop entry, with the icon the installed icons
-/// make it, or the generic one without any, and the checksum of the
-/// AppImage that is in place by now.
+/// make it, or the generic one without any, the checksum of the AppImage
+/// that is in place by now, and what the server said about it.
 pub(crate) fn write_entry(plan: &InstallPlan, icons: &[PathBuf]) -> Result<()> {
     let icon_field = if icons.is_empty() { FALLBACK_ICON.to_string() } else { plan.slug.clone() };
     let mut entry = plan.desktop_entry.clone();
     entry.set("Icon", icon_field);
     stamp::record(&mut entry, &plan.appimage_path, None);
+    remote::record_in(&mut entry, plan.remote.as_ref());
     entry.write(&plan.desktop_entry_path)
 }
 
@@ -367,6 +378,7 @@ mod tests {
             update_info: None,
             update_source: None,
             release: None,
+            remote: None,
             slug: None,
             overwrite: false,
         }

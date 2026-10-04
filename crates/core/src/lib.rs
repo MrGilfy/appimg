@@ -23,6 +23,7 @@ pub mod list;
 pub mod metadata;
 pub mod notify;
 pub mod paths;
+pub mod remote;
 pub mod remove;
 pub mod slug;
 pub mod stamp;

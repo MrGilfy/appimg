@@ -8,6 +8,27 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A URL update source can be a vendor's download link that redirects to
+  the current version, such as LM Studio's, or a fixed name whose file
+  changes, such as CurseForge's. A check follows the link with HEAD
+  requests, one per redirect, and downloads nothing; a server that refuses
+  HEAD is asked for its first byte. A newer version in the name of the file
+  the link lands on is an update, taken from `Content-Disposition` when the
+  server sends one. Without a version, the path it lands on, the `ETag`, a
+  later `Last-Modified` or another `Content-Length` decide, in that order,
+  against what the server said when the installed file was downloaded:
+  installs and updates from a URL keep that in `X-AppImg-Remote`, each
+  field percent-encoded and the whole tied to the checksum of the installed
+  file, so a file replaced by any other means leaves a record that no longer
+  counts. The host and query of the URL never count, CDNs rotate the one and
+  sign the other. A file the server changed under a version already
+  installed is no update, the check says so in a note. A link that ends at
+  an error page is an error that says where it ended, and one that lands on
+  a GitHub release names the `github:` source that would also check the
+  release digests. A server that says nothing about its files still gets a
+  full download, which now keeps the installed file when it turns out to be
+  the same. An install from such a link takes the name and version of the
+  file it lands on. (#28)
 - The terminal interface and `appimg adopt` take a zip or tar archive with
   an AppImage inside, the way `install` and `update` do: the AppImage is
   found by its bytes, never by its name, the archive has to hold exactly
@@ -39,6 +60,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
   `update_source` field of `list --json` and the `source` field of
   `update --check --json` carry the same, tag and pattern included,
   escaped like every other string there.
+
+### Fixed
+
+- A version read from a file name keeps a numeric build number behind it:
+  `LM-Studio-0.4.25-1-x64.AppImage` is `0.4.25-1`, no longer `0.4.25`.
+  `-1` and `+1` are the same build number and compare as numbers, so
+  `0.4.25-1` equals the `0.4.25+1` LM Studio's metadata declares, and a
+  rebuild as `0.4.25-2` is newer. A version without a build number stands
+  for any build of it. Pre-release markers such as `-beta`, `-rc` and
+  `-alpha` keep their meaning. `update --check` had reported the installed
+  LM Studio as newer than the one its download link offered. (#28)
 
 ## [0.4.1] - 2026-10-04
 

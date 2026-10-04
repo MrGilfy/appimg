@@ -434,7 +434,7 @@ impl App {
                 continue;
             }
             match update::check(app) {
-                Ok(status) if !status.available && status.note.is_none() => continue,
+                Ok(status) if status.nothing_to_do() => continue,
                 Ok(_) | Err(_) => {}
             }
             match update::update(&self.paths, app, None) {

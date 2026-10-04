@@ -571,6 +571,7 @@ mod tests {
             available: true,
             source: crate::update::UpdateSource::Manual,
             note: None,
+            settled: false,
         };
         let (one, two) = (status("One", Some("1.0"), Some("2.0")), status("Two", None, None));
 
@@ -611,6 +612,7 @@ mod tests {
             available,
             source: crate::update::UpdateSource::Manual,
             note: None,
+            settled: false,
         };
         let names = |found: Vec<&UpdateStatus>| -> Vec<String> {
             found

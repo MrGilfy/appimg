@@ -544,11 +544,16 @@ fn install_from_a_url_records_it_and_updates_from_it() {
     assert_eq!(app.origin.as_deref(), Some(url.as_str()));
     assert_eq!(update::source_for(&app), update::UpdateSource::DirectUrl { url: url.clone() });
 
-    // `--check` says only that a re-download is what an update means here.
+    // `--check` asks the server about the file and downloads none of it.
+    // The name the URL gives carries the version that is installed, so
+    // there is nothing to do.
     let before = walk(&sandbox.paths.data_home);
+    let served = server.served().len();
     let status = update::check(&app).unwrap();
-    assert!(status.note.is_some());
+    assert!(status.nothing_to_do(), "{status:?}");
+    assert_eq!(status.latest_version.as_deref(), Some("1.0.0"));
     assert_eq!(walk(&sandbox.paths.data_home), before);
+    assert_eq!(server.asked().len(), served + 1);
 
     // The server now offers a different build, so the update picks it up.
     // A download only replaces the installed file if it starts with an ELF

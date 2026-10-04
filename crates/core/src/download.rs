@@ -11,6 +11,7 @@ use crate::digest::Verified;
 use crate::elf;
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
+use crate::remote::Remote;
 
 pub const USER_AGENT: &str = concat!("appimg/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -39,11 +40,20 @@ pub fn file_name_from_url(url: &str) -> String {
 /// Downloads a URL to a local file and marks it executable. Existing files
 /// are replaced only after the download finished.
 pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Result<u64> {
+    fetch(url, dest, progress).map(|(bytes, _)| bytes)
+}
+
+/// [`to_file`], and what the server said about the file it sent.
+fn fetch(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Result<(u64, Remote)> {
     let response = agent()
         .get(url)
         .header("User-Agent", USER_AGENT)
+        .config()
+        .save_redirect_history(true)
+        .build()
         .call()
         .map_err(|e| Error::Download(format!("{url}: {e}")))?;
+    let remote = remote_of(url, &response);
 
     let total = response
         .headers()
@@ -99,7 +109,69 @@ pub fn to_file(url: &str, dest: &Path, progress: Option<ProgressFn<'_>>) -> Resu
 
     fs_util::set_mode(&partial, MODE_EXEC)?;
     std::fs::rename(&partial, dest).map_err(|e| Error::io(dest, e))?;
-    Ok(written)
+    Ok((written, remote))
+}
+
+/// Asks the server about the file at `url` and downloads none of it: a HEAD
+/// request, which follows every redirect, or for a server that refuses HEAD
+/// a request for its first byte. One request per redirect, see
+/// [`crate::remote`]. A link that ends anywhere but at a file is an error
+/// that says where it ended: a link to a version that is gone often
+/// redirects to a page that says so.
+pub fn probe(url: &str) -> Result<Remote> {
+    let agent = agent();
+    let ask = |request: ureq::RequestBuilder<ureq::typestate::WithoutBody>| {
+        request
+            .header("User-Agent", USER_AGENT)
+            .config()
+            .save_redirect_history(true)
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .map_err(|e| Error::Download(format!("{url}: {e}")))
+    };
+
+    let mut response = ask(agent.head(url))?;
+    if matches!(response.status().as_u16(), 403 | 405 | 501) {
+        response = ask(agent.get(url).header("Range", "bytes=0-0"))?;
+    }
+
+    let landed = response.get_uri().to_string();
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(Error::Download(format!(
+            "{url}: the link leads to no file, the server answered {status} at {landed}"
+        )));
+    }
+    let html = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().to_ascii_lowercase().starts_with("text/html"));
+    if html {
+        return Err(Error::Download(format!(
+            "{url}: the link leads to a web page, not a file, at {landed}"
+        )));
+    }
+    Ok(remote_of(url, &response))
+}
+
+/// What a response that `url` led to says about its file.
+fn remote_of(url: &str, response: &ureq::http::Response<ureq::Body>) -> Remote {
+    let hops = match response.get_redirect_history() {
+        Some(history) if !history.is_empty() => history.iter().map(|uri| uri.to_string()).collect(),
+        _ => vec![url.to_string(), response.get_uri().to_string()],
+    };
+    let headers = response.headers();
+    // The headers of a one-byte request say one byte: the whole file is
+    // what its range says, for a 206 only.
+    let ranged = response.status().as_u16() == 206;
+    Remote::from_response(hops, &|name| {
+        if name == "content-range" && !ranged {
+            return None;
+        }
+        headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+    })
 }
 
 /// Downloads an AppImage the way [`to_file`] downloads anything, then makes
@@ -123,6 +195,9 @@ pub struct Fetched {
     /// The name of the AppImage inside the archive the server sent, when it
     /// sent one, for messages only.
     pub unpacked: Option<String>,
+    /// What the server said about what it sent, for an update from the same
+    /// URL to compare with, see [`crate::remote`].
+    pub remote: Remote,
 }
 
 /// Downloads `url` and leaves a checked AppImage at `dest`, whether the
@@ -141,11 +216,11 @@ pub fn appimage_or_archive(
     verify: &dyn Fn(&Path) -> Result<Option<Verified>>,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<Fetched> {
-    let bytes = to_file(url, dest, progress)?;
+    let (bytes, remote) = fetch(url, dest, progress)?;
     if archive::Kind::of(dest).is_none() {
         check_appimage(url, dest, None)?;
         let verified = verify(dest)?;
-        return Ok(Fetched { bytes, verified, unpacked: None });
+        return Ok(Fetched { bytes, verified, unpacked: None, remote });
     }
 
     let packed = dest.with_extension("archive");
@@ -160,7 +235,7 @@ pub fn appimage_or_archive(
     let _ = std::fs::remove_file(&packed);
     let (verified, extracted) = unpacked?;
     check_appimage(url, dest, Some(&extracted.entry))?;
-    Ok(Fetched { bytes, verified, unpacked: Some(extracted.entry) })
+    Ok(Fetched { bytes, verified, unpacked: Some(extracted.entry), remote })
 }
 
 /// The checks a downloaded AppImage gets before it goes anywhere: not
@@ -459,7 +534,7 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
-fn percent_decode(value: &str) -> String {
+pub(crate) fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

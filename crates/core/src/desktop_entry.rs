@@ -27,6 +27,13 @@ pub const KEY_INSTALLED_AT: &str = "X-AppImg-InstalledAt";
 /// written whenever appimg writes the file. A zsync check takes the
 /// checksum from here while size and time still match, see [`crate::stamp`].
 pub const KEY_SHA1: &str = "X-AppImg-SHA1";
+/// What the server said about the installed file when it was downloaded
+/// from a URL, tied to the checksum in [`KEY_SHA1`]:
+/// `<sha1> <length> <modified> <etag> <path> <name>`, each field
+/// percent-encoded, `-` for one the server did not send. A check of a URL
+/// source compares it with what the server says now, see
+/// [`crate::remote`].
+pub const KEY_REMOTE: &str = "X-AppImg-Remote";
 
 /// The freedesktop main categories. A desktop entry needs at least one of
 /// them, everything else is an additional category we do not offer.

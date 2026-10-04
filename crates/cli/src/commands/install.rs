@@ -4,6 +4,7 @@ use anyhow::{bail, Context, Result};
 use appimg_core::digest::Verified;
 use appimg_core::install::{IconChoice, InstallRequest};
 use appimg_core::metadata::{AppImageInfo, Reading};
+use appimg_core::remote::Remote;
 use appimg_core::update::{self, UpdateSource};
 use appimg_core::{archive, download, install, list, metadata, Paths};
 use tempfile::TempDir;
@@ -18,7 +19,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     check_entry_args(&args.entry)?;
     // The temporary directory has to outlive the installation, a downloaded
     // AppImage lives in it until it has been copied into place.
-    let (source, origin, _scratch) = resolve_source(ui, &args.source)?;
+    let (source, origin, remote, _scratch) = resolve_source(ui, &args.source)?;
 
     if !metadata::looks_like_appimage(&source) {
         bail!("{} does not look like an AppImage", source.display());
@@ -35,6 +36,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     }
 
     let mut request = InstallRequest::from_info(&source, &origin, &info);
+    request.remote = remote;
     apply_overrides(&mut request, &args.entry)?;
     if request.name.trim().is_empty() {
         bail!("no name could be determined, pass --name");
@@ -158,8 +160,12 @@ pub(crate) fn offer_suggested_source(
 
 /// Turns the argument into a local AppImage. URLs are downloaded, and an
 /// archive is unpacked, into a temporary directory that the caller keeps
-/// alive. The origin is what the user gave, archive or not.
-fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<TempDir>)> {
+/// alive. The origin is what the user gave, archive or not. A download
+/// comes with what the server said about it.
+fn resolve_source(
+    ui: &Ui,
+    source: &str,
+) -> Result<(PathBuf, String, Option<Remote>, Option<TempDir>)> {
     if !download::is_url(source) {
         let path = PathBuf::from(source);
         if !path.exists() {
@@ -168,19 +174,19 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
         let absolute = path.canonicalize().unwrap_or(path);
         let origin = absolute.to_string_lossy().into_owned();
         if let Some((dest, scratch)) = unpack_local(ui, &absolute)? {
-            return Ok((dest, origin, Some(scratch)));
+            return Ok((dest, origin, None, Some(scratch)));
         }
         // The same checks a download gets, before the metadata is read,
         // which can run the file.
         install::check_file(&absolute)?;
-        return Ok((absolute, origin, None));
+        return Ok((absolute, origin, None, None));
     }
 
     // Against the digest its release publishes, before anything reads the
     // metadata, which can run the file.
-    let (dest, scratch) =
+    let (dest, scratch, remote) =
         download_appimage(ui, source, &|file| install::verify_download(file, source))?;
-    Ok((dest, source.to_string(), Some(scratch)))
+    Ok((dest, source.to_string(), Some(remote), Some(scratch)))
 }
 
 /// Takes the AppImage out of a file on disk that is an archive, by its
@@ -209,11 +215,15 @@ fn scratch_dir(prefix: &str) -> Result<TempDir> {
 /// [`download::appimage_or_archive`]: checked against what its release
 /// publishes with `verify`, the archive before it is unpacked, then
 /// complete, flushed, and an ELF file at least as long as its squashfs says.
+///
+/// The file is named after what the server named it, which for a link that
+/// redirects to the current version is where its version is: the name and
+/// version a file name gives come from there when the metadata says none.
 pub(crate) fn download_appimage(
     ui: &Ui,
     url: &str,
     verify: &dyn Fn(&Path) -> appimg_core::Result<Option<Verified>>,
-) -> Result<(PathBuf, TempDir)> {
+) -> Result<(PathBuf, TempDir, Remote)> {
     let scratch = scratch_dir("appimg-download-")?;
     let dest = scratch.path().join(download::file_name_from_url(url));
 
@@ -233,7 +243,16 @@ pub(crate) fn download_appimage(
     if let Some(entry) = &fetched.unpacked {
         ui.info(&format!("  took {entry} out of the archive"));
     }
-    Ok((dest, scratch))
+    let dest = match fetched.remote.name.as_deref().filter(|_| fetched.unpacked.is_none()) {
+        Some(name) => {
+            let named = scratch.path().join(download::file_name_from_url(name));
+            std::fs::rename(&dest, &named)
+                .with_context(|| format!("cannot rename the download to {}", named.display()))?;
+            named
+        }
+        None => dest,
+    };
+    Ok((dest, scratch, fetched.remote))
 }
 
 /// Extraction failed, so name, icon and categories would be guesses. Say

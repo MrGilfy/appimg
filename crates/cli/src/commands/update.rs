@@ -128,8 +128,11 @@ pub(crate) fn update_one(
     // A source that cannot be checked can still be re-downloaded.
     let status = update::check(app).ok();
     if let Some(status) = &status {
-        if !status.available && status.note.is_none() {
-            ui.info(&format!("{} is up to date.", app.name));
+        if status.nothing_to_do() {
+            match &status.note {
+                Some(note) => ui.info(&format!("{} is up to date: {note}.", app.name)),
+                None => ui.info(&format!("{} is up to date.", app.name)),
+            }
             return Ok(None);
         }
     }
