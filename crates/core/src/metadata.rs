@@ -103,7 +103,7 @@ pub fn inspect(appimage: &Path, locale: Option<&str>, reading: Reading) -> Resul
         if let Some(entry) = read_embedded_entry(extraction.root()) {
             apply_entry(&mut info, &entry, locale);
         }
-        info.suggested_update_source = appstream::github_repository(extraction.root());
+        info.suggested_update_source = appstream::release_repository(extraction.root());
         info.extraction = Some(extraction);
     }
 

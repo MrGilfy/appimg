@@ -109,6 +109,25 @@ set, appimg sends it as a bearer token to `api.github.com` over https, and to
 no other host: never with a download, and never along a redirect, wherever it
 leads. `GH_TOKEN` comes first, as with `gh`.
 
+Releases on GitLab and on Forgejo, which Codeberg runs, are followed the
+same way, `@tag` and `--asset` patterns included:
+
+    appimg update-source app gitlab:group/subgroup/project
+    appimg update-source app codeberg:owner/repo
+    appimg update-source app gitlab:https://invent.kde.org/group/project
+    appimg update-source app forgejo:https://git.example.org/owner/repo
+
+GitLab marks no release as a pre-release, so one whose tag names one
+(`rc`, `beta`, `alpha`, `pre`, `preview`) or a moving build such as
+`nightly` is passed over unless `@tag` names it. Neither forge publishes a
+digest in the release, so an update checks the download against the
+SHA-256 the package registry of a GitLab project knows for it, or else a
+checksum file in the release, `<file>.sha256`, `<file>.sha256sum` or
+`SHA256SUMS`; a check never asks for either. A token goes to the API of
+the host it is for, over https, in the `Authorization` header and nowhere
+else: `GITLAB_TOKEN` for gitlab.com, `CODEBERG_TOKEN` for codeberg.org, and
+`APPIMG_TOKEN_<HOST>` for any host, such as `APPIMG_TOKEN_INVENT_KDE_ORG`.
+
 ## Where things go
 
     $XDG_DATA_HOME/appimages/<name>.AppImage      the binary

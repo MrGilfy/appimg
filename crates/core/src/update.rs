@@ -12,6 +12,10 @@ use crate::paths::Paths;
 use crate::remote::{self, Remote};
 use crate::{archive, caches, date, hold, icon, json, stamp, version, zsync};
 
+mod forge;
+
+pub use forge::{Forge, Repo};
+
 const GITHUB_API: &str = "https://api.github.com";
 
 /// Where the GitHub API is asked. `APPIMG_GITHUB_API` exists for the tests,
@@ -35,21 +39,16 @@ pub enum UpdateSource {
     /// file's header directly, and appimg applies the delta itself; a full
     /// download of the file it describes is the fallback when that fails.
     Zsync { update_info: String },
-    /// A GitHub release, queried through the API. `tag` is the tag to
-    /// follow: one that keeps moving out of a download URL, see
-    /// [`tag_to_follow`], or the one an update source names; without one, the
-    /// newest release that has the installed AppImage in it, see
-    /// [`release_to_follow`]. `asset` is the name of the file that was
-    /// installed, which picks the matching file out of the release.
-    /// `pattern` is one the user gave with `--asset`, which picks the file
-    /// instead, see [`with_asset_pattern`].
-    GitHubRelease {
-        owner: String,
-        repo: String,
-        tag: Option<String>,
-        asset: Option<String>,
-        pattern: Option<String>,
-    },
+    /// A release on GitHub, GitLab or a Forgejo such as Codeberg, queried
+    /// through the forge's API, see [`Repo`]. `tag` is the tag to follow:
+    /// one that keeps moving out of a download URL, see [`tag_to_follow`],
+    /// or the one an update source names; without one, the newest release
+    /// that has the installed AppImage in it, see [`release_to_follow`].
+    /// `asset` is the name of the file that was installed, which picks the
+    /// matching file out of the release. `pattern` is one the user gave
+    /// with `--asset`, which picks the file instead, see
+    /// [`with_asset_pattern`].
+    ForgeRelease { repo: Repo, tag: Option<String>, asset: Option<String>, pattern: Option<String> },
     /// `gh-releases-zsync`: a GitHub release whose named asset is a zsync
     /// file. The release says which assets exist, the zsync file inside it
     /// says what the update is, and from there this is a zsync source like
@@ -64,18 +63,18 @@ pub enum UpdateSource {
 }
 
 impl UpdateSource {
-    /// What the source is, in a word, or for a GitHub release the way the
-    /// desktop entry stores it, `github:owner/repo[@tag][#pattern]`: the tag
-    /// and the asset pattern decide which file an update takes, so they are
-    /// part of it.
+    /// What the source is, in a word, or for a release the way the desktop
+    /// entry stores it, `github:owner/repo[@tag][#pattern]` and the like:
+    /// the tag and the asset pattern decide which file an update takes, so
+    /// they are part of it.
     pub fn describe(&self) -> String {
         match self {
             UpdateSource::Zsync { .. } => "zsync".to_string(),
             // The release is where the zsync file is found, not what the
             // update is: a delta is a delta.
             UpdateSource::GitHubZsync { .. } => "zsync".to_string(),
-            UpdateSource::GitHubRelease { owner, repo, tag, pattern, .. } => {
-                github_source_setting(owner, repo, tag.as_deref(), pattern.as_deref())
+            UpdateSource::ForgeRelease { repo, tag, pattern, .. } => {
+                repo.setting(tag.as_deref(), pattern.as_deref())
             }
             UpdateSource::DirectUrl { .. } => "url".to_string(),
             UpdateSource::Manual => MANUAL.to_string(),
@@ -228,10 +227,13 @@ pub fn source_for(app: &InstalledApp) -> UpdateSource {
 }
 
 /// Checks an update source as a user gives it, and returns it the way the
-/// desktop entry stores it. Accepted are an http(s) URL and
-/// `github:owner/repo`, optionally followed by `@tag`, a tag that is then
-/// followed exactly as written. A link to a repository or to its releases
-/// on github.com is stored as `github:owner/repo`, and one to a release
+/// desktop entry stores it. Accepted are an http(s) URL, and the releases of
+/// a repository, see [`Repo::parse_source`]: `github:owner/repo`,
+/// `gitlab:group/project`, `codeberg:owner/repo`, and the self-hosted
+/// `gitlab:https://host/...` and `forgejo:https://host/...`, each
+/// optionally followed by `@tag`, a tag that is then followed exactly as
+/// written, and `#pattern`. A link to a repository or to its releases on
+/// github.com is stored as `github:owner/repo`, and one to a release
 /// follows its tag the way a download URL does, see [`tag_to_follow`].
 pub fn parse_update_source(value: &str) -> Result<String> {
     let trimmed = value.trim();
@@ -242,7 +244,8 @@ pub fn parse_update_source(value: &str) -> Result<String> {
         return Ok(github_source_setting(&owner, &repo, tag.as_deref(), pattern.as_deref()));
     }
     if !download::is_url(trimmed) {
-        return Err(invalid());
+        let (repo, tag, pattern) = Repo::parse_source(trimmed).ok_or_else(invalid)?;
+        return Ok(repo.setting(tag.as_deref(), pattern.as_deref()));
     }
     let host = trimmed.split_once("://").map_or("", |(_, rest)| rest);
     let host = host.split(['/', '?', '#']).next().unwrap_or("");
@@ -255,15 +258,78 @@ pub fn parse_update_source(value: &str) -> Result<String> {
         }
         Some(GitHubPage::Download) => Ok(trimmed.to_string()),
         Some(GitHubPage::Other) => Err(invalid()),
-        None => Ok(trimmed.to_string()),
+        None => Ok(forge_page(trimmed).unwrap_or_else(|| trimmed.to_string())),
     }
 }
 
-/// The `owner/repo` an update source follows the releases of, if it is a
-/// GitHub one, whether written as `github:` or as a download URL.
-pub fn github_repository(value: &str) -> Option<String> {
+/// The update source a link to a repository on gitlab.com or codeberg.org
+/// stands for, or to its releases, or to one release, which follows its
+/// tag the way a GitHub one does, see [`tag_to_follow`]. Anything else
+/// there, a download above all, stays the URL it is.
+fn forge_page(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest).trim_end_matches('/');
+    let (setting, tag) = match rest.strip_prefix("codeberg.org/") {
+        Some(path) => codeberg_page(path)?,
+        None => gitlab_page(rest.strip_prefix("gitlab.com/")?)?,
+    };
+    let (repo, _, _) = Repo::parse_source(&setting)?;
+    Some(repo.setting(tag.as_deref(), None))
+}
+
+/// A page of a repository on codeberg.org, by its path: the repository
+/// as a source, and the tag of a release page.
+fn codeberg_page(path: &str) -> Option<(String, Option<String>)> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let tag = match parts[..] {
+        [_, _] | [_, _, "releases"] => None,
+        [_, _, "releases", "tag", tag] => tag_to_follow(tag),
+        _ => return None,
+    };
+    Some((format!("codeberg:{}/{}", parts[0], parts[1]), tag))
+}
+
+/// A page of a project on gitlab.com, by its path, the way
+/// [`codeberg_page`] reads one. GitLab's own pages and API sit under names
+/// no group can take, and a file is no project.
+fn gitlab_page(path: &str) -> Option<(String, Option<String>)> {
+    const RESERVED: &[&str] = &[
+        "api",
+        "admin",
+        "assets",
+        "dashboard",
+        "explore",
+        "groups",
+        "help",
+        "oauth",
+        "projects",
+        "search",
+        "uploads",
+        "users",
+    ];
+    let (project, pages) = match path.split_once("/-/") {
+        Some((project, pages)) => (project, Some(pages)),
+        None => (path, None),
+    };
+    let tag = match pages.map(|pages| pages.split('/').collect::<Vec<_>>()).as_deref() {
+        None | Some(["releases"]) => None,
+        Some(["releases", tag]) => tag_to_follow(tag),
+        Some(_) => return None,
+    };
+    let first = project.split('/').next().unwrap_or("");
+    let last = project.rsplit('/').next().unwrap_or("").to_lowercase();
+    if RESERVED.contains(&first) || last.ends_with(".appimage") || archive::is_archive_name(&last) {
+        return None;
+    }
+    Some((format!("gitlab:{project}"), tag))
+}
+
+/// The repository an update source follows the releases of, whether
+/// written as `github:` and the like or as a GitHub download URL, as the
+/// source without tag or pattern: `github:owner/repo`, `gitlab:group/project`.
+pub fn release_repository(value: &str) -> Option<String> {
     match source_from_setting(value, None) {
-        UpdateSource::GitHubRelease { owner, repo, .. } => Some(format!("{owner}/{repo}")),
+        UpdateSource::ForgeRelease { repo, .. } => Some(repo.setting(None, None)),
         _ => None,
     }
 }
@@ -272,16 +338,16 @@ pub fn github_repository(value: &str) -> Option<String> {
 /// the name of the installed file: `github:owner/repo[@tag]#<pattern>`, a
 /// file name in which `*` stands for whatever changes from one release to
 /// the next, matched without regard to case. Only a source that follows
-/// GitHub releases can take one. A pattern it had already is replaced.
+/// releases can take one. A pattern it had already is replaced.
 pub fn with_asset_pattern(source: &str, pattern: &str) -> Result<String> {
     if !valid_pattern(pattern) {
         return Err(Error::InvalidAssetPattern(pattern.to_string()));
     }
     match source_from_setting(source, None) {
-        UpdateSource::GitHubRelease { owner, repo, tag, .. } => {
-            Ok(github_source_setting(&owner, &repo, tag.as_deref(), Some(pattern)))
+        UpdateSource::ForgeRelease { repo, tag, .. } => {
+            Ok(repo.setting(tag.as_deref(), Some(pattern)))
         }
-        _ => Err(Error::AssetNeedsGitHub(source.to_string())),
+        _ => Err(Error::AssetNeedsRelease(source.to_string())),
     }
 }
 
@@ -297,7 +363,7 @@ pub fn check_asset_pattern(pattern: &str) -> Result<()> {
 
 /// Whether `pattern` can pick an asset: something that could be a file
 /// name, with `*` where anything may stand.
-fn valid_pattern(pattern: &str) -> bool {
+pub(crate) fn valid_pattern(pattern: &str) -> bool {
     !pattern.is_empty()
         && !pattern.chars().any(|c| c.is_whitespace() || c.is_control() || "/#".contains(c))
 }
@@ -324,12 +390,11 @@ fn source_from_setting(value: &str, origin: Option<&str>) -> UpdateSource {
     let Ok(value) = parse_update_source(value) else {
         return UpdateSource::Manual;
     };
-    match value.strip_prefix("github:").and_then(github_source_spec) {
+    match Repo::parse_source(&value) {
         // The file that was installed is what picks the file out of each
         // release, whether it came from that release or from anywhere else,
         // unless a pattern the user gave does.
-        Some((owner, repo, tag, pattern)) => UpdateSource::GitHubRelease {
-            owner,
+        Some((repo, tag, pattern)) => UpdateSource::ForgeRelease {
             repo,
             tag,
             asset: origin
@@ -474,8 +539,8 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             status.note = note;
         }
         UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
-            let release =
-                release_to_follow(owner, repo, tag.as_deref(), |r| has_zsync_for(r, asset))?;
+            let github = Repo::github(owner, repo);
+            let release = release_to_follow(&github, tag.as_deref(), |r| has_zsync_for(r, asset))?;
 
             match zsync_asset_url(&release, asset) {
                 // From here on this is a zsync source: the zsync file says
@@ -492,7 +557,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 }
                 None => {
                     status.latest_version = release.version();
-                    let recorded = recorded_tag(app, owner, repo);
+                    let recorded = recorded_tag(app, &Repo::github(owner, repo));
                     let (installed, available, note) =
                         compare_release(current.as_deref(), recorded.as_deref(), &release);
                     status.current_version = installed;
@@ -506,11 +571,12 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
                 }
             }
         }
-        UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern } => {
-            let wanted = Wanted { pattern: pattern.as_deref(), hint: asset.as_deref() };
-            let release = release_to_follow(owner, repo, tag.as_deref(), |r| r.has_asset(wanted))?;
+        UpdateSource::ForgeRelease { repo, tag, asset, pattern } => {
+            let hint = asset_hint(app, repo, asset.as_deref());
+            let wanted = Wanted { pattern: pattern.as_deref(), hint: hint.as_deref() };
+            let release = release_to_follow(repo, tag.as_deref(), |r| r.has_asset(wanted))?;
             status.latest_version = release.version();
-            let recorded = recorded_tag(app, owner, repo);
+            let recorded = recorded_tag(app, repo);
             let (installed, available, note) =
                 compare_release(current.as_deref(), recorded.as_deref(), &release);
             status.current_version = installed;
@@ -568,13 +634,117 @@ fn installed_since(app: &InstalledApp) -> Option<i64> {
 /// digest the release publishes. The link stays the update source.
 fn github_hint(offered: &Remote, slug: &str) -> Option<String> {
     offered.hops.iter().skip(1).find_map(|hop| match github_source_from_url(hop)? {
-        UpdateSource::GitHubRelease { owner, repo, .. } => Some(format!(
-            "the link leads to a release of github:{owner}/{repo}, following that checks each \
-             download against the digest the release publishes: appimg update-source {slug} \
-             github:{owner}/{repo}"
-        )),
+        UpdateSource::ForgeRelease { repo, .. } => {
+            let source = repo.setting(None, None);
+            Some(format!(
+                "the link leads to a release of {source}, following that checks each download \
+                 against the digest the release publishes: appimg update-source {slug} {source}"
+            ))
+        }
         _ => None,
     })
+}
+
+/// The name the installed file went by, which picks the file out of each
+/// release: the end of the URL it was installed from. On GitHub that is
+/// the file name, as it always was. A GitLab package file comes from a URL
+/// that ends in `download`, which names nothing: then the name the server
+/// gave the download, kept with what it said about it, see
+/// [`KEY_REMOTE`]. Without one, nothing names the file, and the release
+/// is searched for the build for this machine.
+fn asset_hint(app: &InstalledApp, repo: &Repo, asset: Option<&str>) -> Option<String> {
+    let names_a_file =
+        |name: &str| name.to_lowercase().ends_with(".appimage") || archive::is_archive_name(name);
+    match asset {
+        Some(asset) if repo.forge == Forge::GitHub || names_a_file(asset) => {
+            Some(asset.to_string())
+        }
+        _ => DesktopEntry::read(&app.desktop_entry_path)
+            .ok()
+            .and_then(|entry| Remote::parse_record(entry.get(KEY_REMOTE)?))
+            .and_then(|(_, recorded)| recorded.name)
+            .filter(|name| names_a_file(name)),
+    }
+}
+
+/// What to check the file at `url` out of `release` against, asked for at
+/// update time only, never by a check. GitHub publishes a digest for each
+/// asset in the release itself. GitLab and Forgejo do not, so in this
+/// order: the SHA-256 the package registry of a GitLab project knows for a
+/// file of a generic package, at the cost of two requests, see
+/// [`Repo::package_checksum`]; then a checksum file in the release, see
+/// [`checksum_file`]; and when there is neither, nothing, which is no
+/// reason to refuse the file, only nothing to check it against.
+fn published(repo: &Repo, release: &Release, url: &str) -> Published {
+    if repo.forge == Forge::GitHub {
+        return release.published_for(url);
+    }
+    if let Some(sha256) = repo.package_checksum(url) {
+        return Published::Checksum { sha256, by: "the GitLab package registry".to_string() };
+    }
+    checksum_file(release, url).unwrap_or_else(|| {
+        Published::Nothing("the release publishes no checksum for it".to_string())
+    })
+}
+
+/// The checksum the release of the file at `url` publishes in a file of
+/// its own: `<name>.sha256` or `<name>.sha256sum` next to it, or a list of
+/// them, `SHA256SUMS`. A file that cannot be read, or names no checksum
+/// for this one, leaves nothing to check against, and says so. One plain
+/// request, for at most 64 KiB, and never with a token, see
+/// [`download::small_text`].
+fn checksum_file(release: &Release, url: &str) -> Option<Published> {
+    let asset = release.assets.iter().find(|asset| asset.url == url)?;
+    let lower = asset.name.to_lowercase();
+    let named = |wanted: &[String]| {
+        release.assets.iter().find(|candidate| wanted.contains(&candidate.name.to_lowercase()))
+    };
+    let (file, single) = match named(&[format!("{lower}.sha256"), format!("{lower}.sha256sum")]) {
+        Some(file) => (file, true),
+        None => {
+            let lists = ["sha256sums", "sha256sums.txt", "checksums.sha256"].map(String::from);
+            (named(&lists)?, false)
+        }
+    };
+    let text = match download::small_text(&file.url, 64 * 1024) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(Published::Nothing(format!("{} could not be read: {error}", file.name)));
+        }
+    };
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let names = [asset.name.clone(), download::percent_decode(last_segment(path))];
+    Some(match sha256_in(&text, &names, single) {
+        Some(sha256) => Published::Checksum { sha256, by: file.name.clone() },
+        None => Published::Nothing(format!("{} names no checksum for it", file.name)),
+    })
+}
+
+/// The SHA-256 a checksum file holds for a file that goes by one of
+/// `names`, out of lines of `<hex>  <name>`, the way `sha256sum` writes
+/// them. A file of its own for one file, `single`, may call that file
+/// something else, or nothing at all: its one checksum is the one.
+fn sha256_in(text: &str, names: &[String], single: bool) -> Option<String> {
+    let entries: Vec<(String, Option<&str>)> = text
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let hex = words.next()?;
+            let name = words
+                .next()
+                .map(|name| name.trim_start_matches('*'))
+                .map(|name| name.rsplit('/').next().unwrap_or(name));
+            (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| (hex.to_ascii_lowercase(), name))
+        })
+        .collect();
+    let by_name =
+        entries.iter().find(|(_, name)| name.is_some_and(|name| names.iter().any(|n| n == name)));
+    match (by_name, entries.as_slice()) {
+        (Some((hex, _)), _) => Some(hex.clone()),
+        (None, [(hex, _)]) if single => Some(hex.clone()),
+        _ => None,
+    }
 }
 
 /// What to say about an application that has nothing to update from.
@@ -634,9 +804,9 @@ pub fn update(
             apply_zsync(paths, app, &target, &url, source, Provenance::default(), progress)
         }
         UpdateSource::GitHubZsync { owner, repo, tag, asset } => {
-            let release =
-                release_to_follow(owner, repo, tag.as_deref(), |r| has_zsync_for(r, asset))?;
-            let from = Provenance::of(owner, repo, &release);
+            let github = Repo::github(owner, repo);
+            let release = release_to_follow(&github, tag.as_deref(), |r| has_zsync_for(r, asset))?;
+            let from = Provenance::of(&github, &release);
 
             match zsync_asset_url(&release, asset) {
                 Some(url) => apply_zsync(paths, app, &target, &url, source, from, progress),
@@ -645,16 +815,19 @@ pub fn update(
                 None => {
                     let hint = appimage_named_by(asset);
                     let wanted = Wanted { pattern: None, hint: Some(&hint) };
-                    let url = pick_asset(&release, owner, repo, wanted)?;
+                    let url = pick_asset(&release, &github, wanted)?;
                     full_download(paths, app, &target, &url, source, from, progress)
                 }
             }
         }
-        UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern } => {
-            let wanted = Wanted { pattern: pattern.as_deref(), hint: asset.as_deref() };
-            let release = release_to_follow(owner, repo, tag.as_deref(), |r| r.has_asset(wanted))?;
-            let url = pick_asset(&release, owner, repo, wanted)?;
-            let from = Provenance::of(owner, repo, &release);
+        UpdateSource::ForgeRelease { repo, tag, asset, pattern } => {
+            let hint = asset_hint(app, repo, asset.as_deref());
+            let wanted = Wanted { pattern: pattern.as_deref(), hint: hint.as_deref() };
+            let release = release_to_follow(repo, tag.as_deref(), |r| r.has_asset(wanted))?;
+            let url = pick_asset(&release, repo, wanted)?;
+            // Only an update asks for a checksum, a check never does.
+            let from =
+                Provenance::of(repo, &release).checked_against(published(repo, &release, &url));
             full_download(paths, app, &target, &url, source, from, progress)
         }
         UpdateSource::DirectUrl { url } => {
@@ -758,12 +931,13 @@ fn version_to_record(
     }
 }
 
-/// The AppImage a `github:` update source offers now, picked the way an
-/// update picks it, with what its release publishes about it.
+/// The AppImage a release source offers now, picked the way an update
+/// picks it, with what its release publishes about it.
 #[derive(Debug, Clone)]
 pub struct ReleaseAsset {
     pub url: String,
-    /// `github:owner/repo@tag`, for [`desktop_entry::KEY_RELEASE`].
+    /// `github:owner/repo@tag` and the like, for
+    /// [`desktop_entry::KEY_RELEASE`].
     pub release: Option<String>,
     /// What the release publishes for the file, to check it against.
     pub published: Published,
@@ -780,21 +954,22 @@ impl ReleaseAsset {
     }
 }
 
-/// The newest AppImage, or archive with one inside, the
-/// `github:owner/repo[@tag][#pattern]` update source `source` offers: out
+/// The newest AppImage, or archive with one inside, the release source
+/// `source` offers, `github:owner/repo[@tag][#pattern]` and the like: out
 /// of the newest release that has one matching the pattern, or
 /// `asset_hint`, the file name of an earlier download, the way an update
-/// finds it. One request for the releases.
+/// finds it. One request for the releases, and up to two more for a
+/// checksum where the forge publishes none in the listing, see
+/// [`published`].
 pub fn newest_asset(source: &str, asset_hint: Option<&str>) -> Result<ReleaseAsset> {
     let invalid = || Error::InvalidUpdateSource(source.to_string());
-    let (owner, repo, tag, pattern) =
-        source.strip_prefix("github:").and_then(github_source_spec).ok_or_else(invalid)?;
+    let (repo, tag, pattern) = Repo::parse_source(source).ok_or_else(invalid)?;
     let wanted = Wanted { pattern: pattern.as_deref(), hint: asset_hint };
-    let release = release_to_follow(&owner, &repo, tag.as_deref(), |r| r.has_asset(wanted))?;
-    let url = pick_asset(&release, &owner, &repo, wanted)?;
-    let from = Provenance::of(&owner, &repo, &release);
+    let release = release_to_follow(&repo, tag.as_deref(), |r| r.has_asset(wanted))?;
+    let url = pick_asset(&release, &repo, wanted)?;
+    let from = Provenance::of(&repo, &release);
     Ok(ReleaseAsset {
-        published: release.published_for(&url),
+        published: published(&repo, &release, &url),
         release: from.release,
         from_release: from.version,
         url,
@@ -978,7 +1153,12 @@ fn github_source_from_url(url: &str) -> Option<UpdateSource> {
         _ => None,
     };
     let asset = rest.rsplit('/').next().map(str::to_string);
-    Some(UpdateSource::GitHubRelease { owner, repo, tag, asset, pattern: None })
+    Some(UpdateSource::ForgeRelease {
+        repo: Repo::github(&owner, &repo),
+        tag,
+        asset,
+        pattern: None,
+    })
 }
 
 /// Which tag an update should follow, out of the one the application was
@@ -994,13 +1174,24 @@ fn tag_to_follow(tag: &str) -> Option<String> {
     (version::is_rolling(tag) && !tag.eq_ignore_ascii_case("latest")).then(|| tag.to_string())
 }
 
+/// A file of a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Asset {
+    /// What it is called. On GitHub the end of its download URL, as it
+    /// always was; elsewhere the name the forge gives it, see
+    /// [`Repo::parse_release`].
+    name: String,
+    url: String,
+    /// The SHA-256 the forge publishes for it in the release, as GitHub
+    /// does, `None` for an asset older than the digests and on a forge that
+    /// publishes none there.
+    sha256: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Release {
     tag: Option<String>,
-    assets: Vec<String>,
-    /// The download URL of every asset with the SHA-256 GitHub publishes
-    /// for it, `None` for an asset older than the digests.
-    digests: Vec<(String, Option<String>)>,
+    assets: Vec<Asset>,
     /// The day it was published, `2025-10-18`.
     published: Option<String>,
     /// The commit it was built from, abbreviated.
@@ -1010,17 +1201,16 @@ struct Release {
 impl Release {
     /// What this release publishes for the asset at `url`.
     fn published_for(&self, url: &str) -> Published {
-        match self.digests.iter().find(|(asset, _)| asset == url) {
-            Some((_, Some(sha256))) => Published::Sha256(sha256.clone()),
-            Some((_, None)) => Published::Nothing(digest::NONE_PUBLISHED.to_string()),
+        match self.assets.iter().find(|asset| asset.url == url) {
+            Some(Asset { sha256: Some(sha256), .. }) => Published::Sha256(sha256.clone()),
+            Some(_) => Published::Nothing(digest::NONE_PUBLISHED.to_string()),
             None => Published::Nothing("the file is not an asset of the release".to_string()),
         }
     }
 
-    /// The asset `name` of this release, by the last part of its download
-    /// URL, as a download URL spells it.
+    /// The download URL of the asset `name` of this release.
     fn asset_named(&self, name: &str) -> Option<&String> {
-        self.assets.iter().find(|url| last_segment(url) == name)
+        self.assets.iter().find(|asset| asset.name == name).map(|asset| &asset.url)
     }
 
     /// Whether this release is a moving one rather than a cut version.
@@ -1040,7 +1230,7 @@ impl Release {
         self.tag
             .as_deref()
             .and_then(version::extract)
-            .or_else(|| self.assets.first().and_then(|url| version::extract(url)))
+            .or_else(|| self.assets.first().and_then(|asset| version::extract(&asset.url)))
     }
 
     /// The version to record for a file downloaded out of this release,
@@ -1054,13 +1244,16 @@ impl Release {
         !self.candidates(wanted, Arch::current()).0.is_empty()
     }
 
-    fn appimages(&self) -> Vec<&String> {
-        self.assets.iter().filter(|url| url.to_lowercase().ends_with(".appimage")).collect()
+    fn appimages(&self) -> Vec<&Asset> {
+        self.assets
+            .iter()
+            .filter(|asset| asset.name.to_lowercase().ends_with(".appimage"))
+            .collect()
     }
 
     /// The archives of this release, any of which may hold an AppImage.
-    fn archives(&self) -> Vec<&String> {
-        self.assets.iter().filter(|url| archive::is_archive_name(last_segment(url))).collect()
+    fn archives(&self) -> Vec<&Asset> {
+        self.assets.iter().filter(|asset| archive::is_archive_name(&asset.name)).collect()
     }
 
     /// What `wanted` picks out of this release on a machine that is `here`,
@@ -1077,10 +1270,10 @@ impl Release {
     ///    project that renames its files every release, the way Shipwright
     ///    puts a new codename into `SoH-<codename>-Linux.zip`, still ships
     ///    one build for Linux.
-    fn candidates(&self, wanted: Wanted, here: Option<Arch>) -> (Vec<&String>, Rule) {
+    fn candidates(&self, wanted: Wanted, here: Option<Arch>) -> (Vec<&Asset>, Rule) {
         if let Some(pattern) = wanted.pattern {
             let fits =
-                self.assets.iter().filter(|url| glob_matches(pattern, last_segment(url))).collect();
+                self.assets.iter().filter(|asset| glob_matches(pattern, &asset.name)).collect();
             return (fits, Rule::Pattern);
         }
         let by_name = fitting(self.appimages(), wanted.hint, here);
@@ -1093,11 +1286,11 @@ impl Release {
                 return (by_name, Rule::Name { archives: true });
             }
         }
-        let left: Vec<&String> = self
+        let left: Vec<&Asset> = self
             .appimages()
             .into_iter()
             .chain(self.archives())
-            .filter(|url| !for_other_platform(url))
+            .filter(|asset| !for_other_platform(&asset.name))
             .collect();
         (fitting(left, None, here), Rule::Platform)
     }
@@ -1113,7 +1306,7 @@ impl Release {
         }
         let (fits, rule) = self.candidates(wanted, here);
         if let [one] = fits.as_slice() {
-            return Ok((*one).clone());
+            return Ok(one.url.clone());
         }
 
         let what = match wanted.hint {
@@ -1125,7 +1318,7 @@ impl Release {
             (true, false) => "archives",
             _ => "AppImages or archives",
         };
-        let installable: Vec<&String> = appimages.iter().chain(&archives).copied().collect();
+        let installable: Vec<&Asset> = appimages.iter().chain(&archives).copied().collect();
         let advice = "pick one with --asset '<pattern>' on appimg update-source, or set the \
                       update source to the download URL of the one to follow";
         Err(match (rule, wanted.pattern) {
@@ -1182,10 +1375,10 @@ enum Rule {
 /// installed file: whatever in it is part of a version is ignored, the rest
 /// of the name and the architecture have to match. Without a hint, the
 /// files built for `here` fit.
-fn fitting<'a>(files: Vec<&'a String>, hint: Option<&str>, here: Option<Arch>) -> Vec<&'a String> {
+fn fitting<'a>(files: Vec<&'a Asset>, hint: Option<&str>, here: Option<Arch>) -> Vec<&'a Asset> {
     let wanted = hint.map(AssetName::parse);
-    let named: Vec<(&String, AssetName)> =
-        files.into_iter().map(|url| (url, AssetName::parse(url))).collect();
+    let named: Vec<(&Asset, AssetName)> =
+        files.into_iter().map(|asset| (asset, AssetName::parse(&asset.name))).collect();
     // A name without an architecture is the build for this machine, unless
     // another file of the same kind names this machine's: then it is the
     // build for some other one, the way electron-builder leaves the x86_64
@@ -1202,7 +1395,7 @@ fn fitting<'a>(files: Vec<&'a String>, hint: Option<&str>, here: Option<Arch>) -
             }
             None => arch_fits(None, candidate.arch, here, unlabeled),
         })
-        .map(|(url, _)| url)
+        .map(|(asset, _)| asset)
         .collect()
 }
 
@@ -1223,11 +1416,11 @@ fn for_other_platform(name: &str) -> bool {
 }
 
 /// The download URL of the file to update to, out of a release.
-fn pick_asset(release: &Release, owner: &str, repo: &str, wanted: Wanted) -> Result<String> {
+fn pick_asset(release: &Release, repo: &Repo, wanted: Wanted) -> Result<String> {
     release.pick(wanted, Arch::current()).map_err(|reason| Error::NoMatchingAsset {
         release: match &release.tag {
-            Some(tag) => format!("release {tag} of github:{owner}/{repo}"),
-            None => format!("the release of github:{owner}/{repo} it follows"),
+            Some(tag) => format!("release {tag} of {}", repo.setting(None, None)),
+            None => format!("the release of {} it follows", repo.setting(None, None)),
         },
         reason,
     })
@@ -1386,8 +1579,8 @@ fn last_segment(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
-fn names(urls: &[&String]) -> String {
-    urls.iter().map(|url| last_segment(url)).collect::<Vec<_>>().join(", ")
+fn names(assets: &[&Asset]) -> String {
+    assets.iter().map(|asset| asset.name.as_str()).collect::<Vec<_>>().join(", ")
 }
 
 /// The zsync file of a release, out of the pattern a `gh-releases-zsync`
@@ -1402,6 +1595,7 @@ fn zsync_asset_url(release: &Release, pattern: &str) -> Option<String> {
     let zsyncs: Vec<String> = release
         .assets
         .iter()
+        .map(|asset| &asset.url)
         .filter(|url| url.to_lowercase().ends_with(".zsync"))
         .cloned()
         .collect();
@@ -1442,7 +1636,7 @@ fn has_zsync_for(release: &Release, pattern: &str) -> bool {
     release
         .assets
         .iter()
-        .map(|url| asset_name(url))
+        .map(|asset| asset_name(&asset.url))
         .any(|name| name.ends_with(".zsync") && glob_matches(&loose, &name))
 }
 
@@ -1523,10 +1717,9 @@ fn glob_matches(pattern: &str, name: &str) -> bool {
 }
 
 /// Reads the release behind a tag.
-fn fetch_release(owner: &str, repo: &str, tag: &str) -> Result<Release> {
-    let url = format!("{}/repos/{owner}/{repo}/releases/tags/{tag}", github_api());
-    let body = download::to_string(&url)?;
-    Ok(parse_release(&body))
+fn fetch_release(repo: &Repo, tag: &str) -> Result<Release> {
+    let body = download::api_text(&repo.tag_url(tag), repo.api())?;
+    Ok(repo.parse_release(&body))
 }
 
 /// Reads the release GitHub calls the latest: the newest that is neither a
@@ -1537,10 +1730,7 @@ fn fetch_latest_release(owner: &str, repo: &str) -> Result<Release> {
     Ok(parse_release(&body))
 }
 
-/// How many releases the one request for a listing asks for.
-const RELEASES_PER_PAGE: usize = 30;
-
-/// The release an update from GitHub follows. A tag is followed exactly.
+/// The release an update from a forge follows. A tag is followed exactly.
 /// Without one, the newest release that `holds` what the update needs: the
 /// installed AppImage, or a zsync file for it. Projects publish releases for
 /// some platforms only, and the latest one may hold nothing but an `.apk`.
@@ -1548,34 +1738,22 @@ const RELEASES_PER_PAGE: usize = 30;
 /// it holds what is needed, the newest one is returned all the same, and
 /// what comes next says why it is no use.
 fn release_to_follow(
-    owner: &str,
-    repo: &str,
+    repo: &Repo,
     tag: Option<&str>,
     holds: impl Fn(&Release) -> bool,
 ) -> Result<Release> {
     if let Some(tag) = tag {
-        return fetch_release(owner, repo, tag);
+        return fetch_release(repo, tag);
     }
-    let url =
-        format!("{}/repos/{owner}/{repo}/releases?per_page={RELEASES_PER_PAGE}", github_api());
-    let body = download::to_string(&url)?;
-    newest_where(published_releases(&body), holds).ok_or_else(|| Error::NoMatchingAsset {
-        release: format!("github:{owner}/{repo}"),
-        reason: "it has no release that is neither a draft nor a pre-release".to_string(),
+    let body = download::api_text(&repo.listing_url(), repo.api())?;
+    newest_where(repo.published_releases(&body), holds).ok_or_else(|| Error::NoMatchingAsset {
+        release: repo.setting(None, None),
+        reason: match repo.forge {
+            Forge::GitLab { .. } => "it has no release whose tag names neither a pre-release nor                                      a moving build; follow one with @tag"
+                .to_string(),
+            _ => "it has no release that is neither a draft nor a pre-release".to_string(),
+        },
     })
-}
-
-/// The releases of a listing, newest first as GitHub lists them, without
-/// drafts and pre-releases: what `releases/latest` chooses from.
-fn published_releases(listing: &str) -> Vec<Release> {
-    json::array_objects(listing)
-        .into_iter()
-        .filter(|release| {
-            json::bool_field(release, "draft") != Some(true)
-                && json::bool_field(release, "prerelease") != Some(true)
-        })
-        .map(parse_release)
-        .collect()
 }
 
 /// The newest release that `holds` what is needed, or the newest release
@@ -1585,16 +1763,27 @@ fn newest_where(releases: Vec<Release>, holds: impl Fn(&Release) -> bool) -> Opt
     releases.into_iter().nth(index)
 }
 
+/// A release as GitHub's API answers for it.
 fn parse_release(body: &str) -> Release {
+    let digests: Vec<(String, Option<String>)> = json::array_field_objects(body, "assets")
+        .into_iter()
+        .filter_map(|asset| {
+            let url = json::string_field(asset, "browser_download_url")?;
+            let sha256 = json::string_field(asset, "digest").as_deref().and_then(digest::parse);
+            Some((url, sha256))
+        })
+        .collect();
     Release {
         tag: json::string_field(body, "tag_name"),
-        assets: json::string_fields(body, "browser_download_url"),
-        digests: json::array_field_objects(body, "assets")
+        assets: json::string_fields(body, "browser_download_url")
             .into_iter()
-            .filter_map(|asset| {
-                let url = json::string_field(asset, "browser_download_url")?;
-                let sha256 = json::string_field(asset, "digest").as_deref().and_then(digest::parse);
-                Some((url, sha256))
+            .map(|url| Asset {
+                name: last_segment(&url).to_string(),
+                sha256: digests
+                    .iter()
+                    .find(|(asset, _)| *asset == url)
+                    .and_then(|(_, sha256)| sha256.clone()),
+                url,
             })
             .collect(),
         published: json::string_field(body, "published_at")
@@ -1695,12 +1884,9 @@ fn same_tag(a: &str, b: &str) -> bool {
 
 /// The tag `X-AppImg-Release` records for this repository, if it records
 /// one. A release of another repository says nothing about this one.
-fn recorded_tag(app: &InstalledApp, owner: &str, repo: &str) -> Option<String> {
-    let (recorded_owner, recorded_repo, tag) =
-        github_spec(app.release.as_deref()?.strip_prefix("github:")?)?;
-    (recorded_owner.eq_ignore_ascii_case(owner) && recorded_repo.eq_ignore_ascii_case(repo))
-        .then_some(tag)
-        .flatten()
+fn recorded_tag(app: &InstalledApp, repo: &Repo) -> Option<String> {
+    let (recorded, tag, pattern) = Repo::parse_source(app.release.as_deref()?)?;
+    (pattern.is_none() && recorded.same_as(repo)).then_some(tag).flatten()
 }
 
 /// `github:owner/repo@tag` for a file downloaded out of a GitHub release,
@@ -1720,7 +1906,7 @@ pub fn published_for_download(url: &str) -> Option<Published> {
     let download = ReleaseDownload::parse(url)?;
     let (owner, repo) = (&download.owner, &download.repo);
     let (release, which) = match &download.tag {
-        Some(tag) => (fetch_release(owner, repo, tag), format!("release {tag}")),
+        Some(tag) => (fetch_release(&Repo::github(owner, repo), tag), format!("release {tag}")),
         None => (fetch_latest_release(owner, repo), "the latest release".to_string()),
     };
     let published = match release {
@@ -1782,24 +1968,35 @@ struct Provenance {
     /// update that came out of no release, which has nothing to check a
     /// file against and nothing to say about it.
     out_of: Option<Release>,
+    /// What to check the file against when the release listing does not
+    /// say, see [`published`].
+    checked_against: Option<Published>,
     /// What the server said about a file downloaded from a URL source, for
     /// [`KEY_REMOTE`]. `None` for any other update, which leaves no record.
     remote: Option<Remote>,
 }
 
 impl Provenance {
-    fn of(owner: &str, repo: &str, release: &Release) -> Self {
+    fn of(repo: &Repo, release: &Release) -> Self {
         Self {
             version: release.recorded_version(),
-            release: release.tag.as_deref().map(|tag| github_setting(owner, repo, Some(tag))),
+            release: release.tag.as_deref().map(|tag| repo.setting(Some(tag), None)),
             out_of: Some(release.clone()),
+            checked_against: None,
             remote: None,
         }
+    }
+
+    fn checked_against(self, published: Published) -> Self {
+        Self { checked_against: Some(published), ..self }
     }
 
     /// What the release publishes for the asset at `url`, `None` for an
     /// update that came out of no release.
     fn published_for(&self, url: &str) -> Option<Published> {
+        if let Some(published) = &self.checked_against {
+            return Some(published.clone());
+        }
         self.out_of.as_ref().map(|release| release.published_for(url))
     }
 }
@@ -1989,6 +2186,17 @@ fn payload_url(zsync_url: &str, header: &zsync::Header) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// An asset at `url` as GitHub lists it: named after the end of its URL,
+    /// with no digest.
+    fn github_asset(url: &str) -> Asset {
+        Asset { name: last_segment(url).to_string(), url: url.to_string(), sha256: None }
+    }
+
+    /// The releases of a GitHub listing an update follows.
+    fn published_releases(listing: &str) -> Vec<Release> {
+        Repo::github("o", "r").published_releases(listing)
+    }
+
     fn header_with_url(url: Option<&str>) -> zsync::Header {
         zsync::Header {
             filename: None,
@@ -2035,10 +2243,11 @@ mod tests {
             assets: assets
                 .iter()
                 .map(|name| {
-                    format!("https://github.com/WerWolv/ImHex/releases/download/{tag}/{name}")
+                    github_asset(&format!(
+                        "https://github.com/WerWolv/ImHex/releases/download/{tag}/{name}"
+                    ))
                 })
                 .collect(),
-            digests: Vec::new(),
             published: None,
             commit: None,
         }
@@ -2366,9 +2575,8 @@ mod tests {
         );
         assert_eq!(
             source,
-            Some(UpdateSource::GitHubRelease {
-                owner: "owner".to_string(),
-                repo: "repo".to_string(),
+            Some(UpdateSource::ForgeRelease {
+                repo: Repo::github("owner", "repo"),
                 tag: None,
                 asset: Some("App.AppImage".to_string()),
                 pattern: None,
@@ -2382,9 +2590,8 @@ mod tests {
         );
         assert_eq!(
             source,
-            Some(UpdateSource::GitHubRelease {
-                owner: "AppImage".to_string(),
-                repo: "AppImageUpdate".to_string(),
+            Some(UpdateSource::ForgeRelease {
+                repo: Repo::github("AppImage", "AppImageUpdate"),
                 tag: Some("continuous".to_string()),
                 asset: Some("appimageupdatetool-x86_64.AppImage".to_string()),
                 pattern: None,
@@ -2744,9 +2951,8 @@ mod tests {
                 "github:o/r#SoH-*-Linux.zip",
                 Some("/home/u/SoH-Ackbar-Delta-Linux.zip")
             ),
-            UpdateSource::GitHubRelease {
-                owner: "o".to_string(),
-                repo: "r".to_string(),
+            UpdateSource::ForgeRelease {
+                repo: Repo::github("o", "r"),
                 tag: None,
                 asset: Some("SoH-Ackbar-Delta-Linux.zip".to_string()),
                 pattern: Some("SoH-*-Linux.zip".to_string()),
@@ -2776,9 +2982,9 @@ mod tests {
         );
         assert!(matches!(
             with_asset_pattern("https://example.com/App.zip", "*.zip"),
-            Err(Error::AssetNeedsGitHub(_))
+            Err(Error::AssetNeedsRelease(_))
         ));
-        assert!(matches!(with_asset_pattern("manual", "*.zip"), Err(Error::AssetNeedsGitHub(_))));
+        assert!(matches!(with_asset_pattern("manual", "*.zip"), Err(Error::AssetNeedsRelease(_))));
         assert!(matches!(
             with_asset_pattern("github:o/r", "a b.zip"),
             Err(Error::InvalidAssetPattern(_))
@@ -2940,8 +3146,12 @@ mod tests {
         ];
         let release = followed(releases, Some("Obsidian-1.13.6.AppImage")).unwrap();
         assert_eq!(release.tag.as_deref(), Some("v1.13.8"));
-        let error =
-            pick_asset(&release, "obsidianmd", "obsidian-releases", Wanted::default()).unwrap_err();
+        let error = pick_asset(
+            &release,
+            &Repo::github("obsidianmd", "obsidian-releases"),
+            Wanted::default(),
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "release v1.13.8 of github:obsidianmd/obsidian-releases: the release has neither an \
@@ -3041,7 +3251,7 @@ mod tests {
     }
 
     fn compared(app: &InstalledApp, release: &Release) -> (Option<String>, bool, Option<String>) {
-        let recorded = recorded_tag(app, "ppy", "osu");
+        let recorded = recorded_tag(app, &Repo::github("ppy", "osu"));
         compare_release(app.version.as_deref(), recorded.as_deref(), release)
     }
 
@@ -3061,7 +3271,7 @@ mod tests {
         // A release recorded for another repository says nothing about this
         // one, and the versions decide.
         let elsewhere = osu(Some("github:someone/osu-fork@2026.1002.0-lazer"));
-        assert_eq!(recorded_tag(&elsewhere, "ppy", "osu"), None);
+        assert_eq!(recorded_tag(&elsewhere, &Repo::github("ppy", "osu")), None);
         assert!(compared(&elsewhere, &osu_release("2026.1002.0-lazer")).1);
     }
 
@@ -3128,10 +3338,11 @@ mod tests {
             assert_eq!(release_of_download(url), None, "{url}");
         }
 
-        let from = Provenance::of("ppy", "osu", &osu_release("2026.921.0-lazer"));
+        let from = Provenance::of(&Repo::github("ppy", "osu"), &osu_release("2026.921.0-lazer"));
         assert_eq!(from.release.as_deref(), Some("github:ppy/osu@2026.921.0-lazer"));
         assert_eq!(
-            Provenance::of("ppy", "osu", &Release { tag: None, ..osu_release("x") }).release,
+            Provenance::of(&Repo::github("ppy", "osu"), &Release { tag: None, ..osu_release("x") })
+                .release,
             None
         );
 
@@ -3178,7 +3389,7 @@ mod tests {
         // An update out of no release has nothing to check against and
         // nothing to say about it.
         assert_eq!(Provenance::default().published_for(asset), None);
-        assert!(Provenance::of("o", "r", &old[0]).published_for(asset).is_some());
+        assert!(Provenance::of(&Repo::github("o", "r"), &old[0]).published_for(asset).is_some());
     }
 
     #[test]
@@ -3281,9 +3492,8 @@ mod tests {
     }
 
     fn github(owner: &str, repo: &str, tag: Option<&str>, asset: Option<&str>) -> UpdateSource {
-        UpdateSource::GitHubRelease {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
+        UpdateSource::ForgeRelease {
+            repo: Repo::github(owner, repo),
             tag: tag.map(str::to_string),
             asset: asset.map(str::to_string),
             pattern: None,
@@ -3372,17 +3582,52 @@ mod tests {
         }
     }
 
+    /// A link to a repository on gitlab.com or codeberg.org, or to its
+    /// releases, is that repository's releases. A download there stays the
+    /// URL it is, as 0.4.x stored it.
+    #[test]
+    fn a_link_to_a_gitlab_or_codeberg_repository_follows_its_releases() {
+        for (link, stored) in [
+            ("https://gitlab.com/es-de/emulationstation-de", "gitlab:es-de/emulationstation-de"),
+            (
+                "https://gitlab.com/librewolf-community/browser/appimage/-/releases",
+                "gitlab:librewolf-community/browser/appimage",
+            ),
+            ("https://gitlab.com/o/r/-/releases/v1.0", "gitlab:o/r"),
+            ("https://gitlab.com/o/r/-/releases/continuous", "gitlab:o/r@continuous"),
+            ("https://codeberg.org/naev/naev/", "codeberg:naev/naev"),
+            ("https://codeberg.org/naev/naev/releases", "codeberg:naev/naev"),
+            ("https://codeberg.org/naev/naev/releases/tag/nightly", "codeberg:naev/naev@nightly"),
+        ] {
+            assert_eq!(parse_update_source(link).unwrap(), stored, "{link}");
+        }
+        for url in [
+            "https://gitlab.com/es-de/emulationstation-de/-/package_files/1/download",
+            "https://gitlab.com/api/v4/projects/7/packages/generic/app/1.0/App.AppImage",
+            "https://codeberg.org/naev/naev/releases/download/v0.13.5/naev-0.13.5-linux-x86-64.AppImage",
+            "https://gitlab.example.org/o/r",
+            "http://codeberg.org/o/r",
+        ] {
+            assert_eq!(parse_update_source(url).unwrap(), url, "{url}");
+            assert!(matches!(source_from_setting(url, None), UpdateSource::DirectUrl { .. }), "{url}");
+        }
+    }
+
     #[test]
     fn a_github_repository_is_recognised_however_it_is_written() {
-        assert_eq!(github_repository("github:o/r@continuous").as_deref(), Some("o/r"));
-        assert_eq!(github_repository("https://github.com/o/r").as_deref(), Some("o/r"));
+        assert_eq!(release_repository("github:o/r@continuous").as_deref(), Some("github:o/r"));
+        assert_eq!(release_repository("https://github.com/o/r").as_deref(), Some("github:o/r"));
         assert_eq!(
-            github_repository("https://github.com/o/r/releases/download/v1/App.AppImage")
+            release_repository("https://github.com/o/r/releases/download/v1/App.AppImage")
                 .as_deref(),
-            Some("o/r")
+            Some("github:o/r")
         );
-        assert_eq!(github_repository("https://example.com/App.AppImage"), None);
-        assert_eq!(github_repository(MANUAL), None);
+        assert_eq!(
+            release_repository("gitlab:g/s/p@v1#App-*.AppImage").as_deref(),
+            Some("gitlab:g/s/p")
+        );
+        assert_eq!(release_repository("https://example.com/App.AppImage"), None);
+        assert_eq!(release_repository(MANUAL), None);
     }
 
     /// The AppImageUpdate continuous release as the API returns it, and the
@@ -3390,8 +3635,7 @@ mod tests {
     fn continuous_release() -> Release {
         Release {
             tag: Some("continuous".to_string()),
-            assets: vec!["https://x/AppImageUpdate-x86_64.AppImage".to_string()],
-            digests: Vec::new(),
+            assets: vec![github_asset("https://x/AppImageUpdate-x86_64.AppImage")],
             published: Some("2025-10-18".to_string()),
             commit: Some("a211784".to_string()),
         }
@@ -3459,8 +3703,7 @@ mod tests {
     fn a_version_release_is_still_compared_as_a_version() {
         let release = Release {
             tag: Some("v2.0.0".to_string()),
-            assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
-            digests: Vec::new(),
+            assets: vec![github_asset("https://x/App-2.0.0-x86_64.AppImage")],
             published: Some("2025-10-18".to_string()),
             commit: Some("a211784".to_string()),
         };
@@ -3483,8 +3726,7 @@ mod tests {
         // and saying so beats ordering `a211784` against `2.0.0`.
         let release = Release {
             tag: Some("v2.0.0".to_string()),
-            assets: vec!["https://x/App-2.0.0-x86_64.AppImage".to_string()],
-            digests: Vec::new(),
+            assets: vec![github_asset("https://x/App-2.0.0-x86_64.AppImage")],
             published: Some("2025-10-18".to_string()),
             commit: None,
         };

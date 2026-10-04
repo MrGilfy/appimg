@@ -791,7 +791,7 @@ fn adopt_keeps_the_asset_pattern_with_the_update_source_or_refuses_it() {
     let output = home.run(&["--yes", "adopt", file.to_str().unwrap(), "--asset", "Fake-*.zip"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(
-        stderr(&output).contains("--asset picks a file out of a GitHub release"),
+        stderr(&output).contains("--asset picks a file out of a release"),
         "{}",
         stderr(&output)
     );

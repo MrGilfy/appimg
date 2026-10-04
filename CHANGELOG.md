@@ -8,6 +8,31 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Update sources that follow releases on GitLab and on Forgejo, which
+  Codeberg runs: `gitlab:group/project`, with every subgroup, and
+  `codeberg:owner/repo`, and on any other host
+  `gitlab:https://host/group/project` and `forgejo:https://host/owner/repo`
+  (`gitea:` too). `@tag`, `--asset` patterns, archives, recorded releases
+  and rolling tags work as with `github:`, and a link on gitlab.com or
+  codeberg.org to a repository, its releases or one release, given as the
+  source or found in the AppStream metadata, names one the short way; a
+  download URL there stays a URL source. GitLab marks no
+  pre-release, so a release whose tag names one or a moving build is
+  passed over unless `@tag` names it, as is one dated in the future; a
+  GitLab link stands for the file its name reads like, or the one its URL
+  ends in, and a package file that downloads from `.../download` is
+  matched by the name the server gave it when it was installed. An update
+  checks the download against the SHA-256 the package registry of a GitLab
+  project knows for a file of a generic package, two more requests, or
+  else against a checksum file in the release, `<file>.sha256`,
+  `<file>.sha256sum` or `SHA256SUMS`, one more, read whole up to 64 KiB
+  since some CDNs answer a ranged request for one with no body, and a
+  bare hash in a file of its own counts; a check asks for neither,
+  one request as before. A token goes only to the API host it is for,
+  over https, and only in the `Authorization` header, which no redirect
+  carries along: `GITLAB_TOKEN` for gitlab.com, `CODEBERG_TOKEN` for
+  codeberg.org, `APPIMG_TOKEN_<HOST>` for any host. Everything 0.4.x stored
+  for `github:` reads and behaves as it did. (#30)
 - `appimg hold <app>` holds an application at the version it has, and
   `appimg unhold <app>` releases it; the hold is `X-AppImg-Hold` in its
   desktop entry. Asking for the state it is in already says so and exits
@@ -71,6 +96,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `--asset` and its error speak of releases, not GitHub releases, and a
+  rate limit names the forge or host whose limit it is.
 - Installing over an installed application keeps the update source it had
   when the install would leave it to update manually otherwise, held or
   not, and says so, in a dry run too. `--update-source`, the URL an install

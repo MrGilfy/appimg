@@ -160,8 +160,8 @@ pub fn suggested_update_source(request: &InstallRequest, info: &AppImageInfo) ->
     if request.update_info.is_some() {
         return None;
     }
-    let following = request.update_source.as_deref().and_then(update::github_repository);
-    let offered = update::github_repository(&suggested);
+    let following = request.update_source.as_deref().and_then(update::release_repository);
+    let offered = update::release_repository(&suggested);
     let same = following.zip(offered).is_some_and(|(a, b)| a.eq_ignore_ascii_case(&b));
     (!same).then_some(suggested)
 }

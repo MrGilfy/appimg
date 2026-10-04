@@ -473,9 +473,8 @@ fn an_update_source_given_at_install_is_written_and_followed() {
     // release.
     assert_eq!(
         update::source_for(&app),
-        update::UpdateSource::GitHubRelease {
-            owner: "o".to_string(),
-            repo: "r".to_string(),
+        update::UpdateSource::ForgeRelease {
+            repo: update::Repo::github("o", "r"),
             tag: None,
             asset: Some("Fake_App-1.0.0-x86_64.AppImage".to_string()),
             pattern: None,

@@ -299,6 +299,27 @@ pub fn head_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// A small text file, such as a checksum file next to a release asset: a
+/// plain request, never with a token, read to at most `max_bytes`. No
+/// `Range` asks for less: some CDNs answer one for a file this small with
+/// a length and no body, dl.librewolf.net among them. A file that is
+/// longer is refused, whatever it holds.
+pub fn small_text(url: &str, max_bytes: u64) -> Result<String> {
+    let response = agent()
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .call()
+        .map_err(|e| Error::Download(format!("{url}: {e}")))?;
+    let mut reader = response.into_body().into_reader().take(max_bytes + 1);
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut out)
+        .map_err(|e| Error::Download(format!("{url}: {e}")))?;
+    if out.len() as u64 > max_bytes {
+        return Err(Error::Download(format!("{url}: longer than {max_bytes} bytes")));
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
 /// What a ranged request came back with. A server that honours the range
 /// sends the piece that was asked for; one that does not starts sending the
 /// whole file instead, and says so with a 200.
@@ -449,21 +470,60 @@ fn first_byte_of_content_range(value: &str) -> Option<u64> {
     first.trim().parse().ok()
 }
 
+/// The release API a request goes to. It decides how a token is sent, and
+/// what a refusal means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Api {
+    GitHub,
+    GitLab,
+    Forgejo,
+}
+
+impl Api {
+    fn name(self) -> &'static str {
+        match self {
+            Api::GitHub => "GitHub",
+            Api::GitLab => "GitLab",
+            Api::Forgejo => "Forgejo",
+        }
+    }
+
+    /// The value of the `Authorization` header for `token`. Every forge
+    /// takes the token there, and nowhere else: ureq drops that header, and
+    /// only that one, on every redirect, see [`agent`]. GitLab's own
+    /// `PRIVATE-TOKEN` header would follow a redirect to any host.
+    fn authorization(self, token: &str) -> String {
+        match self {
+            Api::GitHub | Api::GitLab => format!("Bearer {token}"),
+            Api::Forgejo => format!("token {token}"),
+        }
+    }
+}
+
 /// Fetches a URL as text, used for the GitHub release API. A GitHub token
 /// in the environment goes along, to api.github.com and nowhere else, see
 /// [`Credentials`].
 pub fn to_string(url: &str) -> Result<String> {
-    fetch_text(url, Credentials::from_env().as_ref())
+    api_text(url, Api::GitHub)
 }
 
-fn fetch_text(url: &str, credentials: Option<&Credentials>) -> Result<String> {
-    let mut request = agent()
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Accept", "application/vnd.github+json");
+/// Fetches the answer of a release API as text, with the token the
+/// environment holds for the host it goes to, if any, see
+/// [`Credentials::for_url`].
+pub fn api_text(url: &str, api: Api) -> Result<String> {
+    let credentials = Credentials::for_url(url, &|name| std::env::var(name).ok());
+    fetch_text(url, api, credentials.as_ref())
+}
+
+fn fetch_text(url: &str, api: Api, credentials: Option<&Credentials>) -> Result<String> {
+    let accept = match api {
+        Api::GitHub => "application/vnd.github+json",
+        Api::GitLab | Api::Forgejo => "application/json",
+    };
+    let mut request = agent().get(url).header("User-Agent", USER_AGENT).header("Accept", accept);
     let credentials = credentials.filter(|credentials| credentials.belongs_to(url));
     if let Some(credentials) = credentials {
-        request = request.header("Authorization", format!("Bearer {}", credentials.token));
+        request = request.header("Authorization", api.authorization(&credentials.token));
     }
 
     match request.call() {
@@ -471,45 +531,79 @@ fn fetch_text(url: &str, credentials: Option<&Credentials>) -> Result<String> {
             response.into_body().read_to_string().map_err(|e| Error::Network(format!("{url}: {e}")))
         }
         Err(ureq::Error::StatusCode(401)) if credentials.is_some() => Err(Error::Network(format!(
-            "{url}: GitHub refused the token in {}",
-            credentials.map_or("", |credentials| credentials.variable)
+            "{url}: {} refused the token in {}",
+            api.name(),
+            credentials.map_or("", |credentials| credentials.variable.as_str())
         ))),
-        Err(ureq::Error::StatusCode(403 | 429)) => Err(Error::RateLimited),
+        // GitHub answers an exhausted limit with a 403 as often as with a
+        // 429. GitLab and Forgejo mean something else by a 403.
+        Err(ureq::Error::StatusCode(403 | 429)) if api == Api::GitHub => {
+            Err(Error::RateLimited("GitHub".to_string()))
+        }
+        Err(ureq::Error::StatusCode(429)) => Err(Error::RateLimited(host_of(url))),
         Err(e) => Err(Error::Network(format!("{url}: {e}"))),
     }
 }
 
-/// A GitHub token, and the one origin it is ever sent to. Only the request
-/// for API text carries it: a download never does, and nor does a redirect,
-/// see [`agent`].
+/// The host and port of a URL, for a message.
+fn host_of(url: &str) -> String {
+    url.parse::<ureq::http::Uri>()
+        .ok()
+        .and_then(|uri| uri.authority().map(|authority| authority.host().to_string()))
+        .unwrap_or_else(|| url.to_string())
+}
+
+/// A token, and the one origin it is ever sent to. Only the request for API
+/// text carries it: a download never does, and nor does a redirect, see
+/// [`agent`].
 struct Credentials {
     scheme: &'static str,
     authority: String,
     token: String,
     /// The environment variable the token came from, for an error to name.
-    variable: &'static str,
+    variable: String,
 }
 
 impl Credentials {
-    /// `GH_TOKEN`, then `GITHUB_TOKEN`, the order `gh` reads them in, for
-    /// api.github.com. With a token, the API allows 5000 requests an hour
-    /// instead of 60.
-    fn from_env() -> Option<Self> {
-        Self::github(std::env::var("GH_TOKEN").ok(), std::env::var("GITHUB_TOKEN").ok())
-    }
-
-    fn github(gh_token: Option<String>, github_token: Option<String>) -> Option<Self> {
-        [("GH_TOKEN", gh_token), ("GITHUB_TOKEN", github_token)].into_iter().find_map(
-            |(variable, token)| {
-                let token = token?.trim().to_string();
-                (!token.is_empty()).then(|| Self {
-                    scheme: "https",
-                    authority: "api.github.com".to_string(),
-                    token,
-                    variable,
-                })
-            },
-        )
+    /// The token `env` holds for the origin of `url`, which has to be
+    /// https, with no user name in front:
+    ///
+    /// - api.github.com: `GH_TOKEN`, then `GITHUB_TOKEN`, the order `gh`
+    ///   reads them in. With one, the API allows 5000 requests an hour
+    ///   instead of 60.
+    /// - gitlab.com: `GITLAB_TOKEN`.
+    /// - codeberg.org: `CODEBERG_TOKEN`.
+    /// - any host, these included: `APPIMG_TOKEN_<HOST>`, the host and port
+    ///   in capitals with everything but letters and digits as `_`, such as
+    ///   `APPIMG_TOKEN_INVENT_KDE_ORG` for invent.kde.org.
+    fn for_url(url: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
+        let uri = url.parse::<ureq::http::Uri>().ok()?;
+        let authority = uri.authority()?.as_str();
+        if uri.scheme_str() != Some("https") || authority.contains('@') {
+            return None;
+        }
+        let known: &[&str] = match authority {
+            "api.github.com" => &["GH_TOKEN", "GITHUB_TOKEN"],
+            "gitlab.com" => &["GITLAB_TOKEN"],
+            "codeberg.org" => &["CODEBERG_TOKEN"],
+            _ => &[],
+        };
+        let generic = format!(
+            "APPIMG_TOKEN_{}",
+            authority
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+                .collect::<String>()
+        );
+        known.iter().map(|name| name.to_string()).chain([generic]).find_map(|variable| {
+            let token = env(&variable)?.trim().to_string();
+            (!token.is_empty()).then(|| Self {
+                scheme: "https",
+                authority: authority.to_string(),
+                token,
+                variable,
+            })
+        })
     }
 
     /// Whether `url` is on the origin the token belongs to: the same scheme
@@ -565,9 +659,22 @@ mod tests {
         assert!(!is_url("./a.AppImage"));
     }
 
+    /// The environment of a user who set `variables`.
+    fn env(variables: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let variables: Vec<(String, String)> =
+            variables.iter().map(|(name, value)| (name.to_string(), value.to_string())).collect();
+        move |name: &str| {
+            variables.iter().find(|(variable, _)| variable == name).map(|(_, value)| value.clone())
+        }
+    }
+
     #[test]
     fn a_token_belongs_to_api_github_com_and_nowhere_else() {
-        let credentials = Credentials::github(None, Some("secret".to_string())).unwrap();
+        let credentials = Credentials::for_url(
+            "https://api.github.com/repos",
+            &env(&[("GITHUB_TOKEN", "secret")]),
+        )
+        .unwrap();
         assert!(credentials.belongs_to("https://api.github.com/repos/o/r/releases?per_page=30"));
         for url in [
             "http://api.github.com/repos/o/r/releases",
@@ -586,18 +693,79 @@ mod tests {
     #[test]
     fn the_token_comes_from_gh_token_then_github_token() {
         let token = |gh: Option<&str>, github: Option<&str>| {
-            Credentials::github(gh.map(str::to_string), github.map(str::to_string))
+            let mut variables = Vec::new();
+            variables.extend(gh.map(|value| ("GH_TOKEN", value)));
+            variables.extend(github.map(|value| ("GITHUB_TOKEN", value)));
+            Credentials::for_url("https://api.github.com/repos/o/r", &env(&variables))
                 .map(|credentials| (credentials.variable, credentials.token))
         };
-        assert_eq!(token(Some("a"), Some("b")), Some(("GH_TOKEN", "a".to_string())));
-        assert_eq!(token(None, Some(" b\n")), Some(("GITHUB_TOKEN", "b".to_string())));
-        assert_eq!(token(Some("  "), Some("b")), Some(("GITHUB_TOKEN", "b".to_string())));
+        let found = |variable: &str, token: &str| Some((variable.to_string(), token.to_string()));
+        assert_eq!(token(Some("a"), Some("b")), found("GH_TOKEN", "a"));
+        assert_eq!(token(None, Some(" b\n")), found("GITHUB_TOKEN", "b"));
+        assert_eq!(token(Some("  "), Some("b")), found("GITHUB_TOKEN", "b"));
         assert_eq!(token(Some(""), None), None);
         assert_eq!(token(None, None), None);
     }
 
+    /// Each forge has a variable of its own, and every host one by its
+    /// name. None of them goes anywhere but https and the host it names.
+    #[test]
+    fn each_host_takes_the_token_its_own_variable_holds() {
+        let all = env(&[
+            ("GITHUB_TOKEN", "github"),
+            ("GITLAB_TOKEN", "gitlab"),
+            ("CODEBERG_TOKEN", "codeberg"),
+            ("APPIMG_TOKEN_INVENT_KDE_ORG", "kde"),
+            ("APPIMG_TOKEN_GIT_EXAMPLE_ORG_8443", "example"),
+        ]);
+        let token = |url: &str| {
+            Credentials::for_url(url, &all)
+                .map(|credentials| (credentials.variable, credentials.token))
+        };
+        let found = |variable: &str, token: &str| Some((variable.to_string(), token.to_string()));
+        assert_eq!(
+            token("https://api.github.com/repos/o/r/releases"),
+            found("GITHUB_TOKEN", "github")
+        );
+        assert_eq!(
+            token("https://gitlab.com/api/v4/projects/a%2Fb/releases"),
+            found("GITLAB_TOKEN", "gitlab")
+        );
+        assert_eq!(
+            token("https://codeberg.org/api/v1/repos/o/r/releases"),
+            found("CODEBERG_TOKEN", "codeberg")
+        );
+        assert_eq!(
+            token("https://invent.kde.org/api/v4/projects/a%2Fb/releases"),
+            found("APPIMG_TOKEN_INVENT_KDE_ORG", "kde")
+        );
+        assert_eq!(
+            token("https://git.example.org:8443/api/v1/repos/o/r/releases"),
+            found("APPIMG_TOKEN_GIT_EXAMPLE_ORG_8443", "example")
+        );
+        // Another host, plain http, a user name in front: no token at all.
+        for url in [
+            "https://github.com/o/r/releases/download/v1/App.AppImage",
+            "https://git.example.org/api/v1/repos/o/r/releases",
+            "http://gitlab.com/api/v4/projects/a%2Fb/releases",
+            "http://codeberg.org/api/v1/repos/o/r/releases",
+            "https://user@codeberg.org/api/v1/repos/o/r/releases",
+            "https://gitlab.com.example.org/api/v4/projects/a%2Fb/releases",
+        ] {
+            assert_eq!(token(url), None, "{url}");
+        }
+        let credentials = Credentials::for_url("https://codeberg.org/api", &all).unwrap();
+        assert!(!credentials.belongs_to("https://gitlab.com/api/v4"));
+        assert!(!credentials.belongs_to("https://codeberg.org:444/api"));
+    }
+
     /// The path of a request, and the `Authorization` header it came with.
     type Seen = (String, Option<String>);
+
+    /// Whether any request a server saw carried GitLab's own token header,
+    /// which nothing ever sends.
+    static PRIVATE_TOKEN_SEEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     /// A server that answers every request with `answer(path)`, and keeps
     /// what each request came with.
@@ -621,6 +789,9 @@ mod tests {
                         .iter()
                         .find(|header| header.field.equiv("Authorization"))
                         .map(|header| header.value.as_str().to_string());
+                    if request.headers().iter().any(|header| header.field.equiv("PRIVATE-TOKEN")) {
+                        PRIVATE_TOKEN_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     let path = request.url().to_string();
                     recorded.lock().unwrap().push((path.clone(), authorization));
                     let _ = request.respond(answer(&path));
@@ -655,22 +826,17 @@ mod tests {
             scheme: "http",
             authority: authority.clone(),
             token: "secret".to_string(),
-            variable: "GITHUB_TOKEN",
+            variable: "GITHUB_TOKEN".to_string(),
         };
+        let fetch = |url: &str| fetch_text(url, Api::GitHub, Some(&credentials));
 
-        assert_eq!(fetch_text(&format!("{}/repos", api.base), Some(&credentials)).unwrap(), "[]");
-        assert_eq!(
-            fetch_text(&format!("{}/file", download.base), Some(&credentials)).unwrap(),
-            "the file"
-        );
+        assert_eq!(fetch(&format!("{}/repos", api.base)).unwrap(), "[]");
+        assert_eq!(fetch(&format!("{}/file", download.base)).unwrap(), "the file");
         // A redirect that leaves the API host leaves the token behind.
-        assert_eq!(
-            fetch_text(&format!("{}/moved", api.base), Some(&credentials)).unwrap(),
-            "the file"
-        );
+        assert_eq!(fetch(&format!("{}/moved", api.base)).unwrap(), "the file");
         // The same server under another name is another host.
         let port = authority.rsplit(':').next().unwrap();
-        fetch_text(&format!("http://localhost:{port}/other"), Some(&credentials)).unwrap();
+        fetch(&format!("http://localhost:{port}/other")).unwrap();
 
         let bearer = Some("Bearer secret".to_string());
         assert_eq!(
@@ -691,6 +857,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(download.seen().last(), Some(&("/file".to_string(), None)));
+    }
+
+    /// GitLab and Forgejo take the token the way each wants it, and in the
+    /// `Authorization` header only, so that a 302 to another host leaves it
+    /// behind the way it does for GitHub. GitLab's `PRIVATE-TOKEN` header
+    /// would follow the redirect, and is never sent.
+    #[test]
+    fn a_forge_token_never_follows_a_redirect_to_another_host() {
+        for (api, sent) in [(Api::GitLab, "Bearer secret"), (Api::Forgejo, "token secret")] {
+            let elsewhere = Recorder::start(|_| tiny_http::Response::from_string("[]"));
+            let target = format!("{}/releases", elsewhere.base);
+            let forge = Recorder::start(move |path| {
+                if path == "/moved" {
+                    let location =
+                        tiny_http::Header::from_bytes(&b"Location"[..], target.as_bytes()).unwrap();
+                    tiny_http::Response::from_string("").with_status_code(302).with_header(location)
+                } else {
+                    tiny_http::Response::from_string("[]")
+                }
+            });
+            let credentials = Credentials {
+                scheme: "http",
+                authority: forge.base.trim_start_matches("http://").to_string(),
+                token: "secret".to_string(),
+                variable: "APPIMG_TOKEN_TEST".to_string(),
+            };
+
+            fetch_text(&format!("{}/releases", forge.base), api, Some(&credentials)).unwrap();
+            fetch_text(&format!("{}/moved", forge.base), api, Some(&credentials)).unwrap();
+
+            let sent = Some(sent.to_string());
+            assert_eq!(
+                forge.seen(),
+                vec![("/releases".to_string(), sent.clone()), ("/moved".to_string(), sent)],
+                "{api:?}"
+            );
+            assert_eq!(elsewhere.seen(), vec![("/releases".to_string(), None)], "{api:?}");
+        }
+        assert!(!PRIVATE_TOKEN_SEEN.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

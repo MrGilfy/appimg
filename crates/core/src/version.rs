@@ -123,6 +123,16 @@ fn is_plain_label(label: &str) -> bool {
             .any(|token| PRERELEASE_WORDS.iter().any(|w| token.eq_ignore_ascii_case(w)))
 }
 
+/// Whether a tag names a pre-release: one of its words is `alpha`, `beta`,
+/// `rc`, `pre` or `preview`, digits around it aside, as in `v2.1-rc1` and
+/// `1.4-alpha1`. GitLab marks no release as one, so this is what tells.
+pub fn is_prerelease(tag: &str) -> bool {
+    tokens(tag).any(|token| {
+        let word = token.trim_matches(|c: char| c.is_ascii_digit());
+        PRERELEASE_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w))
+    })
+}
+
 /// Words a project uses for a release that keeps moving instead of one that
 /// was cut once. A tag out of this list is a pointer, not a version.
 const ROLLING_WORDS: &[&str] = &[
@@ -500,6 +510,17 @@ mod tests {
         assert!(is_newer("1.2.0-rc-2", "1.2.0-rc-1"));
         assert_eq!(compare("1.2.0-beta", "1.2.0-beta"), Ordering::Equal);
         assert!(!same_but_label("1.2.0-beta", "1.2.0"));
+    }
+
+    #[test]
+    fn a_prerelease_tag_is_told_by_its_words() {
+        for tag in ["v2.1-rc1", "1.4-alpha1", "v1.0.0-beta", "2.0.0rc2", "v3-preview", "1.0-PRE"] {
+            assert!(is_prerelease(tag), "{tag}");
+        }
+        for tag in ["v2.1", "v3.5.0", "nightly", "release-2026", "representative-1.0", "v1.0-press"]
+        {
+            assert!(!is_prerelease(tag), "{tag}");
+        }
     }
 
     #[test]

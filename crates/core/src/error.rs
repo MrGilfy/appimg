@@ -63,8 +63,9 @@ pub enum Error {
     #[error("download failed: {0}")]
     Download(String),
 
-    #[error("the GitHub API rate limit is exhausted, try again later")]
-    RateLimited,
+    /// Which API: `GitHub`, or the host of another forge.
+    #[error("the {0} API rate limit is exhausted, try again later")]
+    RateLimited(String),
 
     #[error("no update information stored for {0:?}")]
     NoUpdateInfo(String),
@@ -92,10 +93,10 @@ pub enum Error {
     InvalidAssetPattern(String),
 
     #[error(
-        "--asset picks a file out of a GitHub release, and {0:?} follows none: give a \
-         github:owner/repo update source with it"
+        "--asset picks a file out of a release, and {0:?} follows none: give a \
+         github:owner/repo, gitlab:group/project or codeberg:owner/repo update source with it"
     )]
-    AssetNeedsGitHub(String),
+    AssetNeedsRelease(String),
 
     #[error("{url}: {reason}")]
     Zsync { url: String, reason: String },

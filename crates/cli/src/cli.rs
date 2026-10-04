@@ -143,17 +143,19 @@ pub struct EntryArgs {
     pub icon: Option<PathBuf>,
 
     /// Where updates come from when the AppImage carries no update
-    /// information of its own: a URL to download, github:owner/repo to
-    /// follow the newest of its releases that has the AppImage, or
-    /// github:owner/repo@tag to follow that tag.
+    /// information of its own: a URL to download, or the releases of a
+    /// repository, github:owner/repo, gitlab:group/project or
+    /// codeberg:owner/repo, gitlab:https://host/group/project and
+    /// forgejo:https://host/owner/repo on any other host, following the
+    /// newest that has the AppImage, or with @tag that tag.
     #[arg(long, value_name = "URL|github:owner/repo")]
     pub update_source: Option<String>,
 
-    /// Which file of each GitHub release updates come from: a file name in
-    /// which * stands for whatever changes between releases, such as
+    /// Which file of each release updates come from: a file name in which *
+    /// stands for whatever changes between releases, such as
     /// 'SoH-*-Linux.zip', matched without regard to case. It is kept with
     /// the update source and picks the file instead of the name of the
-    /// installed one. Needs a github: update source.
+    /// installed one. Needs an update source that follows releases.
     #[arg(long, value_name = "PATTERN")]
     pub asset: Option<String>,
 }
@@ -191,10 +193,12 @@ pub struct UpdateSourceArgs {
     /// Name or slug of the application.
     pub name: String,
 
-    /// The update source to set: a URL to download, github:owner/repo to
-    /// follow the newest of its releases that has the AppImage, or
-    /// github:owner/repo@tag to follow that tag. Without it and without
-    /// --clear, the current one is shown.
+    /// The update source to set: a URL to download, or the releases of a
+    /// repository, github:owner/repo, gitlab:group/project or
+    /// codeberg:owner/repo, gitlab:https://host/group/project and
+    /// forgejo:https://host/owner/repo on any other host, following the
+    /// newest that has the AppImage, or with @tag that tag. Without it and
+    /// without --clear, the current one is shown.
     #[arg(value_name = "URL|github:owner/repo")]
     pub source: Option<String>,
 
@@ -202,7 +206,7 @@ pub struct UpdateSourceArgs {
     #[arg(long, conflicts_with = "source")]
     pub clear: bool,
 
-    /// Pick the file out of each GitHub release with this pattern, a file
+    /// Pick the file out of each release with this pattern, a file
     /// name in which * stands for whatever changes between releases, such
     /// as 'SoH-*-Linux.zip'. Without a source it is added to the current
     /// one. Setting a source without it drops the pattern.

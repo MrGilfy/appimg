@@ -458,7 +458,7 @@ fn install_keeps_the_asset_pattern_and_refuses_it_without_a_github_source() {
     let refused = other.run(&["--yes", "install", file.to_str().unwrap(), "--asset", "SoH-*.zip"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(
-        stderr(&refused).contains("--asset picks a file out of a GitHub release"),
+        stderr(&refused).contains("--asset picks a file out of a release"),
         "{}",
         stderr(&refused)
     );

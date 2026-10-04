@@ -80,17 +80,17 @@ fn following(source: &UpdateSource) -> String {
         UpdateSource::GitHubZsync { owner, repo, .. } => {
             format!("the embedded update information, zsync files of github:{owner}/{repo}")
         }
-        UpdateSource::GitHubRelease { tag: Some(tag), pattern, .. } => {
+        UpdateSource::ForgeRelease { tag: Some(tag), pattern, .. } => {
             let file = match pattern {
                 Some(pattern) => format!(", the asset matching {pattern}"),
                 None => String::new(),
             };
             format!("{}, the release tagged {tag}{file}", source.describe())
         }
-        UpdateSource::GitHubRelease { tag: None, pattern: Some(pattern), .. } => {
+        UpdateSource::ForgeRelease { tag: None, pattern: Some(pattern), .. } => {
             format!("{}, the newest release with an asset matching {pattern}", source.describe())
         }
-        UpdateSource::GitHubRelease { tag: None, pattern: None, .. } => {
+        UpdateSource::ForgeRelease { tag: None, pattern: None, .. } => {
             format!("{}, the newest release that has this AppImage", source.describe())
         }
         UpdateSource::DirectUrl { url } => url.clone(),

@@ -15,11 +15,16 @@ use ring::digest::{Context, SHA256};
 
 use crate::error::{Error, Result};
 
-/// What a GitHub release publishes for one of its assets.
+/// What a release publishes for one of its assets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Published {
-    /// The SHA-256 of the asset, lowercase hex.
+    /// The SHA-256 of the asset, lowercase hex, as the `digest` GitHub
+    /// computes for it.
     Sha256(String),
+    /// The SHA-256 of the asset, lowercase hex, out of `by`, which says
+    /// where: the package registry of a GitLab project, or a checksum file
+    /// in the release.
+    Checksum { sha256: String, by: String },
     /// Nothing to check the file against, and why.
     Nothing(String),
 }
@@ -30,6 +35,9 @@ pub enum Published {
 pub enum Verified {
     /// The file is the asset, its SHA-256 is the published one.
     Matches(String),
+    /// The file is the asset, its SHA-256 is the one `by` names, see
+    /// [`Published::Checksum`].
+    MatchesChecksum { sha256: String, by: String },
     /// Nothing was published to check it against, and why.
     Unchecked(String),
 }
@@ -40,6 +48,7 @@ impl Verified {
     pub fn describe(&self) -> String {
         match self {
             Verified::Matches(_) => "sha256 matches the digest GitHub publishes".to_string(),
+            Verified::MatchesChecksum { by, .. } => format!("sha256 matches the one {by} names"),
             Verified::Unchecked(reason) => format!("not checked, {reason}"),
         }
     }
@@ -81,7 +90,7 @@ pub fn sha256_file(path: &Path) -> Result<String> {
 /// staged download or the installed AppImage.
 pub fn verify(file: &Path, url: &str, published: &Published) -> Result<Verified> {
     let expected = match published {
-        Published::Sha256(expected) => expected,
+        Published::Sha256(expected) | Published::Checksum { sha256: expected, .. } => expected,
         Published::Nothing(reason) => return Ok(Verified::Unchecked(reason.clone())),
     };
     let found = sha256_file(file)?;
@@ -92,7 +101,12 @@ pub fn verify(file: &Path, url: &str, published: &Published) -> Result<Verified>
             expected: expected.clone(),
         });
     }
-    Ok(Verified::Matches(found))
+    Ok(match published {
+        Published::Checksum { by, .. } => {
+            Verified::MatchesChecksum { sha256: found, by: by.clone() }
+        }
+        _ => Verified::Matches(found),
+    })
 }
 
 #[cfg(test)]

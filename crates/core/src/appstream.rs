@@ -1,5 +1,6 @@
-//! Just enough AppStream for one job: finding the GitHub repository the
-//! metainfo inside an AppImage links, to suggest updating from its releases.
+//! Just enough AppStream for one job: finding the repository on GitHub,
+//! gitlab.com or Codeberg the metainfo inside an AppImage links, to suggest
+//! updating from its releases.
 //! A full XML parser would be a lot of dependency for a handful of `<url>`
 //! elements.
 
@@ -40,10 +41,10 @@ const NOT_AN_OWNER: &[&str] = &[
     "users",
 ];
 
-/// `github:owner/repo` for the repository the metainfo of an extracted
-/// AppImage links, preferring the types of link in the order of
-/// [`URL_TYPES`].
-pub fn github_repository(root: &Path) -> Option<String> {
+/// `github:owner/repo`, `gitlab:group/project` or `codeberg:owner/repo`
+/// for the repository the metainfo of an extracted AppImage links,
+/// preferring the types of link in the order of [`URL_TYPES`].
+pub fn release_repository(root: &Path) -> Option<String> {
     metainfo_files(root).iter().find_map(|path| {
         let text = fs::read_to_string(path).ok()?;
         let urls = urls(&text);
@@ -148,6 +149,22 @@ fn decode(text: &str) -> String {
 fn repository_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
     let rest = rest.strip_prefix("www.").unwrap_or(rest);
+    if let Some(path) = rest.strip_prefix("codeberg.org/") {
+        let mut parts = path.split(['/', '?', '#']);
+        let (owner, repo) = (parts.next()?, parts.next()?);
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        return update::parse_update_source(&format!("codeberg:{owner}/{repo}")).ok();
+    }
+    if let Some(path) = rest.strip_prefix("gitlab.com/") {
+        // A GitLab project is every segment up to the `-` that starts the
+        // pages of the project, `/-/issues` and the like.
+        let path = path.split(['?', '#']).next().unwrap_or(path);
+        let project: Vec<&str> =
+            path.split('/').take_while(|part| *part != "-" && !part.is_empty()).collect();
+        let project = project.join("/");
+        let project = project.strip_suffix(".git").unwrap_or(&project);
+        return update::parse_update_source(&format!("gitlab:{project}")).ok();
+    }
     let path = rest.strip_prefix("github.com/")?;
     let mut parts = path.split(['/', '?', '#']);
     let owner = parts.next()?;
@@ -181,7 +198,7 @@ mod tests {
 
     fn found(urls: &str) -> Option<String> {
         let root = root_with("usr/share/metainfo", "org.example.App.metainfo.xml", &metainfo(urls));
-        github_repository(root.path())
+        release_repository(root.path())
     }
 
     #[test]
@@ -189,6 +206,19 @@ mod tests {
         let urls = "<url type=\"homepage\">https://github.com/home/page</url>\n  \
                     <url type=\"vcs-browser\">https://github.com/WerWolv/ImHex</url>";
         assert_eq!(found(urls).as_deref(), Some("github:WerWolv/ImHex"));
+    }
+
+    #[test]
+    fn gitlab_and_codeberg_links_name_their_repositories() {
+        let urls = "<url type=\"vcs-browser\">https://gitlab.com/es-de/emulationstation-de</url>";
+        assert_eq!(found(urls).as_deref(), Some("gitlab:es-de/emulationstation-de"));
+        let urls = "<url type=\"bugtracker\">https://gitlab.com/librewolf-community/browser/\
+                    appimage/-/issues</url>";
+        assert_eq!(found(urls).as_deref(), Some("gitlab:librewolf-community/browser/appimage"));
+        let urls = "<url type=\"homepage\">https://codeberg.org/tenacityteam/tenacity.git</url>";
+        assert_eq!(found(urls).as_deref(), Some("codeberg:tenacityteam/tenacity"));
+        // A group alone is no project.
+        assert_eq!(found("<url type=\"homepage\">https://gitlab.com/es-de</url>"), None);
     }
 
     #[test]
@@ -207,7 +237,9 @@ mod tests {
             "https://github.com/sponsors/owner",
             "https://github.com/orgs/owner/repositories",
             "https://owner.github.io/repo",
-            "https://gitlab.com/owner/repo",
+            "https://gitlab.example.org/owner/repo",
+            "https://gitlab.com.evil.example/owner/repo",
+            "https://codeberg.org.evil.example/owner/repo",
             "https://github.com.evil.example/owner/repo",
         ] {
             let urls = format!("<url type=\"homepage\">{url}</url>");
@@ -228,12 +260,12 @@ mod tests {
     fn the_older_appdata_directory_is_read_too() {
         let text = metainfo("<url type=\"homepage\">https://github.com/old/place</url>");
         let root = root_with("usr/share/appdata", "app.appdata.xml", &text);
-        assert_eq!(github_repository(root.path()).as_deref(), Some("github:old/place"));
+        assert_eq!(release_repository(root.path()).as_deref(), Some("github:old/place"));
     }
 
     #[test]
     fn no_metainfo_is_no_suggestion() {
         let root = tempfile::tempdir().unwrap();
-        assert_eq!(github_repository(root.path()), None);
+        assert_eq!(release_repository(root.path()), None);
     }
 }
