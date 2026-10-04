@@ -11,6 +11,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::browser::Browser;
 use super::form::{Field, InstallForm};
 
+#[cfg(test)]
+#[path = "../../tests/marker/mod.rs"]
+mod marker;
+
 /// Work that takes long enough to deserve a redraw before it starts, or that
 /// needs the terminal back, so the event loop runs it, not the key handler.
 pub enum Action {
@@ -323,15 +327,27 @@ impl App {
     }
 
     fn inspect(&mut self, path: PathBuf) -> Result<()> {
-        // The same checks a download gets, before the metadata is read,
-        // which runs the file.
+        // The same checks a download gets, before the metadata is read.
         install::check_file(&path)?;
-        let info = metadata::inspect(&path, appimg_core::current_locale().as_deref())?;
-        // Not extracting is not fatal here, the form asks for name and icon
+        // Nothing is confirmed while the form is filled in, so the AppImage
+        // is never run for it: without unsquashfs nothing is read, and the
+        // install goes by what the form says once it is confirmed.
+        let info = metadata::inspect(
+            &path,
+            appimg_core::current_locale().as_deref(),
+            metadata::Reading::WithoutRunning,
+        )?;
+        // Not reading it is not fatal here, the form asks for name and icon
         // anyway, but the reason belongs on screen.
-        let problem = info.extract_root().is_none().then(|| match info.extract_problems.first() {
-            Some(problem) => format!("Not extracted, name and icon are guesses: {problem}"),
-            None => "Not extracted, name and icon are guesses.".to_string(),
+        let problem = info.extract_root().is_none().then(|| {
+            if info.extract_problems.is_empty() {
+                "Metadata not read, name and icon are guesses.".to_string()
+            } else {
+                format!(
+                    "Metadata not read, name and icon are guesses: {}",
+                    info.extract_problems.join("; ")
+                )
+            }
         });
         let origin = path.to_string_lossy().into_owned();
         self.mode = Mode::Form(Box::new(InstallForm::new(&path, &origin, info)));
@@ -431,5 +447,50 @@ impl App {
         {
             self.selected = position;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// The install form is filled in before anything is confirmed, so
+    /// reading the metadata for it never runs the AppImage, nor makes it
+    /// executable. Whether `unsquashfs` is on `PATH` or not, it cannot read
+    /// the marker without the stand-in the CLI tests have, so nothing is
+    /// read, and the status line says so and why.
+    #[test]
+    fn prefilling_the_install_form_runs_nothing() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let root = dir.path();
+        let data_home = root.join("data");
+        let paths = Paths {
+            appimage_dir: data_home.join("appimages"),
+            applications_dir: data_home.join("applications"),
+            icons_root: data_home.join("icons/hicolor"),
+            config_home: root.join("config"),
+            state_home: root.join("state"),
+            data_home,
+        };
+        paths.ensure_dirs().unwrap();
+        let file = root.join("Marker.AppImage");
+        let mark = root.join("it-ran");
+        marker::write(&file, &mark, &root.join("payload"), 0o644);
+
+        let mut app = App::new(paths).unwrap();
+        app.run_action(Action::Inspect(file.clone())).unwrap();
+
+        assert!(!mark.exists(), "filling in the form ran the AppImage");
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o7777, 0o644);
+        let Mode::Form(form) = &app.mode else {
+            panic!("no install form");
+        };
+        assert_eq!(form.request.name, "Marker");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.starts_with("Metadata not read, name and icon are guesses: "), "{status}");
+        assert!(status.contains("the AppImage was not run to read it instead"), "{status}");
     }
 }

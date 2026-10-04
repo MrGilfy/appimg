@@ -703,7 +703,8 @@ fn finish(
 ) -> Result<UpdateOutcome> {
     let target = &paths.appimage_path(&app.slug);
     let from_release = from.version;
-    let info = metadata::inspect(target, None).ok();
+    // The update was asked for, of an application the user installed.
+    let info = metadata::inspect(target, None, metadata::Reading::MayRun).ok();
 
     let icons = match info.as_ref().and_then(|info| info.extract_root().map(Path::to_path_buf)) {
         Some(root) => {

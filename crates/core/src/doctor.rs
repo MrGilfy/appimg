@@ -19,8 +19,10 @@ const REQUIRED_TOOLS: &[(&str, &str)] = &[
     ("desktop-file-validate", "generated entries cannot be validated"),
 ];
 
-const OPTIONAL_TOOLS: &[(&str, &str)] =
-    &[("unsquashfs", "AppImages with a broken runtime cannot be inspected")];
+const OPTIONAL_TOOLS: &[(&str, &str)] = &[(
+    "unsquashfs",
+    "dry runs and the install form read no metadata, and an install runs the AppImage to read it",
+)];
 
 #[derive(Debug, Clone)]
 pub struct ToolStatus {

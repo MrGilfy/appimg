@@ -4,12 +4,12 @@ use anyhow::{bail, Result};
 use appimg_core::adopt::{self, AdoptPlan, Placement, Transfer};
 use appimg_core::install::InstallRequest;
 use appimg_core::update::{self, UpdateSource};
-use appimg_core::{install, list, metadata, Paths};
+use appimg_core::{install, list, Paths};
 
 use crate::cli::AdoptArgs;
 use crate::commands::install::{
     apply_asset, apply_overrides, check_entry_args, confirm_without_metadata,
-    offer_suggested_source,
+    offer_suggested_source, plan_without_metadata, read_metadata,
 };
 use crate::ui::{human_size, Ui};
 use crate::Outcome;
@@ -25,12 +25,16 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     check_entry_args(&args.entry)?;
 
     // Everything that can be said without running the file comes first:
-    // reading the metadata runs it.
+    // reading the metadata can run it, though never in a dry run.
     let source = adopt::check(paths, path)?;
-    let info = metadata::inspect(&source, appimg_core::current_locale().as_deref())?;
-    if info.extract_root().is_none() && !confirm_without_metadata(ui, &info, "Adopt")? {
-        ui.info("Nothing was adopted.");
-        return Ok(Outcome::NothingToDo);
+    let info = read_metadata(&source, args.dry_run)?;
+    if info.extract_root().is_none() {
+        if args.dry_run {
+            plan_without_metadata(ui, &info, "adopt");
+        } else if !confirm_without_metadata(ui, &info, "Adopt")? {
+            ui.info("Nothing was adopted.");
+            return Ok(Outcome::NothingToDo);
+        }
     }
 
     let origin = source.to_string_lossy().into_owned();

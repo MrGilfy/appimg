@@ -133,7 +133,7 @@ fn import_one(paths: &Paths, ui: &Ui, app: &ExportedApp, fetch: &Fetch) -> Resul
         Fetch::Release { source, asset_hint } => {
             let asset = update::newest_asset(source, asset_hint.as_deref())?;
             // Against what the release publishes, before anything reads the
-            // metadata, which runs the file.
+            // metadata, which can run the file.
             let verify = |file: &Path| digest::verify(file, &asset.url, &asset.published).map(Some);
             let (file, _scratch) = download_appimage(ui, &asset.url, &verify)?;
             install_file(paths, ui, app, &file, &asset.url, Some(&asset))?;
@@ -171,7 +171,13 @@ fn install_file(
     origin: &str,
     asset: Option<&ReleaseAsset>,
 ) -> Result<Option<String>> {
-    let info = metadata::inspect(file, appimg_core::current_locale().as_deref())?;
+    // Only a real import gets here, never a dry run: it is the install the
+    // user asked for.
+    let info = metadata::inspect(
+        file,
+        appimg_core::current_locale().as_deref(),
+        metadata::Reading::MayRun,
+    )?;
     if info.extract_root().is_none() {
         ui.warn(&format!(
             "{}: the AppImage did not extract, so it gets the generic icon: {}",

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use appimg_core::digest::Verified;
 use appimg_core::install::{IconChoice, InstallRequest};
-use appimg_core::metadata::AppImageInfo;
+use appimg_core::metadata::{AppImageInfo, Reading};
 use appimg_core::update::{self, UpdateSource};
 use appimg_core::{archive, download, install, list, metadata, Paths};
 use tempfile::TempDir;
@@ -24,10 +24,14 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
         bail!("{} does not look like an AppImage", source.display());
     }
 
-    let info = metadata::inspect(&source, appimg_core::current_locale().as_deref())?;
-    if info.extract_root().is_none() && !confirm_without_metadata(ui, &info, "Install")? {
-        ui.info("Nothing was installed.");
-        return Ok(Outcome::NothingToDo);
+    let info = read_metadata(&source, args.dry_run)?;
+    if info.extract_root().is_none() {
+        if args.dry_run {
+            plan_without_metadata(ui, &info, "install");
+        } else if !confirm_without_metadata(ui, &info, "Install")? {
+            ui.info("Nothing was installed.");
+            return Ok(Outcome::NothingToDo);
+        }
     }
 
     let mut request = InstallRequest::from_info(&source, &origin, &info);
@@ -84,6 +88,15 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     }
 
     Ok(Outcome::Done)
+}
+
+/// Reads the metadata of the AppImage to install or adopt. A dry run never
+/// runs it, see [`Reading`]: without `unsquashfs` it reads nothing. Without
+/// `--dry-run`, the command is the install the user asked for, which may
+/// run the AppImage when `unsquashfs` cannot read it.
+pub(crate) fn read_metadata(source: &Path, dry_run: bool) -> Result<AppImageInfo> {
+    let reading = if dry_run { Reading::WithoutRunning } else { Reading::MayRun };
+    Ok(metadata::inspect(source, appimg_core::current_locale().as_deref(), reading)?)
 }
 
 /// Refuses an update source, or an asset pattern, that is none, before
@@ -163,13 +176,13 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
             return Ok((dest, origin, Some(scratch)));
         }
         // The same checks a download gets, before the metadata is read,
-        // which runs the file.
+        // which can run the file.
         install::check_file(&absolute)?;
         return Ok((absolute, origin, None));
     }
 
     // Against the digest its release publishes, before anything reads the
-    // metadata, which runs the file.
+    // metadata, which can run the file.
     let (dest, scratch) =
         download_appimage(ui, source, &|file| install::verify_download(file, source))?;
     Ok((dest, source.to_string(), Some(scratch)))
@@ -233,6 +246,24 @@ pub(crate) fn confirm_without_metadata(
     ));
 
     ui.confirm(&format!("{verb} without the embedded metadata?"), false)
+}
+
+/// A dry run read no metadata. Says why, what the plan goes by instead, and
+/// how the real thing gets it. `command` is `install` or `adopt`.
+pub(crate) fn plan_without_metadata(ui: &Ui, info: &AppImageInfo, command: &str) {
+    ui.warn(
+        "the metadata inside the AppImage was not read, so its name, icon and categories are \
+         unknown:",
+    );
+    for problem in &info.extract_problems {
+        ui.warn(&format!("  {problem}"));
+    }
+    ui.info(&format!(
+        "The plan uses the name {:?}, from the file name, and the generic icon, unless --name and \
+         --icon say otherwise. Without --dry-run, {command} reads the metadata by running the \
+         AppImage when unsquashfs cannot.",
+        info.name.clone().unwrap_or_default()
+    ));
 }
 
 pub(crate) fn apply_overrides(request: &mut InstallRequest, args: &EntryArgs) -> Result<()> {

@@ -15,6 +15,7 @@ use appimg_core::desktop_entry::{DesktopEntry, KEY_RELEASE, KEY_SHA1, KEY_UPDATE
 use appimg_core::digest::Verified;
 use appimg_core::install::InstallRequest;
 use appimg_core::list::InstalledApp;
+use appimg_core::metadata::Reading;
 use appimg_core::{download, install, list, metadata, update, zsync};
 
 use common::{assert_stamped, read, walk, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
@@ -533,7 +534,7 @@ fn install_from_a_url_records_it_and_updates_from_it() {
     let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
     download::to_file(&url, &downloaded, None).unwrap();
 
-    let info = metadata::inspect(&downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None, Reading::MayRun).unwrap();
     let outcome =
         install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info))
             .unwrap();
@@ -580,7 +581,7 @@ fn an_app_installed_from_a_deleted_file_updates_from_the_source_it_is_given() {
     let local = FakeAppImage::new("Fake App")
         .marker("v1")
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&local, None).unwrap();
+    let info = metadata::inspect(&local, None, Reading::MayRun).unwrap();
     install::install(
         &sandbox.paths,
         &InstallRequest::from_info(&local, &local.to_string_lossy(), &info),
@@ -618,7 +619,7 @@ fn install_edited_from(sandbox: &Sandbox, server: &Server) -> InstalledApp {
     let url = server.url("Fake_App.AppImage");
     let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
     download::to_file(&url, &downloaded, None).unwrap();
-    let info = metadata::inspect(&downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None, Reading::MayRun).unwrap();
     let mut request = InstallRequest::from_info(&downloaded, &url, &info);
     request.name = "My Renamed App".to_string();
     request.categories = vec!["Graphics".to_string()];
@@ -712,7 +713,7 @@ fn a_failing_update_leaves_the_installed_version_alone() {
         let url = server.url("Fake_App-1.0.0.AppImage");
         let downloaded = sandbox.downloads.join("Fake_App-1.0.0.AppImage");
         download::to_file(&url, &downloaded, None).unwrap();
-        let info = metadata::inspect(&downloaded, None).unwrap();
+        let info = metadata::inspect(&downloaded, None, Reading::MayRun).unwrap();
         install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info))
             .unwrap();
         url
@@ -740,7 +741,7 @@ fn a_download_that_is_not_an_appimage_never_replaces_the_installed_one() {
 
     let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
     download::to_file(&url, &downloaded, None).unwrap();
-    let info = metadata::inspect(&downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None, Reading::MayRun).unwrap();
     install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info)).unwrap();
     let app = list::find(&sandbox.paths, "fake-app").unwrap();
     let entry = read(&app.desktop_entry_path);
@@ -768,7 +769,7 @@ fn checking_a_zsync_source_reads_the_header_and_nothing_else() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     let installed = install::install(&sandbox.paths, &request).unwrap();
 
@@ -831,7 +832,7 @@ fn a_zsync_check_reads_the_installed_file_only_when_it_changed() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     let installed = install::install(&sandbox.paths, &request).unwrap();
     let (file, entry_path) = (&installed.appimage_path, &installed.desktop_entry_path);
@@ -887,7 +888,7 @@ fn a_zsync_url_that_serves_something_else_is_an_error() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     let installed = install::install(&sandbox.paths, &request).unwrap();
 
@@ -1220,7 +1221,8 @@ fn delta_fixture(sandbox: &Sandbox, payload_path: &str) -> Delta {
     let one = sandbox.root.join("build1.AppImage");
     std::fs::copy(build("1.0.0"), &one).unwrap();
 
-    let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None)).unwrap();
+    let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None, Reading::MayRun))
+        .unwrap();
     let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
     let installed = install::install(&sandbox.paths, &request).unwrap();
 
@@ -1468,7 +1470,7 @@ impl GitHubFixture {
         let one = FakeAppImage::new("Fake App")
             .marker("v1")
             .build(&sandbox.root, "Fake_App-1.0.0.AppImage");
-        let info = metadata::inspect(&one, None).unwrap();
+        let info = metadata::inspect(&one, None, Reading::MayRun).unwrap();
         let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
         install::install(&sandbox.paths, &request).unwrap();
         let installed = list::find(&sandbox.paths, "fake-app").unwrap();
@@ -1587,7 +1589,7 @@ fn an_update_out_of_no_release_says_nothing_about_a_digest() {
     let url = server.url("Fake_App-1.0.0.AppImage");
     let downloaded = sandbox.downloads.join(download::file_name_from_url(&url));
     download::to_file(&url, &downloaded, None).unwrap();
-    let info = metadata::inspect(&downloaded, None).unwrap();
+    let info = metadata::inspect(&downloaded, None, Reading::MayRun).unwrap();
     install::install(&sandbox.paths, &InstallRequest::from_info(&downloaded, &url, &info)).unwrap();
 
     let newer =
@@ -1628,7 +1630,9 @@ impl GitHubDelta {
 
         let one = sandbox.root.join("build1.AppImage");
         std::fs::copy(build("1.0.0"), &one).unwrap();
-        let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None)).unwrap();
+        let info =
+            with_unsquashfs_stand_in(sandbox, || metadata::inspect(&one, None, Reading::MayRun))
+                .unwrap();
         let request = InstallRequest::from_info(&one, &one.to_string_lossy(), &info);
         let installed = install::install(&sandbox.paths, &request).unwrap();
 

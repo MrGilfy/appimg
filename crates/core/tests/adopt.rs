@@ -12,6 +12,7 @@ use appimg_core::adopt::{self, Placement, Transfer};
 use appimg_core::desktop_entry::{DesktopEntry, KEY_ORIGIN};
 use appimg_core::elf::Unfit;
 use appimg_core::install::{self, InstallRequest};
+use appimg_core::metadata::Reading;
 use appimg_core::{list, metadata, AppImageInfo, Error};
 
 use common::{assert_stamped, changes, snapshot, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
@@ -24,7 +25,9 @@ fn fake(sandbox: &Sandbox, dir: &str, file_name: &str) -> (PathBuf, InstallReque
     fs::create_dir_all(&dir).unwrap();
     let built = FakeAppImage::new("Fake App").elf().build(&dir, file_name);
     let source = adopt::check(&sandbox.paths, &built).unwrap();
-    let info = with_unsquashfs_stand_in(sandbox, || metadata::inspect(&source, None)).unwrap();
+    let info =
+        with_unsquashfs_stand_in(sandbox, || metadata::inspect(&source, None, Reading::MayRun))
+            .unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     (built, request, info)
 }
@@ -200,7 +203,7 @@ fn only_entries_that_launch_exactly_that_file_go_and_nothing_else_is_touched() {
     launcher_entry(&sandbox, "older.desktop", &format!("\"{}.old\"", source.display()), "older");
     launcher_entry(&sandbox, "shares-the-icon.desktop", "/usr/bin/true", "appimagekit_9f9f_shared");
     let other = FakeAppImage::new("Other App").build(&sandbox.root, "Other.AppImage");
-    let info = metadata::inspect(&other, None).unwrap();
+    let info = metadata::inspect(&other, None, Reading::MayRun).unwrap();
     install::install(
         &sandbox.paths,
         &InstallRequest::from_info(&other, &other.to_string_lossy(), &info),
@@ -458,7 +461,7 @@ fn what_cannot_be_adopted_is_refused_before_anything_changes() {
     let link = dir.join("Link.AppImage");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let installed = FakeAppImage::new("Installed").build(&sandbox.root, "Installed.AppImage");
-    let info = metadata::inspect(&installed, None).unwrap();
+    let info = metadata::inspect(&installed, None, Reading::MayRun).unwrap();
     let outcome =
         install::install(&sandbox.paths, &InstallRequest::from_info(&installed, "x", &info))
             .unwrap();
@@ -543,7 +546,7 @@ fn a_scan_lists_what_could_be_adopted_and_changes_and_runs_nothing() {
 
     // Managed, and its leftover: not listed.
     let managed = FakeAppImage::new("Managed").build(&sandbox.root, "Managed.AppImage");
-    let info = metadata::inspect(&managed, None).unwrap();
+    let info = metadata::inspect(&managed, None, Reading::MayRun).unwrap();
     install::install(&sandbox.paths, &InstallRequest::from_info(&managed, "x", &info)).unwrap();
     fs::copy(&managed, sandbox.paths.appimage_dir.join("managed.AppImage.bak")).unwrap();
     // Unmanaged in the appimages directory, not executable the way a

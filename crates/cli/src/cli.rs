@@ -66,7 +66,7 @@ pub struct InstallArgs {
     #[command(flatten)]
     pub entry: EntryArgs,
 
-    /// Show what would happen and write nothing.
+    /// Show what would happen, write nothing and never run the AppImage.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -102,7 +102,7 @@ pub struct AdoptArgs {
     #[command(flatten)]
     pub entry: EntryArgs,
 
-    /// Show what would happen and write nothing.
+    /// Show what would happen, write nothing and never run the AppImage.
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -4,18 +4,20 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use appimg_core::desktop_entry::{self, DesktopEntry};
 use appimg_core::install::{IconChoice, InstallRequest};
 use appimg_core::list::Health;
+use appimg_core::metadata::Reading;
 use appimg_core::{doctor, install, list, metadata, remove, update, Error};
 
-use common::{is_executable, read, walk, FakeAppImage, Sandbox};
+use common::{is_executable, read, walk, with_unsquashfs_stand_in, FakeAppImage, Sandbox};
 
 fn install_fake(sandbox: &Sandbox, file_name: &str) -> install::InstallOutcome {
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, file_name);
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     install::install(&sandbox.paths, &request).unwrap()
 }
@@ -60,7 +62,7 @@ fn the_preferred_locale_wins_for_the_name() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake App.AppImage");
-    let info = metadata::inspect(&source, Some("de_DE.UTF-8")).unwrap();
+    let info = metadata::inspect(&source, Some("de_DE.UTF-8"), Reading::MayRun).unwrap();
     assert_eq!(info.name.as_deref(), Some("Fake App (de)"));
 }
 
@@ -107,7 +109,7 @@ fn installing_the_same_slug_twice_needs_overwrite() {
     let source = FakeAppImage::new("Fake App")
         .marker("second")
         .build(&sandbox.downloads, "Fake_App-2.0.0.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let mut request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
 
     match install::install(&sandbox.paths, &request) {
@@ -129,13 +131,13 @@ fn stale_icons_do_not_survive_a_replacement() {
     let first = FakeAppImage::new("Fake App")
         .icon_sizes(&[48, 256])
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&first, None).unwrap();
+    let info = metadata::inspect(&first, None, Reading::MayRun).unwrap();
     install::install(&sandbox.paths, &InstallRequest::from_info(&first, "local", &info)).unwrap();
 
     let second = FakeAppImage::new("Fake App")
         .icon_sizes(&[64])
         .build(&sandbox.downloads, "Fake_App-2.0.0.AppImage");
-    let info = metadata::inspect(&second, None).unwrap();
+    let info = metadata::inspect(&second, None, Reading::MayRun).unwrap();
     let mut request = InstallRequest::from_info(&second, "local", &info);
     request.overwrite = true;
     install::install(&sandbox.paths, &request).unwrap();
@@ -150,7 +152,7 @@ fn an_unusable_icon_falls_back_to_the_generic_one() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let mut request = InstallRequest::from_info(&source, "local", &info);
     request.icon = IconChoice::Fallback;
 
@@ -333,7 +335,7 @@ fn a_continuous_build_is_shown_as_the_commit_it_came_from() {
             .key("X-AppImage-Version", declared)
             .build(&sandbox.downloads, file_name);
 
-        let info = metadata::inspect(&source, None).unwrap();
+        let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
         assert_eq!(info.version.as_deref(), Some("a211784"), "{declared}");
 
         let request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
@@ -458,7 +460,7 @@ fn an_update_source_given_at_install_is_written_and_followed() {
     let sandbox = Sandbox::new();
     let source =
         FakeAppImage::new("Fake App").build(&sandbox.downloads, "Fake_App-1.0.0-x86_64.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let mut request = InstallRequest::from_info(&source, &source.to_string_lossy(), &info);
     request.update_source = Some(update::parse_update_source("https://github.com/o/r").unwrap());
     let outcome = install::install(&sandbox.paths, &request).unwrap();
@@ -486,7 +488,7 @@ fn an_install_out_of_a_github_release_records_the_release() {
     let _serial = common::serial();
     let sandbox = Sandbox::new();
     let source = FakeAppImage::new("osu!").build(&sandbox.downloads, "osu.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     let url = "https://github.com/ppy/osu/releases/download/2026.921.0-lazer/osu.AppImage";
     let outcome =
         install::install(&sandbox.paths, &InstallRequest::from_info(&source, url, &info)).unwrap();
@@ -562,7 +564,7 @@ fn the_appstream_metadata_suggests_an_update_source_and_sets_none() {
              <url type=\"vcs-browser\">https://github.com/fake/app</url>",
         )
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     assert_eq!(info.suggested_update_source.as_deref(), Some("github:fake/app"));
 
     // A request built from it does not follow it, it only suggests it.
@@ -650,7 +652,7 @@ fn an_appimage_without_the_executable_bit_still_extracts() {
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
     assert!(!is_executable(&source));
 
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     assert!(info.extract_problems.is_empty(), "{:?}", info.extract_problems);
     assert!(info.extract_root().is_some());
     assert_eq!(info.name.as_deref(), Some("Fake App"));
@@ -666,7 +668,7 @@ fn a_failing_runtime_reports_its_exit_status_and_message() {
         .failing(3, "runtime: cannot open the payload")
         .build(&sandbox.downloads, "Fake_App-1.0.0.AppImage");
 
-    let info = metadata::inspect(&source, None).unwrap();
+    let info = metadata::inspect(&source, None, Reading::MayRun).unwrap();
     assert!(info.extract_root().is_none());
 
     let problems = info.extract_problems.join("\n");
@@ -679,4 +681,63 @@ fn a_failing_runtime_reports_its_exit_status_and_message() {
 
     // The name still falls back to the file name, so installing stays possible.
     assert_eq!(info.name.as_deref(), Some("Fake_App"));
+}
+
+/// Reading the metadata without running the file, the way everything
+/// before a confirmed install reads it, runs nothing and leaves the mode
+/// alone. The fixture is the one the adopt scan test uses, a script that
+/// leaves a mark when anything runs it, here without the executable bit the
+/// way a browser saves a file. Read the way a confirmed install may read
+/// it, it does run, which is what makes the mark worth looking for.
+#[test]
+fn reading_without_running_never_runs_the_file() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+    let mark = sandbox.root.join("it-ran");
+    let runner = sandbox.downloads.join("Runner.AppImage");
+    fs::write(&runner, format!("#!/bin/sh\ntouch '{}'\n", mark.display())).unwrap();
+    fs::set_permissions(&runner, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let info = metadata::inspect(&runner, None, Reading::WithoutRunning).unwrap();
+    assert!(!mark.exists(), "reading it without running it ran it");
+    assert!(!is_executable(&runner));
+    assert!(info.extract_root().is_none());
+    let problems = info.extract_problems.join("\n");
+    assert!(problems.contains("no squashfs payload"), "{problems}");
+    assert!(problems.contains("the AppImage was not run to read it instead"), "{problems}");
+    assert_eq!(info.name.as_deref(), Some("Runner"));
+
+    let info = metadata::inspect(&runner, None, Reading::MayRun).unwrap();
+    assert!(info.extract_root().is_none());
+    assert!(mark.exists(), "read the way a confirmed install may, it runs");
+}
+
+/// Without running the file, only `unsquashfs` reads it: an AppImage only
+/// its runtime could extract gives nothing but the name its file name
+/// gives, one `unsquashfs` can read gives everything.
+#[test]
+fn reading_without_running_goes_through_unsquashfs_alone() {
+    let _serial = common::serial();
+    let sandbox = Sandbox::new();
+
+    let runtime_only = FakeAppImage::new("Fake App")
+        .not_executable()
+        .build(&sandbox.downloads, "Runtime_Only.AppImage");
+    let info = metadata::inspect(&runtime_only, None, Reading::WithoutRunning).unwrap();
+    assert!(info.extract_root().is_none());
+    assert_eq!(info.name.as_deref(), Some("Runtime_Only"));
+    assert!(!is_executable(&runtime_only));
+
+    let payload_only = FakeAppImage::new("Fake App")
+        .elf()
+        .not_executable()
+        .build(&sandbox.downloads, "Payload_Only.AppImage");
+    let info = with_unsquashfs_stand_in(&sandbox, || {
+        metadata::inspect(&payload_only, None, Reading::WithoutRunning)
+    })
+    .unwrap();
+    assert!(info.extract_problems.is_empty(), "{:?}", info.extract_problems);
+    assert!(info.extract_root().is_some());
+    assert_eq!(info.name.as_deref(), Some("Fake App"));
+    assert!(!is_executable(&payload_only));
 }

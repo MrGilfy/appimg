@@ -6,6 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- An install or adoption the user asked for, an import and an update read
+  the metadata through `unsquashfs` first as well, and only run the
+  AppImage's own runtime when `unsquashfs` is not installed or cannot read
+  the file, as with a type 1 AppImage. The check that an updated AppImage
+  runs, before its backup goes, still runs it. `doctor` says what a
+  missing `unsquashfs` costs now.
+
+### Fixed
+
+- `install --dry-run` and `adopt --dry-run` ran the AppImage they were
+  meant to preview: reading the metadata ran its runtime with
+  `--appimage-extract`, after setting the executable bit on a file that
+  had none. Nothing before a confirmed install runs it anymore: not a dry
+  run, and not the TUI while it fills in the install form. They read the
+  metadata through `unsquashfs` from the squashfs payload, which runs
+  nothing of the file. Without `unsquashfs` they read no metadata: a dry
+  run says so and why, and shows the plan with the name from the file name
+  and the generic icon, and the TUI says the same in its status line and
+  installs what the form shows once it is confirmed. (#27)
+
 ## [0.4.0] - 2026-10-03
 
 ### Added

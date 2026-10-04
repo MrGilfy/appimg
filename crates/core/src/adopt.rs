@@ -140,7 +140,7 @@ pub struct AdoptOutcome {
 /// What can be said about a file before it is adopted, without running it:
 /// it exists, is a file and no symbolic link, passes the checks an install
 /// runs, and is no installed AppImage already. Returns its canonical path.
-/// This comes before reading the metadata, which runs the file.
+/// This comes before reading the metadata, which can run the file.
 pub fn check(paths: &Paths, path: &Path) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => Error::NotFound(path.to_path_buf()),

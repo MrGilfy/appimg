@@ -216,7 +216,7 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &super::form::InstallForm) {
         let source = if form.info.extract_root().is_some() {
             "Prefilled from the desktop entry inside the AppImage."
         } else {
-            "The AppImage did not extract, these values are guesses."
+            "The metadata inside the AppImage was not read, these values are guesses."
         };
         lines.push(Line::from(Span::styled(source, theme::dim())));
         let updates = if form.info.update_info.is_some() {

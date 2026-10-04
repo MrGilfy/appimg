@@ -95,7 +95,7 @@ impl InstallRequest {
 }
 
 /// The checks a file on disk gets before anything reads its metadata, which
-/// runs it, and before it is installed or adopted: the same ones a download
+/// can run it, and before it is installed or adopted: the same ones a download
 /// gets, see [`elf::check_whole`].
 pub fn check_file(path: &Path) -> Result<()> {
     elf::check_whole(path).map_err(|unfit| Error::Unfit { path: path.to_path_buf(), unfit })
@@ -104,7 +104,7 @@ pub fn check_file(path: &Path) -> Result<()> {
 /// Checks an AppImage downloaded from `url` against the digest its GitHub
 /// release publishes, when it came out of one: one request for that
 /// release. This has to happen right after the download, before anything
-/// reads the metadata out of the file, which runs it. A file that does not
+/// reads the metadata out of the file, which can run it. A file that does not
 /// match is removed before the error comes back. `None` for a URL that is
 /// no GitHub release download, which has nothing to check against.
 pub fn verify_download(file: &Path, url: &str) -> Result<Option<Verified>> {

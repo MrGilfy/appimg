@@ -65,9 +65,25 @@ impl AppImageInfo {
     }
 }
 
+/// Whether reading the metadata may run the AppImage. Running it is running
+/// whatever the file holds, so nothing that happens before the user
+/// confirmed an install may do it: a dry run, a form that is filled in from
+/// the metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reading {
+    /// Only `unsquashfs` reads the squashfs payload, and the file is never
+    /// run, nor made executable. Without `unsquashfs`, nothing is read, and
+    /// [`AppImageInfo::extract_problems`] says so.
+    WithoutRunning,
+    /// For an install the user confirmed: `unsquashfs` first, the
+    /// AppImage's own runtime when that is missing or fails.
+    MayRun,
+}
+
 /// Reads an AppImage: extracts it, parses the embedded desktop entry for the
 /// given locale and picks up the update information from the ELF section.
-pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
+/// `reading` says whether the file may be run for that.
+pub fn inspect(appimage: &Path, locale: Option<&str>, reading: Reading) -> Result<AppImageInfo> {
     if !appimage.exists() {
         return Err(Error::NotFound(appimage.to_path_buf()));
     }
@@ -81,7 +97,7 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
         ..Default::default()
     };
 
-    let report = extract_reported(appimage);
+    let report = unpack(appimage, reading);
     info.extract_problems = report.problems;
     if let Some(extraction) = report.extraction {
         if let Some(entry) = read_embedded_entry(extraction.root()) {
@@ -102,7 +118,9 @@ pub fn inspect(appimage: &Path, locale: Option<&str>) -> Result<AppImageInfo> {
 }
 
 /// Extracts an AppImage, first through its own runtime, then through
-/// `unsquashfs`. Returns `None` when neither works.
+/// `unsquashfs`. Returns `None` when neither works. This runs the file on
+/// purpose, it is how an update tells whether the new binary runs: reading
+/// metadata goes through [`inspect`].
 pub fn extract(appimage: &Path) -> Option<Extraction> {
     extract_reported(appimage).extraction
 }
@@ -117,6 +135,29 @@ pub fn extract_reported(appimage: &Path) -> ExtractReport {
         return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
     }
     if let Some(extraction) = extract_with_unsquashfs(appimage, &mut problems) {
+        return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
+    }
+    ExtractReport { extraction: None, problems }
+}
+
+/// Unpacks an AppImage to read its metadata: through `unsquashfs`, which
+/// runs nothing of the file, and only when `reading` allows it through the
+/// runtime after that.
+fn unpack(appimage: &Path, reading: Reading) -> ExtractReport {
+    let mut problems = Vec::new();
+
+    if let Some(extraction) = extract_with_unsquashfs(appimage, &mut problems) {
+        return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
+    }
+    if reading == Reading::WithoutRunning {
+        problems.push(
+            "the AppImage was not run to read it instead: nothing runs it before an install \
+             is confirmed"
+                .to_string(),
+        );
+        return ExtractReport { extraction: None, problems };
+    }
+    if let Some(extraction) = extract_with_runtime(appimage, &mut problems) {
         return ExtractReport { extraction: Some(extraction), problems: Vec::new() };
     }
     ExtractReport { extraction: None, problems }
@@ -244,7 +285,7 @@ fn extract_with_unsquashfs(appimage: &Path, problems: &mut Vec<String>) -> Optio
     let Some(unsquashfs) = fs_util::which("unsquashfs") else {
         problems.push(format!(
             "the squashfs payload starts at byte {offset}, but unsquashfs is not installed \
-             (package squashfs-tools), so it cannot be unpacked without the runtime"
+             (package squashfs-tools), so it cannot be unpacked without running the AppImage"
         ));
         return None;
     };
@@ -417,6 +458,7 @@ mod tests {
     #[test]
     fn inspecting_a_missing_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(inspect(&dir.path().join("nope.AppImage"), None).is_err());
+        let missing = dir.path().join("nope.AppImage");
+        assert!(inspect(&missing, None, Reading::WithoutRunning).is_err());
     }
 }
