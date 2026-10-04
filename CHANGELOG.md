@@ -6,6 +6,40 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The terminal interface and `appimg adopt` take a zip or tar archive with
+  an AppImage inside, the way `install` and `update` do: the AppImage is
+  found by its bytes, never by its name, the archive has to hold exactly
+  one, nothing it names is ever a path anything is written to, and it may
+  unpack to no more than its own size allows. What comes out gets the
+  checks any AppImage gets, and the entry records the archive as where it
+  came from. The file browser of the terminal interface lists archives
+  beside AppImages. `adopt` leaves the archive where it is, with whatever
+  else it holds, `--copy` or not, and leaves no link in its place. (#26)
+- End-to-end tests for `import` and `adopt --asset`: an import that picks
+  a release archive by its asset pattern where the file name cannot, keeps
+  the pattern, and checks the archive against its digest before unpacking
+  it; an import from an archive URL; and `adopt --asset`, kept with the
+  update source on the command line or the one the AppStream metadata
+  suggests, refused without a GitHub source, and followed by the next
+  update. (#25)
+
+### Changed
+
+- The AppImage taken out of an archive on disk is named after the archive
+  until it is installed, so the name and version a file name gives come
+  from the archive when the metadata inside cannot be read, as in a dry
+  run without `unsquashfs`. When it is no complete AppImage, the error
+  names the archive and the entry it came from.
+- A `github:` update source shows the way the desktop entry stores it,
+  `github:owner/repo@tag#pattern`, wherever it is shown: after an install
+  or adoption, in `list` and `update --check`, in the terminal interface
+  and in `update-source`, which showed `github:owner/repo` alone. The
+  `update_source` field of `list --json` and the `source` field of
+  `update --check --json` carry the same, tag and pattern included,
+  escaped like every other string there.
+
 ## [0.4.1] - 2026-10-04
 
 ### Changed

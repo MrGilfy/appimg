@@ -75,7 +75,9 @@ pub struct InstallArgs {
 #[command(group = clap::ArgGroup::new("what").args(["path", "scan"]).required(true))]
 pub struct AdoptArgs {
     /// The AppImage file to take over. It moves into $XDG_DATA_HOME/appimages;
-    /// one in ~/.local/bin leaves a symbolic link to it behind.
+    /// one in ~/.local/bin leaves a symbolic link to it behind. A zip or tar
+    /// archive with one AppImage inside stays where it is, and the AppImage
+    /// taken out of it is adopted.
     pub path: Option<PathBuf>,
 
     /// List the AppImages that could be adopted, with the command for each,

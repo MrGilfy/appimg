@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use appimg_core::adopt::{self, AdoptPlan, Placement, Transfer};
 use appimg_core::install::InstallRequest;
 use appimg_core::update::{self, UpdateSource};
@@ -9,7 +9,7 @@ use appimg_core::{install, list, Paths};
 use crate::cli::AdoptArgs;
 use crate::commands::install::{
     apply_asset, apply_overrides, check_entry_args, confirm_without_metadata,
-    offer_suggested_source, plan_without_metadata, read_metadata,
+    offer_suggested_source, plan_without_metadata, read_metadata, unpack_local,
 };
 use crate::ui::{human_size, Ui};
 use crate::Outcome;
@@ -24,9 +24,22 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     // Something that is no update source is refused before anything else.
     check_entry_args(&args.entry)?;
 
+    // An archive stays where it is, whatever else it holds: what is adopted
+    // is the AppImage taken out of it, a copy of its own that moves into
+    // place. Nothing can launch an archive, so no link is left in its place
+    // and no entries from elsewhere launch it.
+    let unpacked = unpack_local(ui, path)?;
+    let archive = match &unpacked {
+        Some(_) => Some(
+            path.canonicalize().with_context(|| format!("cannot resolve {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let from_archive = archive.as_deref();
+
     // Everything that can be said without running the file comes first:
     // reading the metadata can run it, though never in a dry run.
-    let source = adopt::check(paths, path)?;
+    let source = adopt::check(paths, unpacked.as_ref().map_or(path.as_path(), |(dest, _)| dest))?;
     let info = read_metadata(&source, args.dry_run)?;
     if info.extract_root().is_none() {
         if args.dry_run {
@@ -37,7 +50,9 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
         }
     }
 
-    let origin = source.to_string_lossy().into_owned();
+    // Where it came from is the archive, the way an install from one records
+    // it.
+    let origin = from_archive.unwrap_or(&source).to_string_lossy().into_owned();
     let mut request = InstallRequest::from_info(&source, &origin, &info);
     apply_overrides(&mut request, &args.entry)?;
     if request.name.trim().is_empty() {
@@ -48,13 +63,15 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     }
     apply_asset(&mut request, &args.entry)?;
 
-    let transfer = if args.copy { Transfer::Copy } else { Transfer::Move };
-    let plan = adopt::plan(paths, &request, transfer, in_local_bin(&source))?;
+    let transfer =
+        if args.copy && from_archive.is_none() { Transfer::Copy } else { Transfer::Move };
+    let link_back = from_archive.is_none() && in_local_bin(&source);
+    let plan = adopt::plan(paths, &request, transfer, link_back)?;
     if args.dry_run {
         if args.keep_entries {
             plan.check_slug(false)?;
         }
-        print_plan(ui, &plan);
+        print_plan(ui, &plan, from_archive);
         return Ok(Outcome::Done);
     }
 
@@ -64,17 +81,21 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     ui.info(&format!("Adopted {} as {}", ui.bold(&request.name), ui.accent(&outcome.slug)));
     ui.info(&format!("  binary  {}", outcome.appimage_path.display()));
     let from = plan.source.display();
-    match outcome.placement {
-        Placement::Moved { across_filesystems: false } => {
+    match (from_archive, outcome.placement) {
+        (Some(archive), _) => ui.info(&format!(
+            "          taken out of {}, which stays where it is",
+            archive.display()
+        )),
+        (None, Placement::Moved { across_filesystems: false }) => {
             ui.info(&format!("          moved from {from}"))
         }
-        Placement::Moved { across_filesystems: true } => ui.info(&format!(
+        (None, Placement::Moved { across_filesystems: true }) => ui.info(&format!(
             "          moved from {from}, across filesystems: copied, checked, then deleted"
         )),
-        Placement::Copied => {
+        (None, Placement::Copied) => {
             ui.info(&format!("          copied from {from}, which stays where it is"))
         }
-        Placement::InPlace => ui.info("          already in place"),
+        (None, Placement::InPlace) => ui.info("          already in place"),
     }
     ui.info(&format!("  entry   {}", outcome.desktop_entry_path.display()));
     if outcome.replaced.is_some() {
@@ -107,7 +128,9 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
         source => ui.info(&format!("  updates from {}", source.describe())),
     }
 
-    if let Some(why) = &outcome.original_left {
+    // The copy out of an archive is in a temporary directory, which goes
+    // anyway.
+    if let Some(why) = outcome.original_left.as_ref().filter(|_| from_archive.is_none()) {
         ui.warn(&format!(
             "could not delete {from}: {why}. The adopted copy is complete, the original is still \
              there"
@@ -198,14 +221,18 @@ fn describe_foreign(ui: &Ui, plan: &AdoptPlan) {
     }
 }
 
-fn print_plan(ui: &Ui, plan: &AdoptPlan) {
+fn print_plan(ui: &Ui, plan: &AdoptPlan, archive: Option<&Path>) {
     ui.info(&format!("Would adopt as {}", ui.accent(&plan.install.slug)));
     ui.info(&format!("  binary  {}", plan.install.appimage_path.display()));
     let from = plan.source.display();
-    match (plan.in_place, plan.transfer) {
-        (true, _) => ui.info("          already in place"),
-        (false, Transfer::Move) => ui.info(&format!("          moved from {from}")),
-        (false, Transfer::Copy) => {
+    match (archive, plan.in_place, plan.transfer) {
+        (Some(archive), _, _) => ui.info(&format!(
+            "          taken out of {}, which stays where it is",
+            archive.display()
+        )),
+        (None, true, _) => ui.info("          already in place"),
+        (None, false, Transfer::Move) => ui.info(&format!("          moved from {from}")),
+        (None, false, Transfer::Copy) => {
             ui.info(&format!("          copied from {from}, which stays where it is"))
         }
     }

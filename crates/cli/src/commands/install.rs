@@ -167,12 +167,7 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
         }
         let absolute = path.canonicalize().unwrap_or(path);
         let origin = absolute.to_string_lossy().into_owned();
-        if archive::Kind::of(&absolute).is_some() {
-            let scratch = scratch_dir("appimg-unpack-")?;
-            let dest = scratch.path().join("unpacked.AppImage");
-            let extracted = archive::extract_appimage(&absolute, &dest)?;
-            ui.info(&format!("Took {} out of {}", extracted.entry, absolute.display()));
-            install::check_file(&dest)?;
+        if let Some((dest, scratch)) = unpack_local(ui, &absolute)? {
             return Ok((dest, origin, Some(scratch)));
         }
         // The same checks a download gets, before the metadata is read,
@@ -186,6 +181,20 @@ fn resolve_source(ui: &Ui, source: &str) -> Result<(PathBuf, String, Option<Temp
     let (dest, scratch) =
         download_appimage(ui, source, &|file| install::verify_download(file, source))?;
     Ok((dest, source.to_string(), Some(scratch)))
+}
+
+/// Takes the AppImage out of a file on disk that is an archive, by its
+/// bytes whatever its name says, into a temporary directory that the caller
+/// keeps alive, and gives it the checks a download gets, see
+/// [`install::unpack_archive`]. `None` for a file that is no archive.
+pub(crate) fn unpack_local(ui: &Ui, file: &Path) -> Result<Option<(PathBuf, TempDir)>> {
+    if archive::Kind::of(file).is_none() {
+        return Ok(None);
+    }
+    let scratch = scratch_dir("appimg-unpack-")?;
+    let (dest, extracted) = install::unpack_archive(file, scratch.path())?;
+    ui.info(&format!("Took {} out of {}", extracted.entry, file.display()));
+    Ok(Some((dest, scratch)))
 }
 
 fn scratch_dir(prefix: &str) -> Result<TempDir> {

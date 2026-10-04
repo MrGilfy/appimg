@@ -522,3 +522,64 @@ fn names_shown_from_an_archive_cannot_drive_a_terminal() {
     let reason = refusal(scratch.unpack("escape.zip", &zip(&entries)));
     assert_eq!(reason, "it holds no AppImage, only ?]0;owned?.txt");
 }
+
+/// What an install, an adoption and the terminal interface take an
+/// AppImage out of a file on disk with: named after the archive, never
+/// after anything in it, within the limit the archive's size sets, and
+/// given the checks a download gets, with the archive named when it fails.
+#[test]
+fn unpacking_for_an_install_names_the_file_after_the_archive_and_keeps_the_rules() {
+    use appimg_core::install;
+
+    let scratch = Scratch::new();
+    let out = scratch.root().join("out");
+    fs::create_dir_all(&out).unwrap();
+    let app = appimage("soh");
+    let archive = scratch.archive(
+        "SoH-9.2.3-Linux.zip",
+        &zip(&[entry("readme.txt", b"x"), entry("../../soh.appimage", &app)]),
+    );
+    let (file, extracted) = install::unpack_archive(&archive, &out).unwrap();
+    assert_eq!(file, out.join("SoH-9.2.3-Linux.AppImage"));
+    assert_eq!(extracted.entry, "../../soh.appimage");
+    assert_eq!(fs::read(&file).unwrap(), app);
+    assert_eq!(mode(&file), 0o755);
+    fs::remove_file(&file).unwrap();
+
+    // Without an ending that makes it an archive, the whole name is kept.
+    let archive = scratch.archive("download", &gzip(&tar(&[("soh", &app)])));
+    let (file, _) = install::unpack_archive(&archive, &out).unwrap();
+    assert_eq!(file, out.join("download.AppImage"));
+    fs::remove_file(&file).unwrap();
+
+    let mut bomb = appimage("");
+    bomb.resize(70 << 20, 0);
+    let archive = scratch.archive("bomb.zip", &zip(&[entry("bomb.AppImage", &bomb)]));
+    let error = install::unpack_archive(&archive, &out).unwrap_err().to_string();
+    assert!(error.contains("would unpack to more than"), "{error}");
+
+    let two = zip(&[entry("a.AppImage", &app), entry("b", &app)]);
+    let archive = scratch.archive("two.zip", &two);
+    let error = install::unpack_archive(&archive, &out).unwrap_err().to_string();
+    assert!(error.contains("it holds 2 AppImages, and appimg takes exactly one"), "{error}");
+
+    // Its ELF header puts the section table far behind its end.
+    let mut short = appimage("");
+    short.resize(64, 0);
+    short[40..48].copy_from_slice(&1_000_000u64.to_le_bytes()); // e_shoff
+    short[58..60].copy_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    short[60..62].copy_from_slice(&1u16.to_le_bytes()); // e_shnum
+    let archive = scratch.archive("short.zip", &zip(&[entry("soh.appimage", &short)]));
+    let error = install::unpack_archive(&archive, &out).unwrap_err().to_string();
+    assert_eq!(
+        error,
+        format!(
+            "{}: soh.appimage: it is cut short, a complete file is at least 1000064 bytes and \
+             this one is 64",
+            archive.display()
+        )
+    );
+
+    // Whatever failed, nothing is left behind.
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+}

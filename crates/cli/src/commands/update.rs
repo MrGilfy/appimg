@@ -177,7 +177,7 @@ fn statuses_to_json(statuses: &[UpdateStatus]) -> String {
                 current = optional(status.current_version.as_deref()),
                 latest = optional(status.latest_version.as_deref()),
                 available = status.available,
-                source = status.source.describe(),
+                source = escape(&status.source.describe()),
                 note = optional(status.note.as_deref()),
             )
         })

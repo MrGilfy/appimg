@@ -13,8 +13,9 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
-use flate2::write::{DeflateEncoder, GzEncoder};
-use flate2::{Compression, Crc};
+mod pack;
+
+use pack::{tar_gz, zip};
 
 /// Executing a file while any process still holds it open for writing fails
 /// with `ETXTBSY`, and a `fork` in another test thread can hold one for a
@@ -245,77 +246,6 @@ fn appimage(root: &Path, name: &str, version: &str) -> Vec<u8> {
 /// A shared library, ELF but no AppImage.
 fn library() -> Vec<u8> {
     b"\x7fELF\x02\x01\x01\x00\x00\x00\x00 libSDL2".to_vec()
-}
-
-/// A zip archive of deflated files, as PKWARE's APPNOTE lays one out.
-fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut central = Vec::new();
-    for (name, data) in files {
-        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(data).unwrap();
-        let packed = encoder.finish().unwrap();
-        let mut crc = Crc::new();
-        crc.update(data);
-        let offset = out.len() as u32;
-        let common = |out: &mut Vec<u8>| {
-            out.extend_from_slice(&20u16.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(&8u16.to_le_bytes());
-            out.extend_from_slice(&[0; 4]);
-            out.extend_from_slice(&crc.sum().to_le_bytes());
-            out.extend_from_slice(&(packed.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-        };
-        out.extend_from_slice(b"PK\x03\x04");
-        common(&mut out);
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&packed);
-        central.extend_from_slice(b"PK\x01\x02");
-        central.extend_from_slice(&(3u16 << 8 | 20).to_le_bytes());
-        common(&mut central);
-        // Comment length, disk, internal and external attributes.
-        central.extend_from_slice(&[0; 10]);
-        central.extend_from_slice(&offset.to_le_bytes());
-        central.extend_from_slice(name.as_bytes());
-    }
-    let directory_at = out.len() as u32;
-    out.extend_from_slice(&central);
-    out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
-    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    out.extend_from_slice(&directory_at.to_le_bytes());
-    out.extend_from_slice(&[0; 2]);
-    out
-}
-
-/// A gzip-compressed tar file of regular files, in ustar form.
-fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut tar = Vec::new();
-    for (name, data) in files {
-        let mut header = vec![0u8; 512];
-        header[..name.len()].copy_from_slice(name.as_bytes());
-        header[100..108].copy_from_slice(b"0000644\0");
-        header[108..116].copy_from_slice(b"0000000\0");
-        header[116..124].copy_from_slice(b"0000000\0");
-        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
-        header[136..148].copy_from_slice(b"00000000000\0");
-        header[148..156].copy_from_slice(b"        ");
-        header[156] = b'0';
-        header[257..265].copy_from_slice(b"ustar\x0000");
-        let sum: u32 = header.iter().map(|byte| *byte as u32).sum();
-        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-        tar.extend(header);
-        tar.extend_from_slice(data);
-        tar.resize(tar.len().next_multiple_of(512), 0);
-    }
-    tar.extend([0u8; 1024]);
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(&tar).unwrap();
-    encoder.finish().unwrap()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -654,4 +584,235 @@ fn an_appimage_cut_short_inside_an_archive_is_refused() {
     );
     // Nothing was installed.
     assert!(home.files().iter().all(|file| !file.starts_with("data")), "{:?}", home.files());
+}
+
+/// Exports a home with Shipwright 9.2.3 installed from the zip, following
+/// its releases, `extra` added to the install, and returns the file the
+/// export went to.
+fn exported_9_2_3(home: &Home, extra: &[&str]) -> PathBuf {
+    install_9_2_3(home, extra);
+    let file = home.root.join("apps.json");
+    home.ok(&["export", file.to_str().unwrap()]);
+    file
+}
+
+/// Two builds for Linux in one release, and others for other platforms:
+/// the file name it was installed from cannot pick one, a pattern can.
+/// Returns the AppImage in the one the pattern picks.
+fn release_9_3_0_with_a_debug_build(home: &Home, server: &Server) -> Vec<u8> {
+    let (soh, linux) = shipwright_zip(&home.root, "9.3.0");
+    let (_, debug) = shipwright_zip(&home.root, "9.3.0-debug");
+    server.release(
+        "9.3.0",
+        &[
+            ("SoH-Blue-Echo-Linux.zip", linux, None),
+            ("SoH-Blue-Echo-Linux-Debug.zip", debug, None),
+            ("SoH-Blue-Echo-Win64.zip", b"win".to_vec(), None),
+        ],
+    );
+    soh
+}
+
+/// An import of an app that follows releases with an asset pattern takes
+/// the newest archive that pattern picks, out of a release where the name
+/// it was installed from could not, checks the archive against the digest
+/// GitHub publishes, takes the AppImage out of it and keeps the pattern.
+#[test]
+fn import_picks_the_release_archive_by_its_pattern_and_keeps_it() {
+    let _serial = serial();
+    let server = Server::start();
+    let old = Home::new(&server);
+    let export = exported_9_2_3(&old, &["--asset", "SoH-*-Linux.zip"]);
+    let soh = release_9_3_0_with_a_debug_build(&old, &server);
+
+    let home = Home::new(&server);
+    let output = home.ok(&["import", export.to_str().unwrap()]);
+    let text = stdout(&output);
+    assert!(text.contains("SoH-Blue-Echo-Linux.zip"), "{text}");
+    assert!(text.contains("sha256 matches the digest GitHub publishes"), "{text}");
+    assert!(text.contains("took soh.appimage out of the archive"), "{text}");
+    assert!(text.contains("installed as ship-of-harkinian, version 9.3.0"), "{text}");
+    assert!(text.contains("Imported 1 of 1 app."), "{text}");
+    assert_eq!(home.installed("ship-of-harkinian"), soh);
+    assert_eq!(server.downloads(), ["/download/9.3.0/SoH-Blue-Echo-Linux.zip"]);
+    assert!(home
+        .entry("ship-of-harkinian")
+        .contains("\nX-AppImg-UpdateSource=github:HarbourMasters/Shipwright#SoH-*-Linux.zip\n"));
+    assert_eq!(home.appimages_dir(), BTreeSet::from(["ship-of-harkinian.AppImage".to_string()]));
+    // Nothing of the download or the archive is left behind.
+    assert_eq!(fs::read_dir(home.root.join("tmp")).unwrap().count(), 0);
+
+    // Without the pattern, the names leave two, and the import says so and
+    // what to do, and installs nothing.
+    let old = Home::new(&server);
+    let export = exported_9_2_3(&old, &[]);
+    release_9_3_0_with_a_debug_build(&old, &server);
+    let home = Home::new(&server);
+    let refused = home.run(&["import", export.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1));
+    let message = stderr(&refused);
+    assert!(message.contains("2 are left for this machine"), "{message}");
+    assert!(message.contains("--asset"), "{message}");
+    assert!(!home.root.join("data/applications/ship-of-harkinian.desktop").exists());
+}
+
+/// The archive an import downloads is checked against the digest its
+/// release publishes before anything is taken out of it: one that does not
+/// match is refused, and nothing is installed or left behind.
+#[test]
+fn import_refuses_a_release_archive_that_does_not_match_its_digest() {
+    let _serial = serial();
+    let server = Server::start();
+    let old = Home::new(&server);
+    let export = exported_9_2_3(&old, &["--asset", "SoH-*-Linux.zip"]);
+    // It holds two AppImages, which unpacking would have said instead.
+    let two = zip(&[
+        ("soh.appimage", &appimage(&old.root, "Ship of Harkinian", "9.3.0")),
+        ("other.appimage", &appimage(&old.root, "Other", "1")),
+    ]);
+    server.release("9.3.0", &[("SoH-Blue-Echo-Linux.zip", two, Some("ab".repeat(32)))]);
+
+    let home = Home::new(&server);
+    let before = home.files();
+    let refused = home.run(&["import", export.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1));
+    let message = stderr(&refused);
+    assert!(
+        message.contains(&format!("the GitHub release publishes sha256:{}", "ab".repeat(32))),
+        "{message}"
+    );
+    assert!(!message.contains("AppImages"), "{message}");
+    assert!(message.contains("1 of 1 app could not be imported"), "{message}");
+    assert_eq!(home.files(), before);
+}
+
+/// An app installed from an archive at a URL updates from that URL, and an
+/// import downloads the archive there again and takes the AppImage out of
+/// it, as it is by then.
+#[test]
+fn import_from_an_archive_url_takes_the_appimage_out_of_it() {
+    let _serial = serial();
+    let server = Server::start();
+    let old = Home::new(&server);
+    let v1 = appimage(&old.root, "Ship of Harkinian", "9.2.3");
+    server.route("/files/soh-linux.tar.gz", tar_gz(&[("soh/README", b"hi"), ("soh/soh", &v1)]));
+    old.ok(&["--yes", "install", &server.url("/files/soh-linux.tar.gz")]);
+    let export = old.root.join("apps.json");
+    old.ok(&["export", export.to_str().unwrap()]);
+
+    let v2 = appimage(&old.root, "Ship of Harkinian", "9.3.0");
+    server.route("/files/soh-linux.tar.gz", tar_gz(&[("soh/soh", &v2)]));
+    let home = Home::new(&server);
+    let output = home.ok(&["import", export.to_str().unwrap()]);
+    let text = stdout(&output);
+    assert!(text.contains("took soh/soh out of the archive"), "{text}");
+    assert!(text.contains("installed as ship-of-harkinian, version 9.3.0"), "{text}");
+    assert_eq!(home.installed("ship-of-harkinian"), v2);
+    let entry = home.entry("ship-of-harkinian");
+    let url = server.url("/files/soh-linux.tar.gz");
+    assert!(entry.contains(&format!("\nX-AppImg-UpdateSource={url}\n")), "{entry}");
+    assert_eq!(home.appimages_dir(), BTreeSet::from(["ship-of-harkinian.AppImage".to_string()]));
+    assert_eq!(fs::read_dir(home.root.join("tmp")).unwrap().count(), 0);
+}
+
+/// `adopt --asset` keeps the pattern with the update source the way an
+/// install does, and the next update picks the archive by it, out of a
+/// release where the name could not.
+#[test]
+fn adopt_keeps_the_asset_pattern_and_the_update_follows_it() {
+    let _serial = serial();
+    let server = Server::start();
+    let home = Home::new(&server);
+    let (_, zip) = shipwright_zip(&home.root, "9.2.3");
+    let file = home.file("home/Downloads/SoH-Ackbar-Delta-Linux.zip", &zip);
+    let output = home.ok(&[
+        "--yes",
+        "adopt",
+        file.to_str().unwrap(),
+        "--update-source",
+        "github:HarbourMasters/Shipwright",
+        "--asset",
+        "SoH-*-Linux.zip",
+    ]);
+    let text = stdout(&output);
+    assert!(
+        text.contains("\n  updates from github:HarbourMasters/Shipwright#SoH-*-Linux.zip\n"),
+        "{text}"
+    );
+    assert!(home
+        .entry("ship-of-harkinian")
+        .contains("\nX-AppImg-UpdateSource=github:HarbourMasters/Shipwright#SoH-*-Linux.zip\n"));
+    assert_eq!(fs::read(&file).unwrap(), zip);
+
+    let soh = release_9_3_0_with_a_debug_build(&home, &server);
+    let output = home.ok(&["update", "ship-of-harkinian"]);
+    let text = stdout(&output);
+    assert!(text.contains("9.2.3 -> 9.3.0"), "{text}");
+    assert!(text.contains("took soh.appimage out of it"), "{text}");
+    assert_eq!(home.installed("ship-of-harkinian"), soh);
+    assert_eq!(server.downloads(), ["/download/9.3.0/SoH-Blue-Echo-Linux.zip"]);
+}
+
+/// The update source shows the way the entry stores it, the asset pattern
+/// included, wherever it is shown: after the install, in the list and the
+/// update check, as text and as JSON, and by `update-source`. In JSON it is
+/// a string like any other, whatever the pattern holds.
+#[test]
+fn the_asset_pattern_shows_wherever_the_update_source_does() {
+    let _serial = serial();
+    let server = Server::start();
+    let home = Home::new(&server);
+    let stored = "github:HarbourMasters/Shipwright#SoH-*-Linux.zip";
+    let (_, zip) = shipwright_zip(&home.root, "9.2.3");
+    let file = home.file("home/Downloads/SoH-Ackbar-Delta-Linux.zip", &zip);
+    let output = home.ok(&[
+        "--yes",
+        "install",
+        file.to_str().unwrap(),
+        "--update-source",
+        "github:HarbourMasters/Shipwright",
+        "--asset",
+        "SoH-*-Linux.zip",
+    ]);
+    let text = stdout(&output);
+    assert!(text.contains(&format!("\n  updates from {stored}\n")), "{text}");
+    release_9_3_0_with_a_debug_build(&home, &server);
+
+    let list = stdout(&home.ok(&["list"]));
+    assert!(list.contains(stored), "{list}");
+    let json = stdout(&home.ok(&["list", "--json"]));
+    assert_eq!(
+        appimg_core::json::string_field(&json, "update_source").as_deref(),
+        Some(stored),
+        "{json}"
+    );
+    let check = stdout(&home.run(&["update", "--all", "--check"]));
+    assert!(check.contains(stored), "{check}");
+    assert!(check.contains("update available"), "{check}");
+    let json = stdout(&home.run(&["update", "--all", "--check", "--json"]));
+    assert_eq!(appimg_core::json::string_field(&json, "source").as_deref(), Some(stored), "{json}");
+    let shown = stdout(&home.ok(&["update-source", "ship-of-harkinian"]));
+    assert!(
+        shown.contains(&format!(
+            "Updates from   {stored}, the newest release with an asset matching SoH-*-Linux.zip"
+        )),
+        "{shown}"
+    );
+
+    // A pattern may hold what JSON has to escape.
+    let odd = r#"SoH-"*"\Linux.zip"#;
+    home.ok(&["update-source", "ship-of-harkinian", "--asset", odd]);
+    let stored = format!("github:HarbourMasters/Shipwright#{odd}");
+    let json = stdout(&home.ok(&["list", "--json"]));
+    assert_eq!(
+        appimg_core::json::string_field(&json, "update_source").as_deref(),
+        Some(stored.as_str()),
+        "{json}"
+    );
+    let json = stdout(&home.run(&["update", "--all", "--check", "--json"]));
+    assert_eq!(
+        appimg_core::json::string_field(&json, "source").as_deref(),
+        Some(stored.as_str()),
+        "{json}"
+    );
 }

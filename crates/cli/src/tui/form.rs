@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use appimg_core::install::{self, IconChoice, InstallRequest};
 use appimg_core::metadata::AppImageInfo;
 use appimg_core::{update, MAIN_CATEGORIES};
+use tempfile::TempDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -63,10 +64,15 @@ pub struct InstallForm {
     pub update_source_text: String,
     /// Whether the update source was prefilled from the AppStream metadata.
     pub suggested: bool,
+    /// The temporary directory the AppImage taken out of an archive lives
+    /// in, kept alive until it is installed.
+    _unpacked: Option<TempDir>,
 }
 
 impl InstallForm {
-    pub fn new(source: &Path, origin: &str, info: AppImageInfo) -> Self {
+    /// `unpacked` is the temporary directory `source` lives in when it was
+    /// taken out of an archive, which `origin` names then.
+    pub fn new(source: &Path, origin: &str, info: AppImageInfo, unpacked: Option<TempDir>) -> Self {
         let request = InstallRequest::from_info(source, origin, &info);
         let category_cursor =
             request.categories.first().and_then(|first| index_of(first)).unwrap_or(0);
@@ -86,11 +92,8 @@ impl InstallForm {
             icon_text: String::new(),
             update_source_text,
             suggested,
+            _unpacked: unpacked,
         }
-    }
-
-    pub fn source(&self) -> &Path {
-        &self.request.source
     }
 
     pub fn is_selected(&self, category: &str) -> bool {
@@ -187,7 +190,7 @@ mod tests {
 
     fn form_for(info: AppImageInfo) -> InstallForm {
         let path = Path::new("/home/me/Downloads/Fake_App-1.0.0-x86_64.AppImage");
-        InstallForm::new(path, &path.to_string_lossy(), info)
+        InstallForm::new(path, &path.to_string_lossy(), info, None)
     }
 
     fn linking(repository: &str) -> AppImageInfo {

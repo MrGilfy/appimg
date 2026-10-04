@@ -2,10 +2,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use appimg_core::list::InstalledApp;
 use appimg_core::update::UpdateSource;
-use appimg_core::{install, list, metadata, remove, update, Error, Paths};
+use appimg_core::{archive, install, list, metadata, remove, update, Error, Paths};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::browser::Browser;
@@ -14,6 +14,10 @@ use super::form::{Field, InstallForm};
 #[cfg(test)]
 #[path = "../../tests/marker/mod.rs"]
 mod marker;
+
+#[cfg(test)]
+#[path = "../../tests/pack/mod.rs"]
+mod pack;
 
 /// Work that takes long enough to deserve a redraw before it starts, or that
 /// needs the terminal back, so the event loop runs it, not the key handler.
@@ -327,13 +331,27 @@ impl App {
     }
 
     fn inspect(&mut self, path: PathBuf) -> Result<()> {
-        // The same checks a download gets, before the metadata is read.
-        install::check_file(&path)?;
+        // An archive, by its bytes whatever its name says, is unpacked the
+        // way an install from the command line unpacks it: the one AppImage
+        // in it goes into a temporary directory the form keeps alive, and
+        // the archive is where it came from.
+        let (file, unpacked, took) = if archive::Kind::of(&path).is_some() {
+            let scratch = tempfile::Builder::new()
+                .prefix("appimg-unpack-")
+                .tempdir()
+                .context("cannot create a temporary directory to unpack the archive into")?;
+            let (file, extracted) = install::unpack_archive(&path, scratch.path())?;
+            (file, Some(scratch), Some(format!("Took {} out of the archive.", extracted.entry)))
+        } else {
+            // The same checks a download gets, before the metadata is read.
+            install::check_file(&path)?;
+            (path.clone(), None, None)
+        };
         // Nothing is confirmed while the form is filled in, so the AppImage
         // is never run for it: without unsquashfs nothing is read, and the
         // install goes by what the form says once it is confirmed.
         let info = metadata::inspect(
-            &path,
+            &file,
             appimg_core::current_locale().as_deref(),
             metadata::Reading::WithoutRunning,
         )?;
@@ -350,8 +368,11 @@ impl App {
             }
         });
         let origin = path.to_string_lossy().into_owned();
-        self.mode = Mode::Form(Box::new(InstallForm::new(&path, &origin, info)));
-        self.status = problem;
+        self.mode = Mode::Form(Box::new(InstallForm::new(&file, &origin, info, unpacked)));
+        self.status = match (took, problem) {
+            (Some(took), Some(problem)) => Some(format!("{took} {problem}")),
+            (took, problem) => took.or(problem),
+        };
         Ok(())
     }
 
@@ -457,15 +478,8 @@ mod tests {
 
     use super::*;
 
-    /// The install form is filled in before anything is confirmed, so
-    /// reading the metadata for it never runs the AppImage, nor makes it
-    /// executable. Whether `unsquashfs` is on `PATH` or not, it cannot read
-    /// the marker without the stand-in the CLI tests have, so nothing is
-    /// read, and the status line says so and why.
-    #[test]
-    fn prefilling_the_install_form_runs_nothing() {
-        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
-        let root = dir.path();
+    /// Directories for appimg below `root`, created.
+    fn paths_in(root: &std::path::Path) -> Paths {
         let data_home = root.join("data");
         let paths = Paths {
             appimage_dir: data_home.join("appimages"),
@@ -476,6 +490,19 @@ mod tests {
             data_home,
         };
         paths.ensure_dirs().unwrap();
+        paths
+    }
+
+    /// The install form is filled in before anything is confirmed, so
+    /// reading the metadata for it never runs the AppImage, nor makes it
+    /// executable. Whether `unsquashfs` is on `PATH` or not, it cannot read
+    /// the marker without the stand-in the CLI tests have, so nothing is
+    /// read, and the status line says so and why.
+    #[test]
+    fn prefilling_the_install_form_runs_nothing() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let root = dir.path();
+        let paths = paths_in(root);
         let file = root.join("Marker.AppImage");
         let mark = root.join("it-ran");
         marker::write(&file, &mark, &root.join("payload"), 0o644);
@@ -492,5 +519,73 @@ mod tests {
         let status = app.status.clone().unwrap_or_default();
         assert!(status.starts_with("Metadata not read, name and icon are guesses: "), "{status}");
         assert!(status.contains("the AppImage was not run to read it instead"), "{status}");
+    }
+
+    /// An archive picked in the browser is unpacked the way the command
+    /// line unpacks it: the one AppImage in it, by its bytes, into a
+    /// temporary directory the form keeps alive until the install, named
+    /// after the archive, which is where the entry says it came from and
+    /// which stays as it was. Nothing runs it on the way.
+    #[test]
+    fn an_archive_installs_the_appimage_in_it_and_stays() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let root = dir.path();
+        let paths = paths_in(root);
+        let mark = root.join("it-ran");
+        let built = root.join("built");
+        marker::write(&built, &mark, &root.join("payload"), 0o755);
+        let app_bytes = fs::read(&built).unwrap();
+        fs::remove_file(&built).unwrap();
+        let archive = root.join("Marker-Tool-Linux.zip");
+        let packed = pack::zip(&[("readme.txt", b"x"), ("../bin/marker", &app_bytes)]);
+        fs::write(&archive, &packed).unwrap();
+
+        let mut app = App::new(paths.clone()).unwrap();
+        app.run_action(Action::Inspect(archive.clone())).unwrap();
+        let Mode::Form(form) = std::mem::replace(&mut app.mode, Mode::List) else {
+            panic!("no install form");
+        };
+        assert_eq!(form.request.origin, archive.to_string_lossy());
+        assert_eq!(form.request.source.file_name().unwrap(), "Marker-Tool-Linux.AppImage");
+        let unpacked = form.request.source.parent().unwrap().to_path_buf();
+        assert!(!unpacked.starts_with(root), "{}", unpacked.display());
+        assert_eq!(fs::read(&form.request.source).unwrap(), app_bytes);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.starts_with("Took ../bin/marker out of the archive. Metadata not read"),
+            "{status}"
+        );
+
+        app.run_action(Action::Install(form)).unwrap();
+        let installed = list::list(&paths).unwrap();
+        assert_eq!(installed.len(), 1);
+        assert_eq!(fs::read(&installed[0].appimage_path).unwrap(), app_bytes);
+        let entry = fs::read_to_string(&installed[0].desktop_entry_path).unwrap();
+        assert!(entry.contains(&format!("\nX-AppImg-Source={}\n", archive.display())), "{entry}");
+        assert_eq!(fs::read(&archive).unwrap(), packed);
+        assert!(!unpacked.exists(), "{} is left", unpacked.display());
+        assert!(!mark.exists(), "the AppImage ran");
+        // Nothing the archive named was written next to it.
+        assert!(!root.join("bin").exists());
+    }
+
+    /// An archive without exactly one AppImage in it opens no form, and
+    /// the reason is what the status line shows.
+    #[test]
+    fn an_archive_without_exactly_one_appimage_opens_no_form() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let root = dir.path();
+        let paths = paths_in(root);
+        let appimage = b"\x7fELF\x02\x01\x01\x00AI\x02 an AppImage";
+        let archive = root.join("two.zip");
+        fs::write(&archive, pack::zip(&[("a", appimage), ("b", appimage)])).unwrap();
+
+        let mut app = App::new(paths).unwrap();
+        let error = app.run_action(Action::Inspect(archive)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("it holds 2 AppImages, and appimg takes exactly one"),
+            "{error:#}"
+        );
+        assert!(matches!(app.mode, Mode::List));
     }
 }

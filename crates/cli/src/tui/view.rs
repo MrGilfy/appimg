@@ -141,7 +141,7 @@ fn draw_browser(frame: &mut Frame, area: Rect, browser: &super::browser::Browser
     }
     if browser.entries.is_empty() {
         frame.render_widget(
-            Paragraph::new("No directories and no AppImages here.")
+            Paragraph::new("No directories, AppImages or archives here.")
                 .style(theme::dim())
                 .block(block),
             area,
@@ -179,7 +179,7 @@ fn draw_form(frame: &mut Frame, area: Rect, form: &super::form::InstallForm) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme::border())
-        .title(format!(" Install {} ", form.source().display()));
+        .title(format!(" Install {} ", form.request.origin));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

@@ -78,7 +78,7 @@ fn app_to_json(app: &InstalledApp) -> String {
         entry = escape(&app.desktop_entry_path.to_string_lossy()),
         size = app.size_bytes.map(|s| s.to_string()).unwrap_or_else(|| "null".to_string()),
         health = health_name(app.health),
-        update_source = update::source_for(app).describe(),
+        update_source = escape(&update::source_for(app).describe()),
     )
 }
 

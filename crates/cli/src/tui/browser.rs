@@ -1,6 +1,9 @@
-//! A small file browser: directories and AppImages, nothing else.
+//! A small file browser: directories, AppImages and the archives an
+//! AppImage may come in, nothing else.
 
 use std::path::{Path, PathBuf};
+
+use appimg_core::archive;
 
 /// One row in the browser.
 #[derive(Debug, Clone)]
@@ -66,7 +69,7 @@ impl Browser {
             }
             if path.is_dir() {
                 directories.push(Entry { path, label: format!("{name}/"), is_dir: true });
-            } else if is_appimage(&path) {
+            } else if is_installable(&name) {
                 files.push(Entry { path, label: name, is_dir: false });
             }
         }
@@ -116,6 +119,40 @@ impl Browser {
     }
 }
 
-fn is_appimage(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("appimage"))
+/// An AppImage, or a zip or tar archive that may hold one, by its name.
+/// Picking it decides by its bytes.
+fn is_installable(name: &str) -> bool {
+    let appimage = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("appimage"));
+    appimage || archive::is_archive_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AppImages and archives are listed, by their names, besides the
+    /// directories; anything else is not.
+    #[test]
+    fn lists_appimages_and_archives() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        for name in ["App.AppImage", "b.appimage", "c.zip", "d.tar.gz", "e.tgz", "f.tar", "g.txt"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let mut browser = Browser {
+            directory: dir.path().to_path_buf(),
+            entries: Vec::new(),
+            selected: 0,
+            error: None,
+        };
+        browser.reload();
+        let labels: Vec<&str> = browser.entries.iter().map(|entry| entry.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["..", "sub/", "App.AppImage", "b.appimage", "c.zip", "d.tar.gz", "e.tgz", "f.tar"]
+        );
+    }
 }

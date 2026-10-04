@@ -61,13 +61,19 @@ pub enum UpdateSource {
 }
 
 impl UpdateSource {
+    /// What the source is, in a word, or for a GitHub release the way the
+    /// desktop entry stores it, `github:owner/repo[@tag][#pattern]`: the tag
+    /// and the asset pattern decide which file an update takes, so they are
+    /// part of it.
     pub fn describe(&self) -> String {
         match self {
             UpdateSource::Zsync { .. } => "zsync".to_string(),
             // The release is where the zsync file is found, not what the
             // update is: a delta is a delta.
             UpdateSource::GitHubZsync { .. } => "zsync".to_string(),
-            UpdateSource::GitHubRelease { owner, repo, .. } => format!("github:{owner}/{repo}"),
+            UpdateSource::GitHubRelease { owner, repo, tag, pattern, .. } => {
+                github_source_setting(owner, repo, tag.as_deref(), pattern.as_deref())
+            }
             UpdateSource::DirectUrl { .. } => "url".to_string(),
             UpdateSource::Manual => MANUAL.to_string(),
         }
@@ -208,11 +214,7 @@ pub fn parse_update_source(value: &str) -> Result<String> {
 
     if let Some(spec) = trimmed.strip_prefix("github:") {
         let (owner, repo, tag, pattern) = github_source_spec(spec).ok_or_else(invalid)?;
-        let setting = github_setting(&owner, &repo, tag.as_deref());
-        return Ok(match pattern {
-            Some(pattern) => format!("{setting}#{pattern}"),
-            None => setting,
-        });
+        return Ok(github_source_setting(&owner, &repo, tag.as_deref(), pattern.as_deref()));
     }
     if !download::is_url(trimmed) {
         return Err(invalid());
@@ -252,7 +254,7 @@ pub fn with_asset_pattern(source: &str, pattern: &str) -> Result<String> {
     }
     match source_from_setting(source, None) {
         UpdateSource::GitHubRelease { owner, repo, tag, .. } => {
-            Ok(format!("{}#{pattern}", github_setting(&owner, &repo, tag.as_deref())))
+            Ok(github_source_setting(&owner, &repo, tag.as_deref(), Some(pattern)))
         }
         _ => Err(Error::AssetNeedsGitHub(source.to_string())),
     }
@@ -360,6 +362,21 @@ fn github_setting(owner: &str, repo: &str, tag: Option<&str>) -> String {
     match tag {
         Some(tag) => format!("github:{owner}/{repo}@{tag}"),
         None => format!("github:{owner}/{repo}"),
+    }
+}
+
+/// A `github:` update source as the desktop entry stores it, with the asset
+/// pattern behind `#` when there is one.
+fn github_source_setting(
+    owner: &str,
+    repo: &str,
+    tag: Option<&str>,
+    pattern: Option<&str>,
+) -> String {
+    let setting = github_setting(owner, repo, tag);
+    match pattern {
+        Some(pattern) => format!("{setting}#{pattern}"),
+        None => setting,
     }
 }
 
@@ -3196,6 +3213,24 @@ mod tests {
         assert_eq!(source_for(&installed(None, None, Some(&local))), UpdateSource::Manual);
         assert_eq!(source_for(&installed(None, None, None)), UpdateSource::Manual);
         assert_eq!(UpdateSource::Manual.describe(), "manual");
+    }
+
+    /// A GitHub release source is shown the way it is stored, tag and
+    /// pattern included, since they decide what an update takes, and what
+    /// is shown reads back as the same source.
+    #[test]
+    fn a_github_release_source_is_described_the_way_it_is_stored() {
+        for stored in [
+            "github:o/r",
+            "github:o/r@continuous",
+            "github:o/r#App-*-x86_64.AppImage",
+            "github:o/r@nightly#App-*.zip",
+        ] {
+            let app = installed(None, Some(stored), Some("/home/u/App.AppImage"));
+            let described = source_for(&app).describe();
+            assert_eq!(described, stored);
+            assert_eq!(parse_update_source(&described).unwrap(), stored);
+        }
     }
 
     #[test]

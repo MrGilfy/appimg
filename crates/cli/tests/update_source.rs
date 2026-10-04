@@ -201,7 +201,7 @@ fn update_source_shows_sets_and_clears() {
         .entry("fake-app")
         .contains("\nX-AppImg-UpdateSource=github:fake/app@continuous\n"));
     let shown = stdout(&home.run(&["update-source", "fake-app"]));
-    assert!(shown.contains("github:fake/app, the release tagged continuous"), "{shown}");
+    assert!(shown.contains("github:fake/app@continuous, the release tagged continuous"), "{shown}");
 
     let again = home.run(&["update-source", "fake-app", "github:fake/app@continuous"]);
     assert_eq!(again.status.code(), Some(3));

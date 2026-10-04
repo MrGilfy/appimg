@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
+mod pack;
+
 /// Executing a file while any process still holds it open for writing fails
 /// with `ETXTBSY`, and a `fork` in another test thread can hold one for a
 /// moment. The tests run one at a time.
@@ -71,6 +73,12 @@ impl Home {
         self.command().args(args).output().unwrap()
     }
 
+    /// Removes an application again, and insists that it worked.
+    fn ok_remove(&self, slug: &str) {
+        let output = self.run(&["--yes", "remove", slug]);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+
     fn data(&self, relative: &str) -> PathBuf {
         self.root.join("data").join(relative)
     }
@@ -107,6 +115,24 @@ impl Home {
         drop(file);
         fs::set_permissions(&partial, fs::Permissions::from_mode(0o755)).unwrap();
         fs::rename(&partial, &path).unwrap();
+        path
+    }
+
+    /// The bytes of [`Home::appimage`] with the AppImage magic behind the
+    /// ELF magic, which is what finds it in an archive. The file itself is
+    /// not left behind.
+    fn packable(&self, file_name: &str) -> Vec<u8> {
+        let path = self.appimage("packed", file_name, None);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        [&b"\x7fELF\x01\x01\x01\x00AI\x02"[..], &bytes[4..]].concat()
+    }
+
+    /// Writes a file below the home.
+    fn file(&self, relative: &str, bytes: &[u8]) -> PathBuf {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
         path
     }
 
@@ -611,4 +637,204 @@ fn a_local_install_gets_the_checks_a_download_gets() {
     );
     assert_eq!(home.snapshot(), before);
     assert!(!home.root.join("home/it-ran").exists());
+}
+
+/// An AppImage that comes in an archive is taken out of it by its bytes,
+/// whatever the archive calls it, and adopted. The archive stays as it was,
+/// with everything else in it, and is where the entry says it came from.
+/// No path out of it is written: the one that climbs out of the home
+/// changes nothing outside it.
+#[test]
+fn the_appimage_in_an_archive_is_adopted_and_the_archive_stays() {
+    let _serial = serial();
+    let home = Home::new();
+    let app = home.packable("fakeapp");
+    let climbing = "../../../../fakeapp";
+    let archive = home.file(
+        "home/Downloads/Fake-App-Linux.zip",
+        &pack::zip(&[
+            ("readme.txt", b"Fake App"),
+            (climbing, &app),
+            ("../../evil.desktop", b"[Desktop Entry]"),
+        ]),
+    );
+    let before = home.snapshot();
+
+    let output = home.run(&["--yes", "adopt", archive.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains(&format!("Took {climbing} out of {}", archive.display())), "{out}");
+    assert!(out.contains("Adopted Fake App as fake-app"), "{out}");
+    assert!(
+        out.contains(&format!("taken out of {}, which stays where it is", archive.display())),
+        "{out}"
+    );
+    assert!(!out.contains("moved from"), "{out}");
+    assert!(!out.contains("link"), "{out}");
+
+    let (gone, new, changed) = changes(&before, &home.snapshot());
+    assert_eq!(gone, Vec::<PathBuf>::new());
+    assert_eq!(
+        new,
+        vec![
+            PathBuf::from("data/appimages/fake-app.AppImage"),
+            PathBuf::from("data/applications/fake-app.desktop"),
+            PathBuf::from("data/icons/hicolor/48x48/apps/fake-app.png"),
+        ]
+    );
+    assert_eq!(changed, Vec::<PathBuf>::new());
+    assert_eq!(fs::read(home.data("appimages/fake-app.AppImage")).unwrap(), app);
+    let entry = fs::read_to_string(home.data("applications/fake-app.desktop")).unwrap();
+    assert!(entry.contains(&format!("\nX-AppImg-Source={}\n", archive.display())), "{entry}");
+    let outside = home.root.parent().unwrap();
+    assert!(!outside.join("fakeapp").exists());
+    assert!(!outside.join("evil.desktop").exists());
+}
+
+/// An archive in `~/.local/bin` is no command, so nothing takes its place,
+/// and `--copy` changes nothing: the archive stays either way. A dry run
+/// says as much and leaves nothing behind, the unpacked copy included.
+#[test]
+fn an_archive_is_never_moved_linked_or_deleted() {
+    let _serial = serial();
+    let home = Home::new();
+    let archive = home.file(
+        "home/.local/bin/fakeapp.tar.gz",
+        &pack::tar_gz(&[("fakeapp/AppRun.AppImage", &home.packable("fakeapp"))]),
+    );
+    let bytes = fs::read(&archive).unwrap();
+    let before = home.snapshot();
+
+    let output = home.run(&["--yes", "adopt", "--dry-run", archive.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Would adopt as fake-app"), "{out}");
+    assert!(
+        out.contains(&format!("taken out of {}, which stays where it is", archive.display())),
+        "{out}"
+    );
+    assert!(!out.contains("link"), "{out}");
+    assert_eq!(home.snapshot(), before);
+
+    for args in [&["--yes", "adopt"][..], &["--yes", "adopt", "--copy"][..]] {
+        let output = home.run(&[args, &[archive.to_str().unwrap()]].concat());
+        assert!(output.status.success(), "{args:?} {}", stderr(&output));
+        assert!(!stdout(&output).contains("link"), "{}", stdout(&output));
+        assert!(fs::symlink_metadata(&archive).unwrap().is_file());
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        assert!(home.data("appimages/fake-app.AppImage").is_file());
+        assert_eq!(fs::read_dir(home.root.join("tmp")).unwrap().count(), 0);
+        home.ok_remove("fake-app");
+    }
+}
+
+/// An archive with no AppImage, or more than one, is refused the way an
+/// install refuses it, and nothing changes.
+#[test]
+fn an_archive_without_exactly_one_appimage_adopts_nothing() {
+    let _serial = serial();
+    let home = Home::new();
+    let app = home.packable("fakeapp");
+    let none = home.file("home/Downloads/none.zip", &pack::zip(&[("readme.txt", b"x")]));
+    let two = home.file("home/Downloads/two.zip", &pack::zip(&[("a", &app), ("b/b", &app)]));
+    let before = home.snapshot();
+
+    let output = home.run(&["--yes", "adopt", none.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("it holds no AppImage, only readme.txt"),
+        "{}",
+        stderr(&output)
+    );
+    let output = home.run(&["--yes", "adopt", two.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("it holds 2 AppImages, and appimg takes exactly one: a, b/b"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(home.snapshot(), before);
+}
+
+/// `--asset` follows the update source the adoption ends up with, the way
+/// an install keeps it: the one on the command line, or the one the
+/// AppStream metadata suggests once `--yes` takes it. A pattern that is
+/// none is refused before the metadata is read, one with no GitHub source
+/// to keep it with once the metadata had its say, and nothing changes.
+#[test]
+fn adopt_keeps_the_asset_pattern_with_the_update_source_or_refuses_it() {
+    let _serial = serial();
+    let urls = "<url type=\"vcs-browser\">https://github.com/fake/app</url>";
+    let home = Home::new();
+    // The stand-in for `unsquashfs` leaves a mark when it reads anything.
+    let read = home.root.join("home/read");
+    let unsquashfs = home.root.join("tools/unsquashfs");
+    let script = fs::read_to_string(&unsquashfs).unwrap();
+    fs::write(&unsquashfs, script.replacen("\n", "\ntouch \"$HOME/read\"\n", 1)).unwrap();
+    let file = home.appimage("home/Applications", "Fake.AppImage", None);
+    let before = home.snapshot();
+
+    let output = home.run(&[
+        "--yes",
+        "adopt",
+        file.to_str().unwrap(),
+        "--update-source",
+        "github:fake/app",
+        "--asset",
+        "Fake App.zip",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("is no asset pattern"), "{}", stderr(&output));
+    assert!(!read.exists(), "the metadata was read before the refusal");
+    assert_eq!(home.snapshot(), before);
+
+    let output = home.run(&["--yes", "adopt", file.to_str().unwrap(), "--asset", "Fake-*.zip"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("--asset picks a file out of a GitHub release"),
+        "{}",
+        stderr(&output)
+    );
+    fs::remove_file(&read).unwrap();
+    assert_eq!(home.snapshot(), before);
+
+    // A dry run shows the pattern in the entry it would write.
+    let output = home.run(&[
+        "adopt",
+        "--dry-run",
+        file.to_str().unwrap(),
+        "--update-source",
+        "github:fake/app",
+        "--asset",
+        "Fake-*.zip",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("\nX-AppImg-UpdateSource=github:fake/app#Fake-*.zip\n"),
+        "{}",
+        stdout(&output)
+    );
+    fs::remove_file(&read).unwrap();
+    assert_eq!(home.snapshot(), before);
+
+    let output = home.run(&[
+        "--yes",
+        "adopt",
+        file.to_str().unwrap(),
+        "--update-source",
+        "github:fake/app",
+        "--asset",
+        "Fake-*.zip",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let entry = fs::read_to_string(home.data("applications/fake-app.desktop")).unwrap();
+    assert!(entry.contains("\nX-AppImg-UpdateSource=github:fake/app#Fake-*.zip\n"), "{entry}");
+
+    // With the source the AppStream metadata suggests, taken with --yes.
+    let home = Home::new();
+    let file = home.appimage("home/Applications", "Fake.AppImage", Some(urls));
+    let output = home.run(&["--yes", "adopt", file.to_str().unwrap(), "--asset", "Fake-*.zip"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let entry = fs::read_to_string(home.data("applications/fake-app.desktop")).unwrap();
+    assert!(entry.contains("\nX-AppImg-UpdateSource=github:fake/app#Fake-*.zip\n"), "{entry}");
 }

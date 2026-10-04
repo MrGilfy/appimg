@@ -8,7 +8,7 @@ use crate::fs_util::{self, MODE_EXEC};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
-use crate::{caches, download, elf, slug, stamp, update};
+use crate::{archive, caches, download, elf, slug, stamp, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
 const DEFAULT_CATEGORY: &str = "Utility";
@@ -99,6 +99,30 @@ impl InstallRequest {
 /// gets, see [`elf::check_whole`].
 pub fn check_file(path: &Path) -> Result<()> {
     elf::check_whole(path).map_err(|unfit| Error::Unfit { path: path.to_path_buf(), unfit })
+}
+
+/// Takes the one AppImage out of an archive on disk and writes it into
+/// `dir`, see [`archive::extract_appimage`], then gives it the checks a
+/// download gets. It is named after the archive, without the ending that
+/// makes it one, so the name and version a file name gives come from the
+/// file the user picked, never from anything inside it. Returns where it is
+/// and what the archive called it. A file that fails the checks is gone
+/// again before the error, which names the archive, comes back.
+pub fn unpack_archive(archive: &Path, dir: &Path) -> Result<(PathBuf, archive::Extracted)> {
+    let name = archive.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = archive::strip_archive_suffix(&name).unwrap_or(&name);
+    // Room for the ending within the 255 bytes a file name has.
+    let stem = if stem.is_empty() || stem.len() > 200 { "unpacked" } else { stem };
+    let dest = dir.join(format!("{stem}.AppImage"));
+    let extracted = archive::extract_appimage(archive, &dest)?;
+    if let Err(unfit) = elf::check_whole(&dest) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(Error::Archive {
+            archive: archive.display().to_string(),
+            reason: format!("{}: {unfit}", extracted.entry),
+        });
+    }
+    Ok((dest, extracted))
 }
 
 /// Checks an AppImage downloaded from `url` against the digest its GitHub
