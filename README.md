@@ -90,6 +90,19 @@ is no update, the check says so in a note. A server that says nothing about
 its files leaves it to the update, which downloads the file and keeps the
 installed one when it is the same.
 
+An application can be held at the version it has:
+
+    appimg hold app        update --all, the terminal interface and notifications pass it over
+    appimg unhold app      it updates like any other again
+
+Holding never hides an update. `update --check` still checks a held
+application and shows it as held next to what it found, and `list` and the
+terminal interface show what the last check of it found and when.
+`update --all` names the update it passes over. `appimg update app` asks
+before it updates a held application, and with `--yes` updates it and
+keeps the hold. An export carries the hold, and an import holds the
+application again.
+
 GitHub's API answers 60 requests an hour without a token, which checking a
 few applications more than once can use up. With `GH_TOKEN` or `GITHUB_TOKEN`
 set, appimg sends it as a bearer token to `api.github.com` over https, and to

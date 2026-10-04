@@ -8,6 +8,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `appimg hold <app>` holds an application at the version it has, and
+  `appimg unhold <app>` releases it; the hold is `X-AppImg-Hold` in its
+  desktop entry. Asking for the state it is in already says so and exits
+  with 3. `update --all`, the terminal interface's update of everything and
+  the notification timer pass a held application over and never count it
+  as failed: `update --all` still checks it and names an update it passes
+  over, or a check that failed, while the timer neither checks nor
+  announces it, and announces its update once it is released. `update
+  --check` shows it as held next to what the check found, and `--json`
+  gains a `held` field; an update that only a held application has leaves
+  the exit code at 3, nothing `update --all` would do. Each check of a held
+  application records what it found in `X-AppImg-HoldCheck`, so `list` and
+  the terminal interface, which ask no server, show whether the hold keeps
+  an update back and as of which day; `list --json` gains `held` and
+  `hold_check`. `appimg update <app>` on a held application asks before it
+  updates, `--yes` updates it, and either way the hold stays. In the
+  terminal interface `u` on a held application asks the same. An export
+  carries the hold as `held`, an export without it holds nothing, and an
+  import holds the application again without bringing it up to date
+  first. Installing over a held application, an older version that works
+  say, keeps the hold and says so, in a dry run too, and drops what a check
+  found about the file it replaced. `adopt` never replaces an application
+  appimg manages, held or not. (#29)
 - A URL update source can be a vendor's download link that redirects to
   the current version, such as LM Studio's, or a fixed name whose file
   changes, such as CurseForge's. A check follows the link with HEAD
@@ -47,6 +70,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
   update. (#25)
 
 ### Changed
+
+- Installing over an installed application keeps the update source it had
+  when the install would leave it to update manually otherwise, held or
+  not, and says so, in a dry run too. `--update-source`, the URL an install
+  downloads from and update information the new AppImage embeds still come
+  first. A kept source also comes before the one AppStream metadata
+  suggests, which is then not offered.
 
 - The AppImage taken out of an archive on disk is named after the archive
   until it is installed, so the name and version a file name gives come

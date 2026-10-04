@@ -1,7 +1,8 @@
 use anyhow::Result;
+use appimg_core::hold::Checked;
 use appimg_core::json::escape;
 use appimg_core::list::{Health, InstalledApp};
-use appimg_core::{list, update, Paths};
+use appimg_core::{date, list, update, Paths};
 
 use crate::cli::ListArgs;
 use crate::ui::{human_size, table, Ui};
@@ -42,10 +43,13 @@ fn first_category(app: &InstalledApp) -> String {
 }
 
 fn describe_health(ui: &Ui, app: &InstalledApp) -> String {
-    match app.health {
-        Health::Ok => ui.dim(&update::source_for(app).describe()),
-        Health::MissingBinary => ui.bold("broken: binary missing"),
-        Health::Incomplete => ui.bold("broken: entry incomplete"),
+    match (app.health, &app.hold) {
+        // Held, and whether the last check found an update it keeps back.
+        (Health::Ok, Some(hold)) if hold.holds_back_an_update() => ui.accent(&hold.describe()),
+        (Health::Ok, Some(hold)) => ui.dim(&hold.describe()),
+        (Health::Ok, None) => ui.dim(&update::source_for(app).describe()),
+        (Health::MissingBinary, _) => ui.bold("broken: binary missing"),
+        (Health::Incomplete, _) => ui.bold("broken: entry incomplete"),
     }
 }
 
@@ -64,7 +68,8 @@ fn app_to_json(app: &InstalledApp) -> String {
             "\"version\":{version},\"categories\":[{categories}],\"source\":{source},",
             "\"update_info\":{update_info},\"installed_at\":{installed_at},",
             "\"appimage\":\"{appimage}\",\"desktop_entry\":\"{entry}\",",
-            "\"size_bytes\":{size},\"health\":\"{health}\",\"update_source\":\"{update_source}\"}}"
+            "\"size_bytes\":{size},\"health\":\"{health}\",\"update_source\":\"{update_source}\",",
+            "\"held\":{held},\"hold_check\":{hold_check}}}"
         ),
         slug = escape(&app.slug),
         name = escape(&app.name),
@@ -79,6 +84,22 @@ fn app_to_json(app: &InstalledApp) -> String {
         size = app.size_bytes.map(|s| s.to_string()).unwrap_or_else(|| "null".to_string()),
         health = health_name(app.health),
         update_source = escape(&update::source_for(app).describe()),
+        held = app.hold.is_some(),
+        hold_check = hold_check_to_json(app.hold.as_ref().and_then(|hold| hold.checked.as_ref())),
+    )
+}
+
+/// What the last check of a held application found, `null` when it is not
+/// held or was not checked since.
+fn hold_check_to_json(checked: Option<&Checked>) -> String {
+    let Some(checked) = checked else {
+        return "null".to_string();
+    };
+    format!(
+        "{{\"checked_at\":{at},\"found\":\"{found}\",\"latest_version\":{latest}}}",
+        at = optional(date::from_seconds(checked.at).as_deref()),
+        found = checked.found.word(),
+        latest = optional(checked.latest.as_deref()),
     )
 }
 

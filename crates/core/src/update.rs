@@ -10,7 +10,7 @@ use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
 use crate::remote::{self, Remote};
-use crate::{archive, caches, date, icon, json, stamp, version, zsync};
+use crate::{archive, caches, date, hold, icon, json, stamp, version, zsync};
 
 const GITHUB_API: &str = "https://api.github.com";
 
@@ -97,6 +97,9 @@ pub struct UpdateStatus {
     /// Whether the check settled that there is nothing to update, so that a
     /// note is information and no reason to download anything.
     pub settled: bool,
+    /// Whether the application is held, see [`crate::hold`]. A held one is
+    /// checked like any other, it is only never updated unasked.
+    pub held: bool,
 }
 
 impl UpdateStatus {
@@ -439,7 +442,8 @@ fn github_page(url: &str) -> Option<GitHubPage> {
 
 /// Reports whether an update is available. Writes nothing but the checksum
 /// of the installed file into its entry, when a zsync check had to read the
-/// file because the entry held none that still fits, see [`stamp::sha1`].
+/// file because the entry held none that still fits, see [`stamp::sha1`],
+/// and for a held application what the check found, see [`hold`].
 pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
     let source = source_for(app);
     let current = app.version.clone();
@@ -453,6 +457,7 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
         source: source.clone(),
         note: None,
         settled: false,
+        held: app.hold.is_some(),
     };
 
     match &source {
@@ -536,6 +541,8 @@ pub fn check(app: &InstalledApp) -> Result<UpdateStatus> {
             };
         }
     }
+    // A held application keeps what the check found, for a listing to show.
+    hold::record(app, &status);
     Ok(status)
 }
 
@@ -873,6 +880,9 @@ fn finish(
     entry.set_optional(desktop_entry::KEY_RELEASE, from.release);
     stamp::record(&mut entry, target, sha1);
     remote::record_in(&mut entry, from.remote.as_ref());
+    // A hold stays, what a check found under it was about the file that
+    // was replaced.
+    entry.remove(desktop_entry::KEY_HOLD_CHECK);
     entry.write(&app.desktop_entry_path)?;
 
     caches::refresh(paths);
@@ -2240,6 +2250,7 @@ mod tests {
             desktop_entry_path,
             size_bytes: None,
             health: crate::list::Health::Ok,
+            hold: None,
         }
     }
 
@@ -3265,6 +3276,7 @@ mod tests {
             desktop_entry_path: PathBuf::from("/nowhere/app.desktop"),
             size_bytes: None,
             health: crate::list::Health::Ok,
+            hold: None,
         }
     }
 

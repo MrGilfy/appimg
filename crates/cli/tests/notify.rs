@@ -507,6 +507,44 @@ fn a_failed_check_goes_to_the_journal_and_shows_no_notification() {
     assert_eq!(home.notifications().len(), 2, "{:?}", home.notifications());
 }
 
+/// The timer passes a held application over: it is not checked, so a
+/// check that would fail fails nothing, and its update is announced once it
+/// is released, not before.
+#[test]
+fn the_timer_passes_a_held_app_over() {
+    let _serial = serial();
+    let server = Server::start();
+    let home = Home::new(&server, Notifier::NotifySend);
+    home.install("Github App", "r", "1.0.0", &[]);
+    home.install("Other App", "other", "1.0.0", &[]);
+    home.ok(&["notify", "enable"]);
+    home.ok(&["hold", "github-app"]);
+
+    // The server knows no release of o/r: checking it would fail the run.
+    server.release("other", "v2.0.0");
+    let run = home.run_service();
+    assert_eq!(run.status.code(), Some(0), "{}", stderr(&run));
+    assert!(stdout(&run).contains("Held, not checked: Github App."), "{}", stdout(&run));
+    let notifications = home.notifications();
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert_eq!(
+        notifications[0][2..4],
+        ["An AppImage update is available", "Other App 1.0.0 → 2.0.0"]
+    );
+
+    // Held with an update waiting: still nothing about it.
+    server.release("r", "v3.0.0");
+    assert_eq!(home.run_service().status.code(), Some(0));
+    assert_eq!(home.notifications().len(), 1, "{:?}", home.notifications());
+
+    // Released, its update is news.
+    home.ok(&["unhold", "github-app"]);
+    assert_eq!(home.run_service().status.code(), Some(0));
+    let notifications = home.notifications();
+    assert_eq!(notifications.len(), 2, "{notifications:?}");
+    assert_eq!(notifications[1][3], "Github App 1.0.0 → 3.0.0");
+}
+
 #[test]
 fn disable_stops_and_removes_both_units_and_the_record_of_announced_updates() {
     let _serial = serial();

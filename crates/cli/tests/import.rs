@@ -310,6 +310,7 @@ fn listed(slug: &str, name: &str, update_source: &str, origin: &str) -> Exported
         update_source: Some(update_source.to_string()),
         origin: Some(origin.to_string()),
         installed_version: None,
+        held: false,
     }
 }
 

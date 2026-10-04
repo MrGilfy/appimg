@@ -49,6 +49,8 @@ fn run(args: &Cli, ui: &Ui) -> anyhow::Result<Outcome> {
         Some(Command::UpdateSource(source_args)) => {
             commands::update_source::run(&paths, ui, source_args)
         }
+        Some(Command::Hold(hold_args)) => commands::hold::run(&paths, ui, hold_args, true),
+        Some(Command::Unhold(hold_args)) => commands::hold::run(&paths, ui, hold_args, false),
         Some(Command::Remove(remove_args)) => commands::remove::run(&paths, ui, remove_args),
         Some(Command::Edit(edit_args)) => commands::edit::run(&paths, ui, edit_args),
         Some(Command::Export(export_args)) => commands::export::run(&paths, ui, export_args),

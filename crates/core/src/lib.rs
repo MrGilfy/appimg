@@ -16,6 +16,7 @@ pub mod elf;
 pub mod error;
 pub mod export;
 pub mod fs_util;
+pub mod hold;
 pub mod icon;
 pub mod install;
 pub mod json;

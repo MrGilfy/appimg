@@ -572,6 +572,7 @@ mod tests {
             source: crate::update::UpdateSource::Manual,
             note: None,
             settled: false,
+            held: false,
         };
         let (one, two) = (status("One", Some("1.0"), Some("2.0")), status("Two", None, None));
 
@@ -603,6 +604,7 @@ mod tests {
             desktop_entry_path: PathBuf::new(),
             size_bytes: None,
             health: crate::list::Health::Ok,
+            hold: None,
         };
         let status = |slug: &str, latest: &str, available: bool| UpdateStatus {
             slug: slug.to_string(),
@@ -613,6 +615,7 @@ mod tests {
             source: crate::update::UpdateSource::Manual,
             note: None,
             settled: false,
+            held: false,
         };
         let names = |found: Vec<&UpdateStatus>| -> Vec<String> {
             found

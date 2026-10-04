@@ -41,7 +41,11 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     if request.name.trim().is_empty() {
         bail!("no name could be determined, pass --name");
     }
-    if args.entry.update_source.is_none() {
+    // Over an installed application, the update source it had is kept
+    // when nothing else names one, and that comes before a suggestion.
+    if args.entry.update_source.is_none()
+        && install::plan(paths, &request)?.kept_update_source.is_none()
+    {
         offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
     apply_asset(&mut request, &args.entry)?;
@@ -53,8 +57,11 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     }
 
     if plan.already_installed {
-        let question =
-            format!("{:?} is already installed as {:?}. Replace it?", request.name, plan.slug);
+        let held = if plan.keeps_hold { ", held" } else { "" };
+        let question = format!(
+            "{:?} is already installed as {:?}{held}. Replace it?",
+            request.name, plan.slug
+        );
         if !ui.confirm(&question, false)? {
             ui.info("Nothing was changed.");
             return Ok(Outcome::NothingToDo);
@@ -70,6 +77,12 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
         ui.bold(&request.name),
         ui.accent(&outcome.slug)
     ));
+    if outcome.held {
+        ui.info(&format!("  stays held, release it with: appimg unhold {}", outcome.slug));
+    }
+    if let Some(source) = &outcome.kept_update_source {
+        ui.info(&format!("  kept its update source {source}, --update-source sets another one"));
+    }
     ui.info(&format!("  binary  {}", outcome.appimage_path.display()));
     ui.info(&format!("  entry   {}", outcome.desktop_entry_path.display()));
     match outcome.icons.len() {
@@ -363,6 +376,12 @@ fn print_plan(ui: &Ui, plan: &install::InstallPlan) {
     ui.info(&format!("  entry   {}", plan.desktop_entry_path.display()));
     if plan.already_installed {
         ui.warn("a version of this application is already installed and would be replaced");
+    }
+    if plan.keeps_hold {
+        ui.info("  it is held, and stays held");
+    }
+    if let Some(source) = &plan.kept_update_source {
+        ui.info(&format!("  keeps its update source {source}"));
     }
     ui.info("");
     ui.info(&ui.dim(&plan.desktop_entry.to_string()));

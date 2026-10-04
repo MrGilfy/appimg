@@ -7,7 +7,7 @@ use appimg_core::export::{self, ExportedApp, Fetch};
 use appimg_core::install::InstallRequest;
 use appimg_core::remote::Remote;
 use appimg_core::update::{self, ReleaseAsset, UpdateSource};
-use appimg_core::{digest, install, list, metadata, Paths};
+use appimg_core::{digest, hold, install, list, metadata, Paths};
 
 use crate::cli::ImportArgs;
 use crate::commands::install::download_appimage;
@@ -47,7 +47,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &ImportArgs) -> Result<Outcome> {
             continue;
         }
         if args.dry_run {
-            ui.info(&format!("  {label}: {}", describe(&fetch)));
+            ui.info(&format!("  {label}: {}", describe(&fetch, app.held)));
             imported += 1;
             continue;
         }
@@ -144,6 +144,11 @@ fn import_one(paths: &Paths, ui: &Ui, app: &ExportedApp, fetch: &Fetch) -> Resul
             let (file, _scratch, remote) =
                 download_appimage(ui, url, &|file| install::verify_download(file, url))?;
             let version = install_file(paths, ui, app, &file, url, None, Some(remote))?;
+            // Held where it came from, it stays at what it was installed
+            // from here too.
+            if app.held {
+                return Ok(Imported::Current);
+            }
             match bring_up_to_date(paths, ui, app, url) {
                 Ok(()) => Ok(Imported::Current),
                 Err(error) => Ok(Imported::NotUpdated(format!(
@@ -214,6 +219,10 @@ fn install_file(
         ui.accent(&outcome.slug),
         request.version.as_deref().unwrap_or("unknown")
     ));
+    if app.held {
+        hold::set(&list::find(paths, &outcome.slug)?, true)?;
+        ui.info("  held, as it was");
+    }
     for warning in &outcome.validation_warnings {
         ui.warn(warning);
     }
@@ -236,8 +245,16 @@ fn bring_up_to_date(paths: &Paths, ui: &Ui, app: &ExportedApp, url: &str) -> Res
     }
 }
 
-/// What the dry run says about where an application would come from.
-fn describe(fetch: &Fetch) -> String {
+/// What the dry run says about where an application would come from, and
+/// that it is held again when it was.
+fn describe(fetch: &Fetch, held: bool) -> String {
+    if held {
+        let from = match fetch {
+            Fetch::Origin(url) => format!("{url}, which it was installed from"),
+            other => describe(other, false),
+        };
+        return format!("{from}, and held");
+    }
     match fetch {
         Fetch::Release { source, asset_hint: Some(hint) } => {
             format!("the newest AppImage of {source}, the one like {hint}")

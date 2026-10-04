@@ -22,8 +22,14 @@ pub fn run(paths: &Paths, ui: &Ui, args: &UpdateArgs) -> Result<Outcome> {
     let mut updated = Vec::new();
     let mut failed = 0;
     let mut manual = 0;
+    let mut held = 0;
 
     for app in &targets {
+        if app.hold.is_some() && args.all {
+            pass_over(ui, app);
+            held += 1;
+            continue;
+        }
         if update::source_for(app) == UpdateSource::Manual {
             // Asked for by name, nothing to update from is the answer.
             if !args.all {
@@ -36,6 +42,10 @@ pub fn run(paths: &Paths, ui: &Ui, args: &UpdateArgs) -> Result<Outcome> {
             ));
             manual += 1;
             continue;
+        }
+        // Asked for by name, the one target there is.
+        if app.hold.is_some() {
+            return update_held(paths, ui, app);
         }
         match update_one(paths, ui, app) {
             Ok(Some(outcome)) => updated.push(outcome),
@@ -51,13 +61,52 @@ pub fn run(paths: &Paths, ui: &Ui, args: &UpdateArgs) -> Result<Outcome> {
         bail!("{failed} of {} updates failed", targets.len());
     }
     if updated.is_empty() {
-        if manual > 0 {
-            ui.info("Everything with an update source is up to date.");
-        } else {
-            ui.info("Everything is up to date.");
+        match (manual > 0, held > 0) {
+            (_, true) => ui.info("Everything else is up to date."),
+            (true, false) => ui.info("Everything with an update source is up to date."),
+            (false, false) => ui.info("Everything is up to date."),
         }
         return Ok(Outcome::NothingToDo);
     }
+    Ok(Outcome::Done)
+}
+
+/// `update --all` passes a held application over. It is checked all the
+/// same, so the hold never hides an update, and a check that fails fails
+/// nothing: nothing was going to be updated.
+fn pass_over(ui: &Ui, app: &InstalledApp) {
+    let found = match update::check(app) {
+        Ok(status) if status.available => format!(
+            ": {} is available, appimg update {} takes it anyway",
+            status.latest_version.as_deref().unwrap_or("an update"),
+            app.slug
+        ),
+        Ok(status) if status.nothing_to_do() => ", it is up to date".to_string(),
+        Ok(status) => format!(", {}", status.note.as_deref().unwrap_or("nothing to tell")),
+        Err(error) => format!(", its check failed: {error:#}"),
+    };
+    ui.info(&format!("{} is held, skipped{found}.", app.name));
+}
+
+/// Updating a held application by name: only when there is something to
+/// update, and only once the user said so, `--yes` included. The hold stays.
+fn update_held(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<Outcome> {
+    let status = update::check(app).ok();
+    if up_to_date(ui, app, status.as_ref()) {
+        return Ok(Outcome::NothingToDo);
+    }
+    let at = app.version.as_deref().map(|version| format!(" at {version}")).unwrap_or_default();
+    let to = status
+        .as_ref()
+        .and_then(|status| status.latest_version.as_deref())
+        .map(|latest| format!(" to {latest}"))
+        .unwrap_or_default();
+    if !ui.confirm(&format!("{} is held{at}. Update it{to} anyway?", app.name), false)? {
+        ui.info(&format!("Nothing was changed, {} stays held.", app.name));
+        return Ok(Outcome::NothingToDo);
+    }
+    apply(paths, ui, app)?;
+    ui.info(&format!("  {} stays held, release it with: appimg unhold {}", app.name, app.slug));
     Ok(Outcome::Done)
 }
 
@@ -101,21 +150,34 @@ fn check(ui: &Ui, apps: &[InstalledApp], json: bool) -> Result<Outcome> {
                     status.current_version.clone().unwrap_or_else(|| "-".to_string()),
                     status.latest_version.clone().unwrap_or_else(|| "-".to_string()),
                     status.source.describe(),
-                    if status.available {
-                        ui.accent("update available")
-                    } else {
-                        ui.dim(status.note.as_deref().unwrap_or("up to date"))
-                    },
+                    describe_status(ui, status),
                 ]
             })
             .collect();
         ui.info(&table(ui, &["NAME", "CURRENT", "LATEST", "SOURCE", "STATUS"], &rows));
     }
 
-    if statuses.iter().any(|status| status.available) {
+    // What `update --all` would do: a held application it passes over.
+    if statuses.iter().any(|status| status.available && !status.held) {
         Ok(Outcome::Done)
     } else {
         Ok(Outcome::NothingToDo)
+    }
+}
+
+/// The STATUS column of `update --check`. A held application says so,
+/// next to what its check found.
+fn describe_status(ui: &Ui, status: &UpdateStatus) -> String {
+    let found = if status.available {
+        "update available"
+    } else {
+        status.note.as_deref().unwrap_or("up to date")
+    };
+    match (status.held, status.available) {
+        (true, true) => ui.accent(&format!("held, {found}")),
+        (true, false) => ui.dim(&format!("held, {found}")),
+        (false, true) => ui.accent(found),
+        (false, false) => ui.dim(found),
     }
 }
 
@@ -127,16 +189,27 @@ pub(crate) fn update_one(
 ) -> Result<Option<UpdateOutcome>> {
     // A source that cannot be checked can still be re-downloaded.
     let status = update::check(app).ok();
-    if let Some(status) = &status {
-        if status.nothing_to_do() {
-            match &status.note {
-                Some(note) => ui.info(&format!("{} is up to date: {note}.", app.name)),
-                None => ui.info(&format!("{} is up to date.", app.name)),
-            }
-            return Ok(None);
-        }
+    if up_to_date(ui, app, status.as_ref()) {
+        return Ok(None);
     }
+    apply(paths, ui, app).map(Some)
+}
 
+/// Whether a check found nothing to update, which it then says.
+fn up_to_date(ui: &Ui, app: &InstalledApp, status: Option<&UpdateStatus>) -> bool {
+    let Some(status) = status.filter(|status| status.nothing_to_do()) else {
+        return false;
+    };
+    match &status.note {
+        Some(note) => ui.info(&format!("{} is up to date: {note}.", app.name)),
+        None => ui.info(&format!("{} is up to date.", app.name)),
+    }
+    true
+}
+
+/// Updates one application, whatever a check said, and confirms the update
+/// once the new version runs.
+fn apply(paths: &Paths, ui: &Ui, app: &InstalledApp) -> Result<UpdateOutcome> {
     ui.info(&format!("Updating {}...", ui.bold(&app.name)));
     let mut progress = ui.progress();
     let outcome =
@@ -162,7 +235,7 @@ pub(crate) fn update_one(
     if let Some(verified) = &outcome.digest {
         ui.info(&format!("  {}", ui.dim(&verified.describe())));
     }
-    Ok(Some(outcome))
+    Ok(outcome)
 }
 
 fn statuses_to_json(statuses: &[UpdateStatus]) -> String {
@@ -173,7 +246,7 @@ fn statuses_to_json(statuses: &[UpdateStatus]) -> String {
                 concat!(
                     "{{\"slug\":\"{slug}\",\"name\":\"{name}\",\"current_version\":{current},",
                     "\"latest_version\":{latest},\"available\":{available},",
-                    "\"source\":\"{source}\",\"note\":{note}}}"
+                    "\"source\":\"{source}\",\"note\":{note},\"held\":{held}}}"
                 ),
                 slug = escape(&status.slug),
                 name = escape(&status.name),
@@ -182,6 +255,7 @@ fn statuses_to_json(statuses: &[UpdateStatus]) -> String {
                 available = status.available,
                 source = escape(&status.source.describe()),
                 note = optional(status.note.as_deref()),
+                held = status.held,
             )
         })
         .collect();

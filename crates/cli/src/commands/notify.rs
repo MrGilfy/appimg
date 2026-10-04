@@ -168,7 +168,15 @@ fn test(ui: &Ui) -> Result<Outcome> {
 /// to the journal. A failed check never shows a notification of its own,
 /// and fails the run, so `status` can tell.
 fn check(paths: &Paths, ui: &Ui) -> Result<Outcome> {
-    let apps = list::list(paths)?;
+    // A held application is not checked, nor announced: what was announced
+    // about it is forgotten, so its update is news again once it is
+    // released.
+    let (held, apps): (Vec<_>, Vec<_>) =
+        list::list(paths)?.into_iter().partition(|app| app.hold.is_some());
+    if !held.is_empty() {
+        let names: Vec<&str> = held.iter().map(|app| app.name.as_str()).collect();
+        ui.info(&format!("Held, not checked: {}.", names.join(", ")));
+    }
     let (statuses, failed) = update::statuses(ui, &apps);
     let available: Vec<&UpdateStatus> = statuses.iter().filter(|s| s.available).collect();
     let mut announced = Announced::load(paths)?;

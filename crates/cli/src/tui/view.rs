@@ -95,10 +95,11 @@ fn list_block(app: &App) -> Block<'static> {
 }
 
 fn status_of(app: &InstalledApp) -> String {
-    match app.health {
-        Health::Ok => update::source_for(app).describe(),
-        Health::MissingBinary => "broken: no binary".to_string(),
-        Health::Incomplete => "broken: entry".to_string(),
+    match (app.health, &app.hold) {
+        (Health::Ok, Some(hold)) => hold.describe(),
+        (Health::Ok, None) => update::source_for(app).describe(),
+        (Health::MissingBinary, _) => "broken: no binary".to_string(),
+        (Health::Incomplete, _) => "broken: entry".to_string(),
     }
 }
 
@@ -289,6 +290,10 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         field_line("Categories", &selected.categories.join(", ")),
         field_line("Origin", selected.origin.as_deref().unwrap_or("-")),
         field_line("Update from", &update::source_for(selected).describe()),
+        field_line(
+            "Hold",
+            &selected.hold.as_ref().map_or_else(|| "not held".to_string(), |hold| hold.describe()),
+        ),
         field_line("Installed", selected.installed_at.as_deref().unwrap_or("-")),
         field_line("Binary", &selected.appimage_path.to_string_lossy()),
         field_line("Entry", &selected.desktop_entry_path.to_string_lossy()),
@@ -369,5 +374,48 @@ fn centered(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use appimg_core::hold::{Checked, Found, Hold};
+
+    use super::*;
+
+    fn app(hold: Option<Hold>) -> InstalledApp {
+        InstalledApp {
+            slug: "app".to_string(),
+            name: "App".to_string(),
+            comment: None,
+            categories: Vec::new(),
+            version: Some("1.0.0".to_string()),
+            origin: None,
+            update_info: None,
+            update_source: Some("github:o/r".to_string()),
+            release: None,
+            installed_at: None,
+            appimage_path: PathBuf::new(),
+            desktop_entry_path: PathBuf::new(),
+            size_bytes: None,
+            health: Health::Ok,
+            hold,
+        }
+    }
+
+    /// The list shows a held application as held, with what its last check
+    /// found, so the hold never hides an update.
+    #[test]
+    fn a_held_app_shows_the_hold_and_the_update_it_keeps_back() {
+        assert_eq!(status_of(&app(None)), "github:o/r");
+        let checked =
+            Checked { at: 1_791_158_400, found: Found::Available, latest: Some("2.0.0".into()) };
+        assert_eq!(
+            status_of(&app(Some(Hold { checked: Some(checked) }))),
+            "held, 2.0.0 available (checked 2026-10-05)"
+        );
+        assert_eq!(status_of(&app(Some(Hold { checked: None }))), "held, not checked yet");
     }
 }

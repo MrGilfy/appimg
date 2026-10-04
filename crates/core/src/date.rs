@@ -64,6 +64,25 @@ pub fn http_date_seconds(text: &str) -> Option<i64> {
     })
 }
 
+/// The day of a time in seconds since the epoch, `2026-10-05`, after
+/// Howard Hinnant's `civil_from_days`. `None` before 1970.
+pub fn from_seconds(seconds: i64) -> Option<String> {
+    if seconds < 0 {
+        return None;
+    }
+    let days = seconds / 86_400 + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 { month_from_march + 3 } else { month_from_march - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
 /// `01:52:51` as seconds since midnight.
 fn time_of_day(field: &str) -> Option<i64> {
     let mut parts = field.split(':');
@@ -144,6 +163,15 @@ mod tests {
         assert_eq!(from_http_date("1 Aug 2026").as_deref(), Some("2026-08-01"));
         assert_eq!(from_http_date("no date in here"), None);
         assert_eq!(from_http_date(""), None);
+    }
+
+    #[test]
+    fn seconds_since_the_epoch_to_a_day() {
+        assert_eq!(from_seconds(0).as_deref(), Some("1970-01-01"));
+        assert_eq!(from_seconds(1_789_782_771).as_deref(), Some("2026-09-19"));
+        assert_eq!(from_seconds(951_868_800 - 1).as_deref(), Some("2000-02-29"));
+        assert_eq!(from_seconds(951_868_800).as_deref(), Some("2000-03-01"));
+        assert_eq!(from_seconds(-1), None);
     }
 
     #[test]

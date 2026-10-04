@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::desktop_entry::{self, DesktopEntry};
 use crate::error::{Error, Result};
 use crate::fs_util;
+use crate::hold::Hold;
 use crate::paths::Paths;
 use crate::version;
 
@@ -38,6 +39,8 @@ pub struct InstalledApp {
     pub desktop_entry_path: PathBuf,
     pub size_bytes: Option<u64>,
     pub health: Health,
+    /// `Some` while it is held at the version it has, see [`crate::hold`].
+    pub hold: Option<Hold>,
 }
 
 impl InstalledApp {
@@ -129,6 +132,7 @@ fn build_app(paths: &Paths, entry: &DesktopEntry, desktop_entry_path: PathBuf) -
         release: entry.get(desktop_entry::KEY_RELEASE).map(str::to_string),
         installed_at: entry.get(desktop_entry::KEY_INSTALLED_AT).map(str::to_string),
         size_bytes: fs_util::file_size(&appimage_path),
+        hold: Hold::of(entry),
         appimage_path,
         desktop_entry_path,
         health,

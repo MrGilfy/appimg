@@ -34,6 +34,14 @@ pub const KEY_SHA1: &str = "X-AppImg-SHA1";
 /// source compares it with what the server says now, see
 /// [`crate::remote`].
 pub const KEY_REMOTE: &str = "X-AppImg-Remote";
+/// `true` while the application is held at the version it has: `update
+/// --all`, the terminal interface and the notification timer pass it over,
+/// see [`crate::hold`]. Absent otherwise.
+pub const KEY_HOLD: &str = "X-AppImg-Hold";
+/// What the last check of a held application found, so that a listing,
+/// which asks no server, can still say whether the hold keeps an update
+/// back: `<seconds> <available|current|unknown> <latest version|->`.
+pub const KEY_HOLD_CHECK: &str = "X-AppImg-HoldCheck";
 
 /// The freedesktop main categories. A desktop entry needs at least one of
 /// them, everything else is an additional category we do not offer.

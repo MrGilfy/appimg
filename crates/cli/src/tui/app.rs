@@ -170,7 +170,15 @@ impl App {
             KeyCode::Char('u') => {
                 if let Some(app) = self.selected_app() {
                     let (slug, name) = (app.slug.clone(), app.name.clone());
-                    self.schedule(Action::UpdateOne(slug), &format!("Updating {name}..."));
+                    if app.hold.is_some() {
+                        // Held: only once the user said so, and it stays held.
+                        self.mode = Mode::Confirm {
+                            question: format!("{name} is held. Update it anyway? It stays held."),
+                            action: Box::new(Action::UpdateOne(slug)),
+                        };
+                    } else {
+                        self.schedule(Action::UpdateOne(slug), &format!("Updating {name}..."));
+                    }
                 }
             }
             KeyCode::Char('U') => {
@@ -385,6 +393,12 @@ impl App {
 
         let what = if outcome.replaced { "Replaced" } else { "Installed" };
         let mut message = format!("{what} {} ({} icons).", outcome.slug, outcome.icons.len());
+        if outcome.held {
+            message.push_str(" It stays held.");
+        }
+        if let Some(source) = &outcome.kept_update_source {
+            message.push_str(&format!(" Kept its update source {source}."));
+        }
         if let Some(warning) = outcome.validation_warnings.first() {
             message.push_str(&format!(" desktop-file-validate: {warning}"));
         }
@@ -404,9 +418,10 @@ impl App {
                 } else {
                     update::confirm(&self.paths, slug)?;
                     format!(
-                        "Updated {} to {}.",
+                        "Updated {} to {}.{}",
                         app.name,
-                        outcome.to_version.as_deref().unwrap_or("the latest version")
+                        outcome.to_version.as_deref().unwrap_or("the latest version"),
+                        if app.hold.is_some() { " It stays held." } else { "" }
                     )
                 }
             }
@@ -426,8 +441,16 @@ impl App {
         let mut updated = 0;
         let mut failed = 0;
         let mut manual = 0;
+        let mut held = 0;
 
         for app in &apps {
+            // Passed over, and never a failure. Its check still runs, so
+            // the list shows whether the hold keeps an update back.
+            if app.hold.is_some() {
+                let _ = update::check(app);
+                held += 1;
+                continue;
+            }
             // Nothing to update from is not a failure.
             if update::source_for(app) == UpdateSource::Manual {
                 manual += 1;
@@ -447,11 +470,16 @@ impl App {
         }
 
         self.reload()?;
-        self.status = Some(match (updated, failed) {
+        let summary = match (updated, failed) {
+            (0, 0) if held > 0 => "Everything else is up to date.".to_string(),
             (0, 0) if manual > 0 => "Everything with an update source is up to date.".to_string(),
             (0, 0) => "Everything is up to date.".to_string(),
             (updated, 0) => format!("Updated {updated} applications."),
             (updated, failed) => format!("Updated {updated}, {failed} failed."),
+        };
+        self.status = Some(match held {
+            0 => summary,
+            held => format!("{summary} {held} held, skipped."),
         });
         Ok(())
     }
@@ -587,5 +615,70 @@ mod tests {
             "{error:#}"
         );
         assert!(matches!(app.mode, Mode::List));
+    }
+
+    /// An installed application as the entry and file appimg writes,
+    /// updating from `source`, held or not.
+    fn installed(paths: &Paths, slug: &str, source: &str, held: bool) -> Vec<u8> {
+        let bytes = format!("\x7fELF {slug}").into_bytes();
+        fs::write(paths.appimage_path(slug), &bytes).unwrap();
+        let hold = if held { "X-AppImg-Hold=true\n" } else { "" };
+        fs::write(
+            paths.desktop_entry_path(slug),
+            format!(
+                "[Desktop Entry]\nType=Application\nName={slug}\nExec=x\nX-AppImg-Managed=true\n\
+                 X-AppImg-Slug={slug}\nX-AppImg-Version=1.0.0\nX-AppImg-UpdateSource={source}\n{hold}"
+            ),
+        )
+        .unwrap();
+        bytes
+    }
+
+    fn press(app: &mut App, key: char) {
+        app.on_key(KeyEvent::from(KeyCode::Char(key)));
+    }
+
+    /// Updating everything passes a held application over, and a check of
+    /// it that fails, which nothing here can reach, is no failure.
+    #[test]
+    fn updating_everything_passes_a_held_app_over() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let held = installed(&paths, "held", "http://127.0.0.1:1/App.AppImage", true);
+        installed(&paths, "manual", "manual", false);
+
+        let mut app = App::new(paths.clone()).unwrap();
+        app.run_action(Action::UpdateAll).unwrap();
+        assert_eq!(app.status.as_deref(), Some("Everything else is up to date. 1 held, skipped."));
+        assert_eq!(fs::read(paths.appimage_path("held")).unwrap(), held);
+    }
+
+    /// Updating a held application asks first, and says it stays held.
+    #[test]
+    fn updating_a_held_app_asks_first() {
+        let dir = tempfile::Builder::new().prefix("appimg-test-").tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        installed(&paths, "held", "manual", true);
+        installed(&paths, "plain", "manual", false);
+
+        let mut app = App::new(paths).unwrap();
+        app.select_slug("held");
+        press(&mut app, 'u');
+        let Mode::Confirm { question, action } = &app.mode else {
+            panic!("no question asked");
+        };
+        assert_eq!(question, "held is held. Update it anyway? It stays held.");
+        assert!(matches!(**action, Action::UpdateOne(ref slug) if slug == "held"));
+        assert!(app.take_pending().is_none());
+
+        // No answers nothing, and updates nothing.
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::List));
+        assert!(app.take_pending().is_none());
+
+        app.select_slug("plain");
+        press(&mut app, 'u');
+        assert!(matches!(app.mode, Mode::List));
+        assert!(matches!(app.take_pending(), Some(Action::UpdateOne(slug)) if slug == "plain"));
     }
 }

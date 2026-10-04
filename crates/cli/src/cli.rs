@@ -41,6 +41,12 @@ pub enum Command {
     Update(UpdateArgs),
     /// Show, set or clear where an installed AppImage updates from.
     UpdateSource(UpdateSourceArgs),
+    /// Hold an installed AppImage at the version it has: update --all, the
+    /// terminal interface and update notifications pass it over, and
+    /// updating it by name asks first.
+    Hold(HoldArgs),
+    /// Release a held AppImage, so that it updates like any other again.
+    Unhold(HoldArgs),
     /// Remove an installed AppImage.
     Remove(RemoveArgs),
     /// Change the desktop entry of an installed AppImage in $EDITOR.
@@ -202,6 +208,12 @@ pub struct UpdateSourceArgs {
     /// one. Setting a source without it drops the pattern.
     #[arg(long, value_name = "PATTERN", conflicts_with = "clear")]
     pub asset: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct HoldArgs {
+    /// Name or slug of the application.
+    pub name: String,
 }
 
 #[derive(Debug, Args)]

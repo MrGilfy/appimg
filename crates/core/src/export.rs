@@ -16,7 +16,8 @@
 //!       "terminal": false,
 //!       "update_source": "github:KDE/krita",
 //!       "origin": "/home/u/Downloads/krita-5.2.6-x86_64.AppImage",
-//!       "installed_version": "5.2.6"
+//!       "installed_version": "5.2.6",
+//!       "held": false
 //!     }
 //!   ]
 //! }
@@ -49,6 +50,10 @@ pub struct ExportedApp {
     pub origin: Option<String>,
     /// For information only: an import installs whatever is current.
     pub installed_version: Option<String>,
+    /// Whether it is held, see [`crate::hold`]. An import holds it again,
+    /// and does not bring it up to date first. Absent from an export
+    /// written before there were holds, which held nothing.
+    pub held: bool,
 }
 
 /// Where an import gets an application's AppImage from.
@@ -110,6 +115,7 @@ pub fn collect(paths: &Paths) -> Result<Vec<ExportedApp>> {
             update_source: app.update_source,
             origin: app.origin,
             installed_version: app.version,
+            held: app.hold.is_some(),
         });
     }
     Ok(apps)
@@ -130,6 +136,7 @@ pub fn to_json(apps: &[ExportedApp]) -> String {
             ("update_source", optional(app.update_source.as_deref())),
             ("origin", optional(app.origin.as_deref())),
             ("installed_version", optional(app.installed_version.as_deref())),
+            ("held", app.held.to_string()),
         ];
         let fields: Vec<String> =
             fields.iter().map(|(key, value)| format!("      \"{key}\": {value}")).collect();
@@ -179,6 +186,7 @@ fn read_app(object: &str, index: usize) -> Result<ExportedApp> {
         update_source: json::string_field(object, "update_source"),
         origin: json::string_field(object, "origin"),
         installed_version: json::string_field(object, "installed_version"),
+        held: json::bool_field(object, "held").unwrap_or(false),
         slug,
         name,
     })
@@ -223,6 +231,7 @@ mod tests {
             update_source: Some("github:o/r".to_string()),
             origin: Some("/home/u/Fake_App-1.0.AppImage".to_string()),
             installed_version: Some("1.0".to_string()),
+            held: true,
         }
     }
 
@@ -236,11 +245,20 @@ mod tests {
             update_source: None,
             origin: None,
             installed_version: None,
+            held: false,
             ..app("bare")
         };
         let apps = vec![app("fake-app"), bare];
         assert_eq!(from_json(&to_json(&apps)).unwrap(), apps);
         assert_eq!(from_json(&to_json(&[])).unwrap(), Vec::new());
+    }
+
+    /// An export written before there were holds held nothing.
+    #[test]
+    fn an_export_without_holds_holds_nothing() {
+        let text = to_json(&[app("fake-app")]).replace(",\n      \"held\": true", "");
+        assert!(!text.contains("held"), "{text}");
+        assert!(!from_json(&text).unwrap()[0].held);
     }
 
     #[test]

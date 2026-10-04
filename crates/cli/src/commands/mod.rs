@@ -3,6 +3,7 @@ pub mod completions;
 pub mod doctor;
 pub mod edit;
 pub mod export;
+pub mod hold;
 pub mod import;
 pub mod install;
 pub mod list;

@@ -5,6 +5,7 @@ use crate::desktop_entry::{self, DesktopEntry};
 use crate::digest::{self, Verified};
 use crate::error::{Error, Result};
 use crate::fs_util::{self, MODE_EXEC};
+use crate::hold::{self, Hold};
 use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
@@ -173,6 +174,10 @@ pub struct InstallOutcome {
     pub icons: Vec<PathBuf>,
     pub validation_warnings: Vec<String>,
     pub replaced: bool,
+    /// Whether it replaced a held application, whose hold it kept.
+    pub held: bool,
+    /// The update source it kept from the application it replaced.
+    pub kept_update_source: Option<String>,
 }
 
 /// Everything an installation would write, without writing it.
@@ -183,6 +188,14 @@ pub struct InstallPlan {
     pub desktop_entry_path: PathBuf,
     pub desktop_entry: DesktopEntry,
     pub already_installed: bool,
+    /// Whether the application it replaces is held. The hold stays: holding
+    /// an application and installing an older version over it is what a
+    /// hold is for.
+    pub keeps_hold: bool,
+    /// The update source of the application it replaces, which it keeps
+    /// because it would update manually otherwise, see
+    /// [`update_source_to_keep`].
+    pub kept_update_source: Option<String>,
     /// What [`InstallRequest::remote`] says, recorded with the checksum of
     /// the installed file once it is in place.
     pub remote: Option<Remote>,
@@ -200,9 +213,22 @@ pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
     let desktop_entry_path = paths.desktop_entry_path(&slug);
     let categories = effective_categories(request)?;
     let icon_field = planned_icon_field(request, &slug);
+    let mut desktop_entry = build_entry(request, &slug, &appimage_path, &categories, &icon_field);
+    let replaced = DesktopEntry::read(&desktop_entry_path).ok().filter(DesktopEntry::is_managed);
+    let keeps_hold = replaced.as_ref().is_some_and(|replaced| Hold::of(replaced).is_some());
+    if keeps_hold {
+        hold::keep_in(&mut desktop_entry);
+    }
+    let kept_update_source =
+        replaced.as_ref().and_then(|replaced| update_source_to_keep(request, replaced));
+    if let Some(source) = &kept_update_source {
+        desktop_entry.set(desktop_entry::KEY_UPDATE_SOURCE, source.clone());
+    }
 
     Ok(InstallPlan {
-        desktop_entry: build_entry(request, &slug, &appimage_path, &categories, &icon_field),
+        desktop_entry,
+        keeps_hold,
+        kept_update_source,
         already_installed: desktop_entry_path.exists() || appimage_path.exists(),
         remote: request.remote.clone(),
         slug,
@@ -253,6 +279,8 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
         icons,
         validation_warnings,
         replaced: plan.already_installed,
+        held: plan.keeps_hold,
+        kept_update_source: plan.kept_update_source,
     })
 }
 
@@ -344,6 +372,20 @@ fn build_entry(
     entry.set_optional(desktop_entry::KEY_RELEASE, request.release.clone());
     entry.set(desktop_entry::KEY_INSTALLED_AT, timestamp());
     entry
+}
+
+/// The update source an install over `replaced` keeps: the one it had,
+/// when the install would leave the application to update manually
+/// otherwise. An update source the request names, from `--update-source`
+/// or the URL it was installed from, comes first, and so does update
+/// information the new AppImage embeds. Nothing to keep is no source:
+/// `manual`, or a value that is no update source.
+pub fn update_source_to_keep(request: &InstallRequest, replaced: &DesktopEntry) -> Option<String> {
+    if request.update_source.is_some() || request.update_info.is_some() {
+        return None;
+    }
+    // `manual` is no update source, so it is nothing to keep either.
+    update::parse_update_source(replaced.get(desktop_entry::KEY_UPDATE_SOURCE)?).ok()
 }
 
 /// Seconds since the epoch, the least surprising timestamp format that needs
@@ -453,5 +495,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan(&paths_in(dir.path()), &request("Sample App")).unwrap();
         assert_eq!(plan.desktop_entry.get("Icon"), Some(FALLBACK_ICON));
+    }
+
+    /// Over an installed application, a request that names no update source
+    /// keeps the one it had. One that names one, update information the new
+    /// file embeds, and a replaced one that had none, keep nothing.
+    #[test]
+    fn a_replace_keeps_the_update_source_only_when_it_would_end_up_manual() {
+        let replaced = |source: Option<&str>| {
+            let mut entry = DesktopEntry::new();
+            entry.set_optional(desktop_entry::KEY_UPDATE_SOURCE, source);
+            entry
+        };
+        let github = replaced(Some("github:o/r@continuous#App-*.AppImage"));
+        assert_eq!(
+            update_source_to_keep(&request("A"), &github).as_deref(),
+            Some("github:o/r@continuous#App-*.AppImage")
+        );
+        let url = replaced(Some("https://example.com/latest/App.AppImage"));
+        assert_eq!(
+            update_source_to_keep(&request("A"), &url).as_deref(),
+            Some("https://example.com/latest/App.AppImage")
+        );
+
+        let named = InstallRequest { update_source: Some("github:o/other".into()), ..request("A") };
+        assert_eq!(update_source_to_keep(&named, &github), None);
+        let embeds = InstallRequest {
+            update_info: Some("zsync|https://e.com/A.zsync".into()),
+            ..request("A")
+        };
+        assert_eq!(update_source_to_keep(&embeds, &github), None);
+        for nothing in [None, Some("manual"), Some("not a source")] {
+            assert_eq!(
+                update_source_to_keep(&request("A"), &replaced(nothing)),
+                None,
+                "{nothing:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_plan_writes_the_kept_source_into_the_entry_and_only_over_a_managed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let entry_path = paths.desktop_entry_path("sample-app");
+        let mut existing = DesktopEntry::new();
+        existing.set(desktop_entry::KEY_UPDATE_SOURCE, "github:o/r");
+        existing.write(&entry_path).unwrap();
+        // Not one appimg manages: nothing of it is kept.
+        let plan = plan(&paths, &request("Sample App")).unwrap();
+        assert_eq!(plan.kept_update_source, None);
+        assert_eq!(plan.desktop_entry.get(desktop_entry::KEY_UPDATE_SOURCE), Some(update::MANUAL));
+
+        existing.set(desktop_entry::KEY_MANAGED, "true");
+        existing.write(&entry_path).unwrap();
+        let plan = super::plan(&paths, &request("Sample App")).unwrap();
+        assert_eq!(plan.kept_update_source.as_deref(), Some("github:o/r"));
+        assert_eq!(plan.desktop_entry.get(desktop_entry::KEY_UPDATE_SOURCE), Some("github:o/r"));
     }
 }
