@@ -72,7 +72,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "appimg"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "appimg-core",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "appimg-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "flate2",
  "imagesize",
