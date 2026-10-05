@@ -3,12 +3,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::clean;
 use crate::desktop_entry::DesktopEntry;
 use crate::error::Result;
 use crate::fs_util;
 use crate::list::{self, Health};
 use crate::paths::Paths;
-use crate::update;
 
 const LIBRARY_DIRS: &[&str] =
     &["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib", "/lib64", "/usr/local/lib"];
@@ -40,10 +40,8 @@ pub struct DoctorReport {
     pub optional_tools: Vec<ToolStatus>,
     /// Icons of a slug appimg manages whose entry no longer refers to them.
     pub orphaned_icons: Vec<PathBuf>,
-    /// Files an update left next to the AppImage of a slug appimg manages:
-    /// its own `.bak` and `.new`, and the `.zs-old` and `.part` that
-    /// `appimageupdatetool` left when an older appimg fell back to it. See
-    /// [`update::LEFTOVER_SUFFIXES`].
+    /// Files an update left next to the AppImage of a slug appimg manages,
+    /// what `appimg clean` removes. See [`clean`].
     pub leftover_files: Vec<PathBuf>,
     /// Managed entries whose AppImage or slug is missing.
     pub broken_entries: Vec<(String, PathBuf)>,
@@ -79,7 +77,7 @@ pub fn run(paths: &Paths) -> Result<DoctorReport> {
         applications_dir_writable: is_writable(&paths.applications_dir),
         required_tools: check_tools(REQUIRED_TOOLS),
         optional_tools: check_tools(OPTIONAL_TOOLS),
-        leftover_files: collect_leftovers(paths, &managed),
+        leftover_files: clean::of_apps(paths, &apps).into_iter().map(|l| l.path).collect(),
         broken_entries: apps
             .iter()
             .filter(|app| app.health != Health::Ok)
@@ -187,16 +185,4 @@ fn collect_orphaned_icons(icons_root: &Path, managed: &HashMap<String, String>) 
 
 fn in_apps_directory(icon: &Path) -> bool {
     icon.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) == Some("apps")
-}
-
-/// The staging and backup files an update leaves behind, appimg's own as
-/// well as those `appimageupdatetool` left when an older appimg fell back to
-/// it. Every one of them is named after a managed slug, so they are provably
-/// ours to report.
-fn collect_leftovers(paths: &Paths, managed: &HashMap<String, String>) -> Vec<PathBuf> {
-    let mut leftovers: Vec<PathBuf> =
-        managed.keys().flat_map(|slug| update::leftovers(paths, slug)).collect();
-
-    leftovers.sort();
-    leftovers
 }

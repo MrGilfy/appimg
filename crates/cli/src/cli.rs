@@ -60,6 +60,18 @@ pub enum Command {
     Notify(NotifyArgs),
     /// Check the environment and look for leftovers.
     Doctor,
+    /// Show the backups and update leftovers appimg keeps next to installed
+    /// AppImages, with their sizes, and remove them.
+    #[command(long_about = "Shows what appimg keeps on disk that is no installed AppImage, with \
+                  sizes and a total, and removes it once confirmed: the backup an update \
+                  keeps of the previous version, which removing ends the rollback to, and \
+                  what an interrupted update or an older appimg left behind (.new, .part, \
+                  .archive, .zs-old). Only files named after an application appimg manages \
+                  are ever touched, never an AppImage it does not manage. A download \
+                  written in the last 15 minutes is left alone, an update may still be \
+                  writing it.\n\n\
+                  Exits with 3 when there is nothing to clean.")]
+    Clean(CleanArgs),
     /// Print a shell completion script.
     Completions(CompletionsArgs),
 }
@@ -224,6 +236,13 @@ pub struct HoldArgs {
 pub struct RemoveArgs {
     /// Name or slug of the application to remove.
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CleanArgs {
+    /// Show what would be removed, and remove nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Args)]

@@ -34,6 +34,7 @@ Run `appimg` without arguments for the TUI, or go straight to a command:
     appimg update --all --check
     appimg remove someapp
     appimg doctor
+    appimg clean --dry-run
 
 The entry is registered right away, though some launchers only read their
 application list at startup.

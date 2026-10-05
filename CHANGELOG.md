@@ -8,6 +8,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `appimg clean` shows what appimg keeps on disk that is no installed
+  AppImage, with the size of each file and a total, and removes it once
+  confirmed: the `.bak` backup an update keeps of the previous version,
+  with a line for each application that removing it ends the rollback to
+  that version, and what an interrupted update or an older appimg left
+  behind, `.new`, `.part`, `.archive` and `.zs-old`. These are the files
+  `doctor` reports, named after an application appimg manages: never an
+  AppImage it does not manage, nothing `adopt --scan` lists, no link and
+  no file of a slug that would lead out of the AppImage directory. A
+  download written in the last 15 minutes is left alone and named, since
+  an update may still be writing it. `--dry-run` shows and removes
+  nothing, `--yes` skips the question, which a pipe without `--yes`
+  refuses, and nothing to clean exits with 3. `doctor` points at
+  `appimg clean` when it finds such files, and calls a `.part` a partial
+  download, which appimg's own downloads leave too. (#35)
 - Update sources that follow releases on GitLab and on Forgejo, which
   Codeberg runs: `gitlab:group/project`, with every subgroup, and
   `codeberg:owner/repo`, and on any other host

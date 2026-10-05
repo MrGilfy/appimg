@@ -1,6 +1,5 @@
-use std::path::Path;
-
 use anyhow::Result;
+use appimg_core::clean::Kind;
 use appimg_core::doctor::{self, DoctorReport};
 use appimg_core::{fs_util, Paths};
 
@@ -89,25 +88,12 @@ fn report_leftovers(ui: &Ui, report: &DoctorReport) {
         ui.info(&format!(
             "  {} {}, {size}: {}",
             mark(ui, false),
-            describe_leftover(file),
+            Kind::of(file).map_or("leftover from an update", Kind::describe),
             file.display(),
         ));
     }
-}
-
-/// What a leftover is, going by the suffix that names it. `appimg update`
-/// drops its own once the new binary has run, so anything still here comes
-/// from a run that did not get that far, or from an older appimg.
-fn describe_leftover(file: &Path) -> &'static str {
-    match file.extension().and_then(|e| e.to_str()) {
-        Some("bak") => "backup of the previous version",
-        Some("new") => "half-finished download",
-        Some("archive") => "archive downloaded by an update that did not get to unpack it",
-        Some("zs-old") => {
-            "copy of the previous version, left by appimageupdatetool under an older appimg"
-        }
-        Some("part") => "partial zsync download, left by appimageupdatetool under an older appimg",
-        _ => "leftover from an update",
+    if !report.leftover_files.is_empty() {
+        ui.info("  Show and remove the files an update left behind with `appimg clean`.");
     }
 }
 
