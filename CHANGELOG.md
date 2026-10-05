@@ -8,6 +8,44 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- An installed AppImage can be a command: a symbolic link in
+  `~/.local/bin` to it, recorded in its desktop entry as
+  `X-AppImg-Command`. `install --command <name>` creates one with the
+  install, `appimg command <app> <name>` gives an installed application
+  one or another one, `appimg command <app>` shows it and `appimg command
+  <app> --remove` takes it away again. The link points at the installed
+  AppImage itself, which an update swaps the new version in under and a
+  rollback puts the old one back under, so the command always runs the
+  installed version. Nothing in `~/.local/bin` appimg did not create is
+  written over: a name taken by another file, link or directory, or by
+  the command of another application, is refused with nothing changed,
+  and a link that no longer runs the application, or whatever took its
+  place, is never removed. appimg warns when `~/.local/bin` is not on
+  `PATH`. `remove` takes the link along, installing over an application
+  keeps its command the way it keeps a hold, and `doctor` reports a
+  recorded command whose link is missing, points at a file that is not
+  there, or runs something else, with the command that mends it. An
+  export carries the command as `command`, and an import creates it again
+  where the name is free and imports the application without it where
+  not, saying why. The link `adopt` leaves in `~/.local/bin` for a file it
+  takes over from there is that application's command from then on. `list`
+  shows a COMMAND column, `list --json` gains `command`, and the details in
+  the terminal interface name it. A command-line tool needs no place in
+  the application launcher: `install --no-launcher` writes its desktop
+  entry with `NoDisplay=true`, which launchers pass over, and installs no
+  icons, and appimg manages it like any other, since the entry is what it
+  knows its applications by. `appimg hide <app>` takes an installed
+  application out of the launcher, leaving its icons where they are, and
+  `appimg unhide <app>` lists it again, installing the icons its AppImage
+  ships when it has none; asking for the state it is in already says so
+  and exits with 3. An update and an install over it keep it out of the
+  launcher, the latter in a dry run too, and give it no icons when it had
+  none. Without a command it says that it runs by its path only. An export
+  carries it as `hidden`, an export without it lists every application,
+  and an import keeps it out of the launcher again. `list` adds `not in
+  launcher` to its status, `list --json` gains `hidden`, the details in
+  the terminal interface say whether the launcher lists it, and `doctor`
+  finds nothing to report about it, with or without icons. (#31)
 - `appimg clean` shows what appimg keeps on disk that is no installed
   AppImage, with the size of each file and a total, and removes it once
   confirmed: the `.bak` backup an update keeps of the previous version,

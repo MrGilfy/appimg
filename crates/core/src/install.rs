@@ -10,7 +10,7 @@ use crate::icon;
 use crate::metadata::AppImageInfo;
 use crate::paths::Paths;
 use crate::remote::{self, Remote};
-use crate::{archive, caches, download, elf, slug, stamp, update};
+use crate::{archive, caches, command, download, elf, launcher, slug, stamp, update};
 
 pub const FALLBACK_ICON: &str = "application-x-executable";
 const DEFAULT_CATEGORY: &str = "Utility";
@@ -65,6 +65,14 @@ pub struct InstallRequest {
     pub slug: Option<String>,
     /// Replace an existing installation with the same slug.
     pub overwrite: bool,
+    /// The command to run it by, a link in `~/.local/bin`, see
+    /// [`crate::command`]. `None` keeps the one of the application it
+    /// replaces, if any.
+    pub command: Option<String>,
+    /// Keep it out of the application launcher, with no icons, see
+    /// [`crate::launcher`]. One that replaces an application out of the
+    /// launcher stays out either way.
+    pub hidden: bool,
 }
 
 impl InstallRequest {
@@ -97,6 +105,8 @@ impl InstallRequest {
             remote: None,
             slug: None,
             overwrite: false,
+            command: None,
+            hidden: false,
         }
     }
 }
@@ -178,6 +188,14 @@ pub struct InstallOutcome {
     pub held: bool,
     /// The update source it kept from the application it replaced.
     pub kept_update_source: Option<String>,
+    /// The command it has, asked for or kept from the application it
+    /// replaced.
+    pub command: Option<String>,
+    /// Why the link of the command it asked for could not be created. The
+    /// installation is complete, without that command.
+    pub command_failed: Option<String>,
+    /// Whether the launcher passes it over.
+    pub hidden: bool,
 }
 
 /// Everything an installation would write, without writing it.
@@ -199,6 +217,16 @@ pub struct InstallPlan {
     /// What [`InstallRequest::remote`] says, recorded with the checksum of
     /// the installed file once it is in place.
     pub remote: Option<Remote>,
+    /// The command it gets: the one asked for, which is free, see
+    /// [`command::check_free`], or the one of the application it replaces.
+    pub command: Option<String>,
+    /// The command of the application it replaces.
+    pub replaced_command: Option<String>,
+    /// It stays out of the launcher, with no icons: asked for, or the way
+    /// the application it replaces was.
+    pub hidden: bool,
+    /// The application it replaces was out of the launcher, and so it stays.
+    pub keeps_hidden: bool,
 }
 
 pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
@@ -212,9 +240,15 @@ pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
     let appimage_path = paths.appimage_path(&slug);
     let desktop_entry_path = paths.desktop_entry_path(&slug);
     let categories = effective_categories(request)?;
-    let icon_field = planned_icon_field(request, &slug);
-    let mut desktop_entry = build_entry(request, &slug, &appimage_path, &categories, &icon_field);
     let replaced = DesktopEntry::read(&desktop_entry_path).ok().filter(DesktopEntry::is_managed);
+    let keeps_hidden = replaced.as_ref().is_some_and(launcher::is_hidden);
+    let hidden = request.hidden || keeps_hidden;
+    let icon_field =
+        if hidden { FALLBACK_ICON.to_string() } else { planned_icon_field(request, &slug) };
+    let mut desktop_entry = build_entry(request, &slug, &appimage_path, &categories, &icon_field);
+    if hidden {
+        launcher::hide_in(&mut desktop_entry);
+    }
     let keeps_hold = replaced.as_ref().is_some_and(|replaced| Hold::of(replaced).is_some());
     if keeps_hold {
         hold::keep_in(&mut desktop_entry);
@@ -224,6 +258,17 @@ pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
     if let Some(source) = &kept_update_source {
         desktop_entry.set(desktop_entry::KEY_UPDATE_SOURCE, source.clone());
     }
+    let replaced_command = replaced
+        .as_ref()
+        .and_then(|replaced| replaced.get(desktop_entry::KEY_COMMAND))
+        .map(str::to_string);
+    if let Some(name) = &request.command {
+        command::check_free(paths, &slug, name)?;
+    }
+    let command = request.command.clone().or_else(|| replaced_command.clone());
+    if let Some(name) = &command {
+        desktop_entry.set(desktop_entry::KEY_COMMAND, name.clone());
+    }
 
     Ok(InstallPlan {
         desktop_entry,
@@ -231,6 +276,10 @@ pub fn plan(paths: &Paths, request: &InstallRequest) -> Result<InstallPlan> {
         kept_update_source,
         already_installed: desktop_entry_path.exists() || appimage_path.exists(),
         remote: request.remote.clone(),
+        command,
+        replaced_command,
+        hidden,
+        keeps_hidden,
         slug,
         appimage_path,
         desktop_entry_path,
@@ -266,8 +315,10 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
 
     fs_util::copy_atomic(&request.source, &plan.appimage_path, MODE_EXEC)?;
 
-    let icons = install_icons(paths, request, &plan.slug);
+    // Nothing shows the icons of an application out of the launcher.
+    let icons = if plan.hidden { Vec::new() } else { install_icons(paths, request, &plan.slug) };
     write_entry(&plan, &icons)?;
+    let (command, command_failed) = link_command(paths, request, &plan)?;
 
     let validation_warnings = caches::validate_desktop_entry(&plan.desktop_entry_path);
     caches::refresh(paths);
@@ -281,7 +332,35 @@ pub fn install(paths: &Paths, request: &InstallRequest) -> Result<InstallOutcome
         replaced: plan.already_installed,
         held: plan.keeps_hold,
         kept_update_source: plan.kept_update_source,
+        command,
+        command_failed,
+        hidden: plan.hidden,
     })
+}
+
+/// Creates the link of the command the request asks for, once the AppImage
+/// and its entry are in place, and removes the link of the one the replaced
+/// application had instead. A kept command keeps its link, the AppImage
+/// is where it was. When the link cannot be created, the entry goes back
+/// to the command it had before, and why comes back with it.
+fn link_command(
+    paths: &Paths,
+    request: &InstallRequest,
+    plan: &InstallPlan,
+) -> Result<(Option<String>, Option<String>)> {
+    let Some(name) = &request.command else {
+        return Ok((plan.command.clone(), None));
+    };
+    if command::own_link(paths, &plan.slug, name).is_none() {
+        if let Err(error) = command::create(paths, &plan.slug, name) {
+            command::record(&plan.desktop_entry_path, plan.replaced_command.as_deref())?;
+            return Ok((plan.replaced_command.clone(), Some(error.to_string())));
+        }
+    }
+    if let Some(previous) = plan.replaced_command.as_deref().filter(|previous| previous != name) {
+        command::remove_link(paths, &plan.slug, previous)?;
+    }
+    Ok((Some(name.clone()), None))
 }
 
 /// Writes the planned desktop entry, with the icon the installed icons
@@ -423,6 +502,8 @@ mod tests {
             remote: None,
             slug: None,
             overwrite: false,
+            command: None,
+            hidden: false,
         }
     }
 
@@ -434,6 +515,7 @@ mod tests {
             appimage_dir: dir.join("appimages"),
             applications_dir: dir.join("applications"),
             icons_root: dir.join("icons/hicolor"),
+            bin_dir: dir.join("bin"),
         }
     }
 

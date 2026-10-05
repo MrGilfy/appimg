@@ -42,6 +42,22 @@ pub enum Error {
     #[error("{taken_by} is already there, so {slug:?} is taken: pass --name to adopt it under another name")]
     SlugTaken { slug: String, taken_by: PathBuf },
 
+    #[error("{name:?} cannot be a command: {reason}")]
+    InvalidCommand { name: String, reason: &'static str },
+
+    #[error(
+        "{} is already there and appimg did not create it, so {name:?} cannot be a command: \
+         nothing was changed, pick another name or move that file away first",
+        path.display()
+    )]
+    CommandTaken { name: String, path: PathBuf },
+
+    #[error(
+        "{name:?} is the command of {slug:?} already: nothing was changed, drop it there first \
+         with `appimg command {slug} --remove`"
+    )]
+    CommandOfAnother { name: String, slug: String },
+
     #[error("{0:?} is not a valid freedesktop main category")]
     InvalidCategory(String),
 

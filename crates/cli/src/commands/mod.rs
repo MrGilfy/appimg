@@ -1,5 +1,6 @@
 pub mod adopt;
 pub mod clean;
+pub mod command;
 pub mod completions;
 pub mod doctor;
 pub mod edit;
@@ -7,6 +8,7 @@ pub mod export;
 pub mod hold;
 pub mod import;
 pub mod install;
+pub mod launcher;
 pub mod list;
 pub mod notify;
 pub mod remove;

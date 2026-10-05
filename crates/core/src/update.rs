@@ -10,7 +10,7 @@ use crate::list::InstalledApp;
 use crate::metadata;
 use crate::paths::Paths;
 use crate::remote::{self, Remote};
-use crate::{archive, caches, date, hold, icon, json, stamp, version, zsync};
+use crate::{archive, caches, date, hold, icon, json, launcher, stamp, version, zsync};
 
 mod forge;
 
@@ -1026,8 +1026,11 @@ fn finish(
     let from_release = from.version;
     // The update was asked for, of an application the user installed.
     let info = metadata::inspect(target, None, metadata::Reading::MayRun).ok();
+    let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
 
-    let icons = match info.as_ref().and_then(|info| info.extract_root().map(Path::to_path_buf)) {
+    // An application out of the launcher that has no icons gets none.
+    let root = info.as_ref().and_then(|info| info.extract_root().map(Path::to_path_buf));
+    let icons = match root.filter(|_| !launcher::without_icons(&entry, &app.slug)) {
         Some(root) => {
             for stale in fs_util::find_files_with_stem(&paths.icons_root, &app.slug)? {
                 let _ = fs::remove_file(stale);
@@ -1044,7 +1047,6 @@ fn finish(
         &target.file_name().unwrap_or_default().to_string_lossy(),
     );
 
-    let mut entry = DesktopEntry::read(&app.desktop_entry_path)?;
     entry.set_optional(desktop_entry::KEY_VERSION, new_version.clone());
     if let Some(update_info) = info.as_ref().and_then(|info| info.update_info.clone()) {
         entry.set(desktop_entry::KEY_UPDATE_INFO, update_info);
@@ -2460,6 +2462,8 @@ mod tests {
             size_bytes: None,
             health: crate::list::Health::Ok,
             hold: None,
+            command: None,
+            hidden: false,
         }
     }
 
@@ -2528,6 +2532,7 @@ mod tests {
             appimage_dir: dir.to_path_buf(),
             applications_dir: dir.join("applications"),
             icons_root: dir.join("icons"),
+            bin_dir: dir.join("bin"),
             config_home: dir.join("config"),
             state_home: dir.join("state"),
             data_home: dir.to_path_buf(),
@@ -3488,6 +3493,8 @@ mod tests {
             size_bytes: None,
             health: crate::list::Health::Ok,
             hold: None,
+            command: None,
+            hidden: false,
         }
     }
 

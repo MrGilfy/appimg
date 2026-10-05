@@ -29,12 +29,13 @@ pub fn run(paths: &Paths, ui: &Ui, args: &ListArgs) -> Result<Outcome> {
                 app.version.clone().unwrap_or_else(|| "-".to_string()),
                 app.size_bytes.map(human_size).unwrap_or_else(|| "-".to_string()),
                 first_category(app),
+                app.command.clone().unwrap_or_else(|| "-".to_string()),
                 describe_health(ui, app),
             ]
         })
         .collect();
 
-    ui.info(&table(ui, &["NAME", "VERSION", "SIZE", "CATEGORY", "STATUS"], &rows));
+    ui.info(&table(ui, &["NAME", "VERSION", "SIZE", "CATEGORY", "COMMAND", "STATUS"], &rows));
     Ok(Outcome::Done)
 }
 
@@ -43,6 +44,15 @@ fn first_category(app: &InstalledApp) -> String {
 }
 
 fn describe_health(ui: &Ui, app: &InstalledApp) -> String {
+    let status = status(ui, app);
+    if app.hidden && app.health == Health::Ok {
+        format!("{status}{}", ui.dim(", not in launcher"))
+    } else {
+        status
+    }
+}
+
+fn status(ui: &Ui, app: &InstalledApp) -> String {
     match (app.health, &app.hold) {
         // Held, and whether the last check found an update it keeps back.
         (Health::Ok, Some(hold)) if hold.holds_back_an_update() => ui.accent(&hold.describe()),
@@ -69,7 +79,7 @@ fn app_to_json(app: &InstalledApp) -> String {
             "\"update_info\":{update_info},\"installed_at\":{installed_at},",
             "\"appimage\":\"{appimage}\",\"desktop_entry\":\"{entry}\",",
             "\"size_bytes\":{size},\"health\":\"{health}\",\"update_source\":\"{update_source}\",",
-            "\"held\":{held},\"hold_check\":{hold_check}}}"
+            "\"held\":{held},\"hold_check\":{hold_check},\"command\":{command},\"hidden\":{hidden}}}"
         ),
         slug = escape(&app.slug),
         name = escape(&app.name),
@@ -86,6 +96,8 @@ fn app_to_json(app: &InstalledApp) -> String {
         update_source = escape(&update::source_for(app).describe()),
         held = app.hold.is_some(),
         hold_check = hold_check_to_json(app.hold.as_ref().and_then(|hold| hold.checked.as_ref())),
+        command = optional(app.command.as_deref()),
+        hidden = app.hidden,
     )
 }
 

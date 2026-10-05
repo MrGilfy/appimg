@@ -13,6 +13,12 @@ pub fn run(paths: &Paths, ui: &Ui, args: &RemoveArgs) -> Result<Outcome> {
     for file in plan.files() {
         ui.info(&format!("  {}", file.display()));
     }
+    if let Some(left) = &plan.command_left {
+        ui.info(&format!(
+            "{} stays: the command it records is there, but no longer runs it.",
+            left.display()
+        ));
+    }
 
     if !ui.confirm("Delete these files?", false)? {
         ui.info("Nothing was changed.");

@@ -311,6 +311,8 @@ fn listed(slug: &str, name: &str, update_source: &str, origin: &str) -> Exported
         origin: Some(origin.to_string()),
         installed_version: None,
         held: false,
+        command: None,
+        hidden: false,
     }
 }
 

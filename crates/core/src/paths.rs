@@ -17,6 +17,9 @@ pub struct Paths {
     pub appimage_dir: PathBuf,
     pub applications_dir: PathBuf,
     pub icons_root: PathBuf,
+    /// `~/.local/bin`, where an application's command goes, see
+    /// [`crate::command`].
+    pub bin_dir: PathBuf,
 }
 
 impl Paths {
@@ -32,7 +35,15 @@ impl Paths {
             .map(PathBuf::from)
             .unwrap_or_else(|| data_home.join("appimages"));
 
+        // Without a HOME, the bin directory sits next to the data
+        // directory, the way `~/.local/bin` sits next to `~/.local/share`.
+        let bin_dir = match &home {
+            Some(home) => home.join(".local/bin"),
+            None => data_home.parent().unwrap_or(&data_home).join("bin"),
+        };
+
         Ok(Self {
+            bin_dir,
             applications_dir: data_home.join("applications"),
             icons_root: data_home.join("icons").join("hicolor"),
             appimage_dir,

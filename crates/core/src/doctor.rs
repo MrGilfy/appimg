@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::clean;
+use crate::command;
 use crate::desktop_entry::DesktopEntry;
 use crate::error::Result;
 use crate::fs_util;
@@ -45,6 +46,18 @@ pub struct DoctorReport {
     pub leftover_files: Vec<PathBuf>,
     /// Managed entries whose AppImage or slug is missing.
     pub broken_entries: Vec<(String, PathBuf)>,
+    /// Commands an entry records whose link is missing, broken or no longer
+    /// runs the application, see [`crate::command`].
+    pub commands: Vec<CommandProblem>,
+}
+
+/// A command an entry records that does not run its application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandProblem {
+    pub slug: String,
+    pub name: String,
+    pub link: PathBuf,
+    pub state: command::State,
 }
 
 impl DoctorReport {
@@ -56,6 +69,7 @@ impl DoctorReport {
             && self.orphaned_icons.is_empty()
             && self.leftover_files.is_empty()
             && self.broken_entries.is_empty()
+            && self.commands.is_empty()
     }
 }
 
@@ -84,7 +98,24 @@ pub fn run(paths: &Paths) -> Result<DoctorReport> {
             .map(|app| (app.slug.clone(), app.desktop_entry_path.clone()))
             .collect(),
         orphaned_icons: collect_orphaned_icons(&paths.icons_root, &managed),
+        commands: command_problems(paths, &apps),
     })
+}
+
+/// Every recorded command whose link does not run its application.
+fn command_problems(paths: &Paths, apps: &[list::InstalledApp]) -> Vec<CommandProblem> {
+    apps.iter()
+        .filter_map(|app| {
+            let name = app.command.as_ref()?;
+            let state = command::state(paths, &app.slug, name);
+            (state != command::State::Linked).then(|| CommandProblem {
+                slug: app.slug.clone(),
+                name: name.clone(),
+                link: command::link_path(paths, name),
+                state,
+            })
+        })
+        .collect()
 }
 
 /// The slugs appimg manages, each with the icon name its entry uses. An

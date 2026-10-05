@@ -6,17 +6,20 @@ use appimg_core::install::{IconChoice, InstallRequest};
 use appimg_core::metadata::{AppImageInfo, Reading};
 use appimg_core::remote::Remote;
 use appimg_core::update::{self, UpdateSource};
-use appimg_core::{archive, download, install, list, metadata, Paths};
+use appimg_core::{archive, command, download, install, list, metadata, Paths};
 use tempfile::TempDir;
 
 use crate::cli::{EntryArgs, InstallArgs};
 use crate::ui::{human_size, Ui};
-use crate::Outcome;
+use crate::{commands, Outcome};
 
 pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
     // Something that is no update source is refused before anything is
     // downloaded.
     check_entry_args(&args.entry)?;
+    if let Some(name) = &args.command {
+        command::check_name(name)?;
+    }
     // The temporary directory has to outlive the installation, a downloaded
     // AppImage lives in it until it has been copied into place.
     let (source, origin, remote, _scratch) = resolve_source(ui, &args.source)?;
@@ -49,10 +52,12 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
         offer_suggested_source(ui, &mut request, &info, args.dry_run)?;
     }
     apply_asset(&mut request, &args.entry)?;
+    request.command = args.command.clone();
+    request.hidden = args.no_launcher;
 
     let plan = install::plan(paths, &request)?;
     if args.dry_run {
-        print_plan(ui, &plan);
+        print_plan(paths, ui, &plan);
         return Ok(Outcome::Done);
     }
 
@@ -89,6 +94,20 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
         0 => ui.info(&format!("  icon    {} (no icon found)", install::FALLBACK_ICON)),
         count => ui.info(&format!("  icons   {count} installed into the hicolor theme")),
     }
+    if outcome.hidden {
+        ui.info(&format!(
+            "  out of the launcher{}, list it with: appimg unhide {}",
+            if args.no_launcher { "" } else { " as before" },
+            outcome.slug
+        ));
+    }
+    if let Some(name) = &outcome.command {
+        ui.info(&format!(
+            "  command {name}, {} -> {}",
+            command::link_path(paths, name).display(),
+            outcome.appimage_path.display()
+        ));
+    }
     let installed = list::find(paths, &outcome.slug)?;
     match update::source_for(&installed) {
         UpdateSource::Manual => ui.info(&format!(
@@ -97,6 +116,17 @@ pub fn run(paths: &Paths, ui: &Ui, args: &InstallArgs) -> Result<Outcome> {
             outcome.slug
         )),
         source => ui.info(&format!("  updates from {}", source.describe())),
+    }
+    if outcome.hidden && outcome.command.is_none() {
+        commands::launcher::warn_without_command(ui, &outcome.slug);
+    }
+    if let Some(why) = &outcome.command_failed {
+        ui.warn(&format!(
+            "it is installed, but not as the command {}: {why}",
+            args.command.as_deref().unwrap_or_default()
+        ));
+    } else if let Some(name) = args.command.as_deref() {
+        commands::command::warn_off_path(paths, ui, name);
     }
     for warning in &outcome.validation_warnings {
         ui.warn(warning);
@@ -370,7 +400,7 @@ pub fn split_args(input: &str) -> Vec<String> {
     args
 }
 
-fn print_plan(ui: &Ui, plan: &install::InstallPlan) {
+fn print_plan(paths: &Paths, ui: &Ui, plan: &install::InstallPlan) {
     ui.info(&format!("Would install as {}", ui.accent(&plan.slug)));
     ui.info(&format!("  binary  {}", plan.appimage_path.display()));
     ui.info(&format!("  entry   {}", plan.desktop_entry_path.display()));
@@ -382,6 +412,18 @@ fn print_plan(ui: &Ui, plan: &install::InstallPlan) {
     }
     if let Some(source) = &plan.kept_update_source {
         ui.info(&format!("  keeps its update source {source}"));
+    }
+    if plan.hidden {
+        let kept = if plan.keeps_hidden { ", as the one it replaces" } else { "" };
+        ui.info(&format!("  out of the launcher{kept}, with no icons"));
+    }
+    if let Some(name) = &plan.command {
+        let kept = if plan.replaced_command.as_ref() == Some(name) { ", kept" } else { "" };
+        ui.info(&format!(
+            "  command {name}{kept}, {} -> {}",
+            command::link_path(paths, name).display(),
+            plan.appimage_path.display()
+        ));
     }
     ui.info("");
     ui.info(&ui.dim(&plan.desktop_entry.to_string()));

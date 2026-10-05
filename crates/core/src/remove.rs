@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::caches;
+use crate::command;
+use crate::desktop_entry::{DesktopEntry, KEY_COMMAND};
 use crate::error::{Error, Result};
 use crate::fs_util;
 use crate::paths::Paths;
@@ -14,12 +16,18 @@ pub struct RemovalPlan {
     pub appimage: Option<PathBuf>,
     pub icons: Vec<PathBuf>,
     pub leftovers: Vec<PathBuf>,
+    /// The link of its command, which runs it, see [`crate::command`].
+    pub command: Option<PathBuf>,
+    /// The place of a command it records whose link no longer runs it:
+    /// whatever is there now stays.
+    pub command_left: Option<PathBuf>,
 }
 
 impl RemovalPlan {
     /// Every file the removal will delete, in the order it will happen.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut files = Vec::new();
+        files.extend(self.command.clone());
         files.extend(self.appimage.clone());
         files.extend(self.icons.iter().cloned());
         files.extend(self.leftovers.iter().cloned());
@@ -38,6 +46,15 @@ pub fn plan(paths: &Paths, slug: &str) -> Result<RemovalPlan> {
 
     // An update can leave these behind, they belong to the slug too.
     let leftovers = update::leftovers(paths, slug);
+    let recorded = DesktopEntry::read(&desktop_entry)
+        .ok()
+        .and_then(|entry| entry.get(KEY_COMMAND).map(str::to_string));
+    let command = recorded.as_deref().and_then(|name| command::own_link(paths, slug, name));
+    let command_left = match (&recorded, &command) {
+        (Some(name), None) => Some(command::link_path(paths, name))
+            .filter(|path| command::check_name(name).is_ok() && fs::symlink_metadata(path).is_ok()),
+        _ => None,
+    };
 
     Ok(RemovalPlan {
         slug: slug.to_string(),
@@ -45,6 +62,8 @@ pub fn plan(paths: &Paths, slug: &str) -> Result<RemovalPlan> {
         appimage: appimage.exists().then_some(appimage),
         desktop_entry,
         leftovers,
+        command,
+        command_left,
     })
 }
 

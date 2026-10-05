@@ -501,6 +501,7 @@ mod tests {
             appimage_dir: root.join("apps"),
             applications_dir: root.join("data/applications"),
             icons_root: root.join("data/icons/hicolor"),
+            bin_dir: root.join("bin"),
         }
     }
 
@@ -605,6 +606,8 @@ mod tests {
             size_bytes: None,
             health: crate::list::Health::Ok,
             hold: None,
+            command: None,
+            hidden: false,
         };
         let status = |slug: &str, latest: &str, available: bool| UpdateStatus {
             slug: slug.to_string(),

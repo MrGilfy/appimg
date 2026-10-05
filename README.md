@@ -32,6 +32,8 @@ Run `appimg` without arguments for the TUI, or go straight to a command:
     appimg import apps.json
     appimg list --json
     appimg update --all --check
+    appimg command someapp someapp
+    appimg install --no-launcher --command tool ./tool.AppImage
     appimg remove someapp
     appimg doctor
     appimg clean --dry-run

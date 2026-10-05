@@ -47,6 +47,16 @@ pub enum Command {
     Hold(HoldArgs),
     /// Release a held AppImage, so that it updates like any other again.
     Unhold(HoldArgs),
+    /// Take an installed AppImage out of the application launcher: its
+    /// desktop entry stays, with NoDisplay=true, for a command-line tool say.
+    Hide(HoldArgs),
+    /// List a hidden AppImage in the application launcher again, with the
+    /// icons it ships.
+    Unhide(HoldArgs),
+    /// Show, add or remove the command an installed AppImage runs as: a
+    /// symbolic link in ~/.local/bin to it.
+    #[command(name = "command")]
+    RunAs(CommandArgs),
     /// Remove an installed AppImage.
     Remove(RemoveArgs),
     /// Change the desktop entry of an installed AppImage in $EDITOR.
@@ -83,6 +93,20 @@ pub struct InstallArgs {
 
     #[command(flatten)]
     pub entry: EntryArgs,
+
+    /// Also make it a command by this name: a symbolic link in ~/.local/bin
+    /// to the installed AppImage, which updates keep running the current
+    /// version. Anything already there that appimg did not create is never
+    /// written over.
+    #[arg(long, value_name = "NAME")]
+    pub command: Option<String>,
+
+    /// Keep it out of the application launcher, for a command-line tool
+    /// say: the desktop entry says NoDisplay=true, and no icons are
+    /// installed. appimg manages it like any other. Use with --command to
+    /// run it by name.
+    #[arg(long)]
+    pub no_launcher: bool,
 
     /// Show what would happen, write nothing and never run the AppImage.
     #[arg(long)]
@@ -224,6 +248,25 @@ pub struct UpdateSourceArgs {
     /// one. Setting a source without it drops the pattern.
     #[arg(long, value_name = "PATTERN", conflicts_with = "clear")]
     pub asset: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct CommandArgs {
+    /// Name or slug of the application.
+    pub name: String,
+
+    /// The command to run it by, a symbolic link of that name in
+    /// ~/.local/bin to the installed AppImage. It replaces the one the
+    /// application has. Anything already there that appimg did not create
+    /// is never written over. Without it and without --remove, the current
+    /// one is shown.
+    #[arg(value_name = "COMMAND")]
+    pub command: Option<String>,
+
+    /// Remove the command: its link goes, as long as it still runs the
+    /// application.
+    #[arg(long, conflicts_with = "command")]
+    pub remove: bool,
 }
 
 #[derive(Debug, Args)]

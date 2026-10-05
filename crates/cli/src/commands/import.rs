@@ -7,13 +7,13 @@ use appimg_core::export::{self, ExportedApp, Fetch};
 use appimg_core::install::InstallRequest;
 use appimg_core::remote::Remote;
 use appimg_core::update::{self, ReleaseAsset, UpdateSource};
-use appimg_core::{digest, hold, install, list, metadata, Paths};
+use appimg_core::{command, digest, hold, install, list, metadata, Error, Paths};
 
 use crate::cli::ImportArgs;
 use crate::commands::install::download_appimage;
 use crate::commands::update::update_one;
 use crate::ui::Ui;
-use crate::Outcome;
+use crate::{commands, Outcome};
 
 /// Installs every application of an export that is not installed yet,
 /// downloading each again, with what the export decided for its entry. One
@@ -47,7 +47,15 @@ pub fn run(paths: &Paths, ui: &Ui, args: &ImportArgs) -> Result<Outcome> {
             continue;
         }
         if args.dry_run {
-            ui.info(&format!("  {label}: {}", describe(&fetch, app.held)));
+            let command = match &app.command {
+                Some(name) => match command::check_free(paths, &app.slug, name) {
+                    Ok(_) => format!(", as the command {name}"),
+                    Err(error) => format!(", not as the command {name}: {}", command_taken(&error)),
+                },
+                None => String::new(),
+            };
+            let hidden = if app.hidden { ", out of the launcher" } else { "" };
+            ui.info(&format!("  {label}: {}{command}{hidden}", describe(&fetch, app.held)));
             imported += 1;
             continue;
         }
@@ -212,6 +220,18 @@ fn install_file(
         request.release = asset.release.clone();
         request.version = asset.version_for(info.version.clone());
     }
+    request.hidden = app.hidden;
+    // A name that is taken here costs the command, not the application.
+    if let Some(name) = &app.command {
+        match command::check_free(paths, &app.slug, name) {
+            Ok(_) => request.command = Some(name.clone()),
+            Err(error) => ui.warn(&format!(
+                "{}: imported without the command {name}: {}",
+                app.name,
+                command_taken(&error)
+            )),
+        }
+    }
 
     let outcome = install::install(paths, &request)?;
     ui.info(&format!(
@@ -222,6 +242,16 @@ fn install_file(
     if app.held {
         hold::set(&list::find(paths, &outcome.slug)?, true)?;
         ui.info("  held, as it was");
+    }
+    if outcome.hidden {
+        ui.info("  out of the launcher, as it was");
+    }
+    if let Some(name) = &outcome.command {
+        ui.info(&format!("  command {name}, as it was"));
+        commands::command::warn_off_path(paths, ui, name);
+    }
+    if let Some(why) = &outcome.command_failed {
+        ui.warn(&format!("{}: imported without its command: {why}", app.name));
     }
     for warning in &outcome.validation_warnings {
         ui.warn(warning);
@@ -276,6 +306,17 @@ fn needs(app: &ExportedApp) -> String {
             format!("it was installed from {origin} on the machine it was exported from")
         }
         None => "where it was installed from is not recorded".to_string(),
+    }
+}
+
+/// Why a command an export names cannot be created here.
+fn command_taken(error: &Error) -> String {
+    match error {
+        Error::CommandTaken { path, .. } => {
+            format!("{} is already there, and appimg did not create it", path.display())
+        }
+        Error::CommandOfAnother { slug, .. } => format!("it is the command of {slug} here"),
+        other => other.to_string(),
     }
 }
 

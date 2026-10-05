@@ -5,6 +5,7 @@ use crate::desktop_entry::{self, DesktopEntry};
 use crate::error::{Error, Result};
 use crate::fs_util;
 use crate::hold::Hold;
+use crate::launcher;
 use crate::paths::Paths;
 use crate::version;
 
@@ -41,6 +42,11 @@ pub struct InstalledApp {
     pub health: Health,
     /// `Some` while it is held at the version it has, see [`crate::hold`].
     pub hold: Option<Hold>,
+    /// The name of its command in `~/.local/bin`, see [`crate::command`].
+    pub command: Option<String>,
+    /// Whether the application launcher passes it over, see
+    /// [`crate::launcher`].
+    pub hidden: bool,
 }
 
 impl InstalledApp {
@@ -133,6 +139,8 @@ fn build_app(paths: &Paths, entry: &DesktopEntry, desktop_entry_path: PathBuf) -
         installed_at: entry.get(desktop_entry::KEY_INSTALLED_AT).map(str::to_string),
         size_bytes: fs_util::file_size(&appimage_path),
         hold: Hold::of(entry),
+        command: entry.get(desktop_entry::KEY_COMMAND).map(str::to_string),
+        hidden: launcher::is_hidden(entry),
         appimage_path,
         desktop_entry_path,
         health,

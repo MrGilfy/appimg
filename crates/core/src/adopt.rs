@@ -26,7 +26,7 @@ use crate::install::{self, InstallPlan, InstallRequest};
 use crate::list;
 use crate::metadata;
 use crate::paths::Paths;
-use crate::{caches, update};
+use crate::{caches, command, update};
 
 /// How the file gets into the appimages directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +79,10 @@ pub struct AdoptPlan {
     /// A symbolic link to the adopted file is left at the old path, so a
     /// command run from there keeps working and runs the managed file.
     pub link_back: bool,
+    /// The link left in `~/.local/bin` is the application's command by this
+    /// name, which its entry records, see [`crate::command`]. `None` for a
+    /// link anywhere else, and for a name no command can have.
+    pub command: Option<String>,
     /// The desktop entries from elsewhere that run the file.
     pub foreign: Vec<ForeignEntry>,
     /// The one of them already where the adopted file's entry goes. When
@@ -128,6 +132,8 @@ pub struct AdoptOutcome {
     pub link: Option<PathBuf>,
     /// Why no link could be left, when one was planned.
     pub link_failed: Option<String>,
+    /// The command the link is, which the entry records.
+    pub command: Option<String>,
     /// The foreign entry the adopted one was written over.
     pub replaced: Option<PathBuf>,
     /// Every file of the foreign entries that was deleted.
@@ -204,15 +210,10 @@ pub fn plan(
         });
     }
 
-    Ok(AdoptPlan {
-        foreign,
-        replaces,
-        link_back: link_back && transfer == Transfer::Move && !in_place,
-        source,
-        install,
-        transfer,
-        in_place,
-    })
+    let link_back = link_back && transfer == Transfer::Move && !in_place;
+    let command = link_back.then(|| command_of(paths, &source, &install.slug)).flatten();
+
+    Ok(AdoptPlan { foreign, replaces, link_back, command, source, install, transfer, in_place })
 }
 
 /// Adopts the file as planned. `remove_foreign` says whether the foreign
@@ -308,11 +309,19 @@ fn adopt_with(
         Placed::InPlace { .. } => Placement::InPlace,
     };
 
-    let (mut link, mut link_failed) = (None, None);
+    let (mut link, mut link_failed, mut command) = (None, None, None);
     if plan.link_back && original_left.is_none() {
         match std::os::unix::fs::symlink(target, &plan.source) {
             Ok(()) => link = Some(plan.source.clone()),
             Err(e) => link_failed = Some(e.to_string()),
+        }
+    }
+    // The adoption is complete by now. An entry that cannot be written once
+    // more leaves the link where it is, which runs the file all the same.
+    if let Some(name) = plan.command.as_ref().filter(|_| link.is_some()) {
+        match command::record(&plan.install.desktop_entry_path, Some(name)) {
+            Ok(()) => command = Some(name.clone()),
+            Err(e) => link_failed = Some(format!("the link is there, but {e}")),
         }
     }
 
@@ -339,11 +348,30 @@ fn adopt_with(
         original_left,
         link,
         link_failed,
+        command,
         replaced: plan.replaces.clone(),
         removed,
         not_removed,
         validation_warnings,
     })
+}
+
+/// The command a link left at `source` would be: the file sits right in the
+/// bin directory, which a shell runs it from by its name. A name no command
+/// can have, or one another application records already, stays a link of
+/// no application.
+fn command_of(paths: &Paths, source: &Path, slug: &str) -> Option<String> {
+    let bin = fs::canonicalize(&paths.bin_dir).ok()?;
+    if source.parent()? != bin {
+        return None;
+    }
+    let name = source.file_name()?.to_str()?;
+    command::check_name(name).ok()?;
+    let taken = list::list(paths)
+        .ok()?
+        .into_iter()
+        .any(|app| app.slug != slug && app.command.as_deref() == Some(name));
+    (!taken).then(|| name.to_string())
 }
 
 /// A file as it was before the adoption wrote over it, or that it was not
@@ -768,6 +796,7 @@ mod tests {
             appimage_dir: root.join("appimages"),
             applications_dir: root.join("applications"),
             icons_root: root.join("icons"),
+            bin_dir: root.join("bin"),
             config_home: root.join("config"),
             state_home: root.join("state"),
             data_home: root.to_path_buf(),

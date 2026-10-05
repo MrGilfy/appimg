@@ -282,22 +282,8 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    let mut lines = vec![
-        field_line("Name", &selected.name),
-        field_line("Slug", &selected.slug),
-        field_line("Version", selected.version.as_deref().unwrap_or("-")),
-        field_line("Comment", selected.comment.as_deref().unwrap_or("-")),
-        field_line("Categories", &selected.categories.join(", ")),
-        field_line("Origin", selected.origin.as_deref().unwrap_or("-")),
-        field_line("Update from", &update::source_for(selected).describe()),
-        field_line(
-            "Hold",
-            &selected.hold.as_ref().map_or_else(|| "not held".to_string(), |hold| hold.describe()),
-        ),
-        field_line("Installed", selected.installed_at.as_deref().unwrap_or("-")),
-        field_line("Binary", &selected.appimage_path.to_string_lossy()),
-        field_line("Entry", &selected.desktop_entry_path.to_string_lossy()),
-    ];
+    let mut lines: Vec<Line> =
+        details(selected).iter().map(|(label, value)| field_line(label, value)).collect();
     if selected.is_broken() {
         lines.push(Line::from(Span::styled(
             "The AppImage this entry points at is gone. Press d to clean it up.",
@@ -306,6 +292,26 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     popup(frame, area, " Details ", lines, 80, 60);
+}
+
+/// What the details show of an application, label and value.
+fn details(app: &InstalledApp) -> Vec<(&'static str, String)> {
+    let or_dash = |value: Option<&str>| value.unwrap_or("-").to_string();
+    vec![
+        ("Name", app.name.clone()),
+        ("Slug", app.slug.clone()),
+        ("Version", or_dash(app.version.as_deref())),
+        ("Comment", or_dash(app.comment.as_deref())),
+        ("Categories", app.categories.join(", ")),
+        ("Origin", or_dash(app.origin.as_deref())),
+        ("Update from", update::source_for(app).describe()),
+        ("Hold", app.hold.as_ref().map_or_else(|| "not held".to_string(), |hold| hold.describe())),
+        ("Command", or_dash(app.command.as_deref())),
+        ("Launcher", if app.hidden { "not listed (NoDisplay=true)" } else { "listed" }.to_string()),
+        ("Installed", or_dash(app.installed_at.as_deref())),
+        ("Binary", app.appimage_path.to_string_lossy().into_owned()),
+        ("Entry", app.desktop_entry_path.to_string_lossy().into_owned()),
+    ]
 }
 
 fn field_line(label: &str, value: &str) -> Line<'static> {
@@ -402,6 +408,8 @@ mod tests {
             size_bytes: None,
             health: Health::Ok,
             hold,
+            command: None,
+            hidden: false,
         }
     }
 
@@ -417,5 +425,27 @@ mod tests {
             "held, 2.0.0 available (checked 2026-10-05)"
         );
         assert_eq!(status_of(&app(Some(Hold { checked: None }))), "held, not checked yet");
+    }
+
+    /// The details name the command an application runs as, if any.
+    #[test]
+    fn the_details_show_the_command() {
+        let command = |app: &InstalledApp| {
+            details(app).into_iter().find(|(label, _)| *label == "Command").unwrap().1
+        };
+        assert_eq!(command(&app(None)), "-");
+        let app = InstalledApp { command: Some("krita".to_string()), ..app(None) };
+        assert_eq!(command(&app), "krita");
+    }
+
+    /// The details say whether the launcher lists an application.
+    #[test]
+    fn the_details_show_whether_the_launcher_lists_it() {
+        let launcher = |app: &InstalledApp| {
+            details(app).into_iter().find(|(label, _)| *label == "Launcher").unwrap().1
+        };
+        assert_eq!(launcher(&app(None)), "listed");
+        let app = InstalledApp { hidden: true, ..app(None) };
+        assert_eq!(launcher(&app), "not listed (NoDisplay=true)");
     }
 }

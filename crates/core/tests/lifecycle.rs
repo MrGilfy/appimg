@@ -278,6 +278,7 @@ fn missing_optional_tools_are_not_a_problem() {
         orphaned_icons: Vec::new(),
         leftover_files: Vec::new(),
         broken_entries: Vec::new(),
+        commands: Vec::new(),
     };
 
     assert!(report.is_clean(), "optional tooling never decides whether something is wrong");

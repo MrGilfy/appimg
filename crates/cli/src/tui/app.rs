@@ -513,6 +513,7 @@ mod tests {
             appimage_dir: data_home.join("appimages"),
             applications_dir: data_home.join("applications"),
             icons_root: data_home.join("icons/hicolor"),
+            bin_dir: root.join("bin"),
             config_home: root.join("config"),
             state_home: root.join("state"),
             data_home,

@@ -12,7 +12,7 @@ use crate::commands::install::{
     offer_suggested_source, plan_without_metadata, read_metadata, unpack_local,
 };
 use crate::ui::{human_size, Ui};
-use crate::Outcome;
+use crate::{commands, Outcome};
 
 pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
     if args.scan {
@@ -65,7 +65,7 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
 
     let transfer =
         if args.copy && from_archive.is_none() { Transfer::Copy } else { Transfer::Move };
-    let link_back = from_archive.is_none() && in_local_bin(&source);
+    let link_back = from_archive.is_none() && in_bin_dir(paths, &source);
     let plan = adopt::plan(paths, &request, transfer, link_back)?;
     if args.dry_run {
         if args.keep_entries {
@@ -112,6 +112,14 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
             outcome.appimage_path.display()
         ));
     }
+    if let Some(name) = &outcome.command {
+        ui.info(&format!(
+            "  command {name}, the link above: appimg remove takes it along, and appimg command {} \
+             --remove drops it alone",
+            outcome.slug
+        ));
+        commands::command::warn_off_path(paths, ui, name);
+    }
     for file in &outcome.removed {
         // An old icon under the slug whose path an adopted icon took is not
         // gone.
@@ -156,13 +164,10 @@ pub fn run(paths: &Paths, ui: &Ui, args: &AdoptArgs) -> Result<Outcome> {
 }
 
 /// Whether the file sits in `~/.local/bin`, where a command runs it by
-/// name. Moving it away would take that command along, so a link stays.
-fn in_local_bin(source: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
-        return false;
-    };
-    let bin = PathBuf::from(home).join(".local/bin");
-    match (bin.canonicalize(), source.parent()) {
+/// name. Moving it away would take that command along, so a link stays,
+/// and becomes the application's command.
+fn in_bin_dir(paths: &Paths, source: &Path) -> bool {
+    match (paths.bin_dir.canonicalize(), source.parent()) {
         (Ok(bin), Some(dir)) => dir == bin,
         _ => false,
     }
@@ -239,6 +244,9 @@ fn print_plan(ui: &Ui, plan: &AdoptPlan, archive: Option<&Path>) {
     if plan.link_back {
         ui.info(&format!("  link    {from} -> {}", plan.install.appimage_path.display()));
     }
+    if let Some(name) = &plan.command {
+        ui.info(&format!("  command {name}, the link, recorded in the entry"));
+    }
     ui.info(&format!("  entry   {}", plan.install.desktop_entry_path.display()));
     if plan.replaces.is_some() {
         ui.info("          written over the one from elsewhere that is there, if that one goes");
@@ -258,8 +266,8 @@ fn scan(paths: &Paths, ui: &Ui) -> Result<Outcome> {
     if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
         let home = PathBuf::from(home);
         dirs.push(home.join("Applications"));
-        dirs.push(home.join(".local/bin"));
     }
+    dirs.push(paths.bin_dir.clone());
     let candidates = adopt::scan(paths, &dirs)?;
     let looked = dirs.iter().map(|dir| dir.display().to_string()).collect::<Vec<_>>().join(", ");
 

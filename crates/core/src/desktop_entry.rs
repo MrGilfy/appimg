@@ -42,6 +42,10 @@ pub const KEY_HOLD: &str = "X-AppImg-Hold";
 /// which asks no server, can still say whether the hold keeps an update
 /// back: `<seconds> <available|current|unknown> <latest version|->`.
 pub const KEY_HOLD_CHECK: &str = "X-AppImg-HoldCheck";
+/// The name of the command that runs the application: a symbolic link of
+/// that name in `~/.local/bin` to the installed AppImage, which appimg
+/// created, see [`crate::command`]. Absent while it has none.
+pub const KEY_COMMAND: &str = "X-AppImg-Command";
 
 /// The freedesktop main categories. A desktop entry needs at least one of
 /// them, everything else is an additional category we do not offer.

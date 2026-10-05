@@ -4,7 +4,7 @@ use appimg_core::doctor::{self, DoctorReport};
 use appimg_core::{fs_util, Paths};
 
 use crate::ui::Ui;
-use crate::Outcome;
+use crate::{commands, Outcome};
 
 pub fn run(paths: &Paths, ui: &Ui) -> Result<Outcome> {
     let report = doctor::run(paths)?;
@@ -48,7 +48,7 @@ pub fn run(paths: &Paths, ui: &Ui) -> Result<Outcome> {
 
     ui.info("");
     ui.info(&ui.bold("Installed files"));
-    report_leftovers(ui, &report);
+    report_leftovers(paths, ui, &report);
 
     ui.info("");
     if report.is_clean() {
@@ -60,10 +60,11 @@ pub fn run(paths: &Paths, ui: &Ui) -> Result<Outcome> {
     Ok(Outcome::NothingToDo)
 }
 
-fn report_leftovers(ui: &Ui, report: &DoctorReport) {
+fn report_leftovers(paths: &Paths, ui: &Ui, report: &DoctorReport) {
     if report.broken_entries.is_empty()
         && report.orphaned_icons.is_empty()
         && report.leftover_files.is_empty()
+        && report.commands.is_empty()
     {
         ui.info(&format!("  {} nothing left behind by appimg", mark(ui, true)));
         return;
@@ -74,6 +75,15 @@ fn report_leftovers(ui: &Ui, report: &DoctorReport) {
             "  {} {slug}: the entry {} has no working AppImage, remove it with `appimg remove {slug}`",
             mark(ui, false),
             path.display()
+        ));
+    }
+    for problem in &report.commands {
+        ui.info(&format!(
+            "  {} {}: its command `{}` does not run it, {}",
+            mark(ui, false),
+            problem.slug,
+            problem.name,
+            commands::command::describe(paths, &problem.slug, &problem.name, &problem.state)
         ));
     }
     for icon in &report.orphaned_icons {

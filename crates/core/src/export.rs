@@ -17,7 +17,9 @@
 //!       "update_source": "github:KDE/krita",
 //!       "origin": "/home/u/Downloads/krita-5.2.6-x86_64.AppImage",
 //!       "installed_version": "5.2.6",
-//!       "held": false
+//!       "held": false,
+//!       "command": "krita",
+//!       "hidden": false
 //!     }
 //!   ]
 //! }
@@ -27,7 +29,7 @@ use crate::desktop_entry::{self, DesktopEntry};
 use crate::error::{Error, Result};
 use crate::list;
 use crate::paths::Paths;
-use crate::{download, json, slug, update};
+use crate::{command, download, json, slug, update};
 
 /// The format version this appimg writes, and the only one it reads.
 pub const FORMAT_VERSION: u64 = 1;
@@ -54,6 +56,13 @@ pub struct ExportedApp {
     /// and does not bring it up to date first. Absent from an export
     /// written before there were holds, which held nothing.
     pub held: bool,
+    /// The name of its command in `~/.local/bin`, see [`crate::command`].
+    /// An import creates it again where the name is free.
+    pub command: Option<String>,
+    /// Whether the application launcher passes it over, see
+    /// [`crate::launcher`]. Absent from an export written before, which
+    /// listed every application.
+    pub hidden: bool,
 }
 
 /// Where an import gets an application's AppImage from.
@@ -116,6 +125,8 @@ pub fn collect(paths: &Paths) -> Result<Vec<ExportedApp>> {
             origin: app.origin,
             installed_version: app.version,
             held: app.hold.is_some(),
+            command: app.command,
+            hidden: app.hidden,
         });
     }
     Ok(apps)
@@ -137,6 +148,8 @@ pub fn to_json(apps: &[ExportedApp]) -> String {
             ("origin", optional(app.origin.as_deref())),
             ("installed_version", optional(app.installed_version.as_deref())),
             ("held", app.held.to_string()),
+            ("command", optional(app.command.as_deref())),
+            ("hidden", app.hidden.to_string()),
         ];
         let fields: Vec<String> =
             fields.iter().map(|(key, value)| format!("      \"{key}\": {value}")).collect();
@@ -178,6 +191,10 @@ fn read_app(object: &str, index: usize) -> Result<ExportedApp> {
         .filter(|name| !name.trim().is_empty())
         .ok_or_else(|| invalid("no name"))?;
     let list = |key: &str| json::string_array_field(object, key).unwrap_or_default();
+    let command = json::string_field(object, "command");
+    if let Some(name) = &command {
+        command::check_name(name)?;
+    }
     Ok(ExportedApp {
         comment: json::string_field(object, "comment"),
         categories: list("categories"),
@@ -187,6 +204,8 @@ fn read_app(object: &str, index: usize) -> Result<ExportedApp> {
         origin: json::string_field(object, "origin"),
         installed_version: json::string_field(object, "installed_version"),
         held: json::bool_field(object, "held").unwrap_or(false),
+        hidden: json::bool_field(object, "hidden").unwrap_or(false),
+        command,
         slug,
         name,
     })
@@ -232,6 +251,8 @@ mod tests {
             origin: Some("/home/u/Fake_App-1.0.AppImage".to_string()),
             installed_version: Some("1.0".to_string()),
             held: true,
+            command: Some("fake".to_string()),
+            hidden: true,
         }
     }
 
@@ -246,6 +267,8 @@ mod tests {
             origin: None,
             installed_version: None,
             held: false,
+            command: None,
+            hidden: false,
             ..app("bare")
         };
         let apps = vec![app("fake-app"), bare];
@@ -259,6 +282,29 @@ mod tests {
         let text = to_json(&[app("fake-app")]).replace(",\n      \"held\": true", "");
         assert!(!text.contains("held"), "{text}");
         assert!(!from_json(&text).unwrap()[0].held);
+    }
+
+    /// An export written before there were commands gives none, and one
+    /// that names a command no file name can be is refused.
+    #[test]
+    fn a_command_is_carried_and_checked() {
+        let text = to_json(&[app("fake-app")]);
+        assert!(text.contains("\"command\": \"fake\""), "{text}");
+        let without = text.replace(",\n      \"command\": \"fake\"", "");
+        assert_eq!(from_json(&without).unwrap()[0].command, None);
+        let escaping = text.replace("\"command\": \"fake\"", "\"command\": \"../../x\"");
+        assert!(matches!(from_json(&escaping), Err(Error::InvalidCommand { .. })));
+    }
+
+    /// An export written before there were applications out of the
+    /// launcher listed every one.
+    #[test]
+    fn an_export_without_hidden_lists_every_application() {
+        let text = to_json(&[app("fake-app")]);
+        assert!(text.contains("\"hidden\": true"), "{text}");
+        let without = text.replace(",\n      \"hidden\": true", "");
+        assert!(!without.contains("hidden"), "{without}");
+        assert!(!from_json(&without).unwrap()[0].hidden);
     }
 
     #[test]
